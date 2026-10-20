@@ -25,6 +25,7 @@ STOPWORDS = frozenset(
     what when where why how can could may might should would will shall do does did done not no nor
     such also both each other more most some any all only very over under between among about against
     within without based new paper study approach method methods results show propose proposed present
+    has have had having been is am being its it's whose whether if else so yet up out per onto upon
     """.split()
 )
 
