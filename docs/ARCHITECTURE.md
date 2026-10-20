@@ -128,127 +128,104 @@ modules.
   `parse_answer(obj, valid_ids)`: the single composition call used by every budgeted method.
 * `scholarpath.prompts.taxonomy` — taxonomy prompts + mocks.
 
-## 4. Module contracts
+## 4. Module APIs
+
+The main public entry points per package (see each module's docstring for the
+full API and the paper references).
 
 ### 4.1 Taxonomy builder (`scholarpath.taxonomy`)
 
 ```python
-# certification.py
-def hypergeom_upper_bound(R: int, a: int, y: int, alpha: float) -> int      # K^U (Sec. 3.3)
-def step_alpha(delta_v: float, j: int, a: int) -> float                    # δ_v / [j(j+1)a(a+1)]
-def certificate_bound(n_v, E_D, R, a, y, delta_v, j) -> float              # U_{v,j,a} (Eq. 4)
-class DeltaAllocator:  # splits δ over nodes so Σ_v δ_v ≤ δ
-    def __init__(self, delta, strategy="spend", n_total=..., max_depth=..., max_nodes=...)
-    def allocate(self, n_v: int) -> float
-@dataclass class AuditOutcome: certified, bound, audited: Dict[pid, bool], draws, errors
-def audit_snapshot(unverified, judge, n_v, E_D, delta_v, j, epsilon, batch_size, rng, ...) -> AuditOutcome
-
-# allocation.py  (Eq. 10 DP, Eq. 3 sizing; App. A.1)
-@dataclass class BatchPlan: z: int; allocation: np.ndarray; predicted_loss: float; F: np.ndarray
-def plan_batch(curves: Sequence[np.ndarray], shares, beta, epsilon, token_cost) -> BatchPlan
-
-# response_model.py  (Eq. 13–14, App. B.1)
-class TransferredPrior  # λ ~ N(W h, Ω); update(descriptors, observed slopes) after each episode
-class RegionResponse     # per-region posterior over (λ_mis, λ_err); observe(); thompson_curve(n_max, rng)
-
-# repair.py  (Sec. 3.3 repair, App. A.2)
-def discovery_draws(residual_by_region, eta_A, s_max, rng) -> List[str]   # proportional stratified
-def correct(...) / relabel(...)
-
+# certification.py  (Sec. 3.3, Eq. 4)
+hypergeom_upper_bound(R, a, y, alpha) -> int           # K^U
+step_alpha(delta_v, j, a) -> float                     # delta_v / [j(j+1)a(a+1)]
+certificate_bound(n_v, E_D, R, a, y, delta_v, j) -> float
+DeltaAllocator(delta, strategy="spend"|"harmonic"|"uniform", n_total, max_depth, max_nodes).allocate(n_v)
+audit_snapshot(unverified, judge, n_v, E_D, delta_v, j, epsilon, batch_size, rng, ...) -> AuditOutcome
+# allocation.py  (Eq. 3, Eq. 10, Prop. 1)
+plan_batch(curves, shares, beta, epsilon, token_cost) -> BatchPlan(z, allocation, predicted_loss, F)
+# response_model.py  (Eq. 13-14)
+RegionResponse(...).thompson_curve(n_max, rng); TransferredPrior(...).predict(descriptor) / .update(...)
+# repair.py  (App. A.2, B.2)
+discovery_draws(...), discover(...), correction_targets(...), correct(...), relabel_candidates(...), relabel(...)
 # builder.py  (Algorithm 1)
-class NodeWiseBuilder:
-    def __init__(self, llm, embedder, config: BuilderConfig, papers: Dict[str, Paper] | Corpus,
-                 paper_vectors: Optional[Dict[str, np.ndarray]] = None, prior: Optional[TransferredPrior] = None)
-    def build(self, root_name="Root", root_definition="", paper_ids=None, facet=None) -> BuildResult
-def build_dual_taxonomies(llm, embedder, config, papers, **kw) -> Tuple[BuildResult, BuildResult]
-
-# dynamic.py  (Sec. 3.4, App. B.3)
-class DynamicUpdater:
-    def __init__(self, builder: NodeWiseBuilder, result: BuildResult)
-    def add_papers(self, new_papers: Sequence[Paper]) -> UpdateReport   # zero-LLM path when U_new ≤ ε
+NodeWiseBuilder(llm, embedder, config, papers, paper_vectors=None, prior=None).build(root_name, root_definition,
+                paper_ids=None, facet=None) -> BuildResult
+build_dual_taxonomies(llm, embedder, config, papers, ...) -> (BuildResult problem, BuildResult method)
+# dynamic.py  (Sec. 3.4, Eq. 16)
+DynamicUpdater(builder, result).add_papers(new_papers) -> UpdateReport
+# baselines.py / selectors.py  (Sec. 5.2, App. C.5)
+select(vectors, k, method, seed) ; SelectionBuilder(llm, embedder, BaselineBuilderConfig, papers, ...).build(...)
+per_paper_node_cost(full_result) ; estimate_full_cost(result, c_bar)
+# result.py
+BuildResult(taxonomy, method, usage, papers_read, episodes, runtime_s, routers, metadata).save(dir) / .load(dir)
 ```
 
-### 4.2 Taxonomy baselines (`taxonomy/baselines.py`, `taxonomy/selectors.py`)
+### 4.2 Retrieval (`scholarpath.retrieval`)
 
 ```python
-def select(vectors: np.ndarray, k: int, method: str, seed: int = 0) -> List[int]
-    # "random" | "coverage" (facility location Σ_p max_s cos) | "kmeans" (medoid nearest each centroid) | "diversity" (farthest point)
-class SelectionBuilder:
-    def __init__(self, llm, embedder, config: BaselineBuilderConfig, papers, paper_vectors=None)
-    def build(self, root_name="Root", root_definition="", paper_ids=None, facet=None) -> BuildResult
-    # selector="full" → FULL (η=1): LLM reads all n_v papers to propose children, then again to route each paper.
-    # mode="node_wise": select ⌈η n_v⌉ at each internal node, LLM proposes + labels them, router routes the rest; stop when n_v < 1/η.
-    # mode="one_off": select ⌈η|P|⌉ once at the root; those papers are the only LLM reads, routed top-down by f_θv.
-def estimate_full_cost(result: BuildResult, per_paper_cost: float) -> float   # Sec. 5.2.2: c̄ Σ_{v internal} n_v
+analyze_query(query, llm, embedder, config) -> QueryAnalysis          # Step 1 (llm=None: embedding-only parser)
+ground(analysis, index, embedder, config, link_predictor=None, anchor_min_sim=None) -> Grounding   # Step 2
+build_search_space(analysis, grounding, index, config, link_predictor) -> SearchSpace          # Steps 3-5
+make_search(space) -> BoundGuidedSearch | ExhaustiveGreedy; .run(budget) -> SearchResult       # Prop. 7
+ranked_join(index, pairs, relevance, k) -> RankedJoinResult                                    # App. A.3
+assemble_context(index, units) -> (context, sources); compose_answer(query, retrieval, llm)    # Step 6
+ScholarPathRetriever(index, llm, embedder, config, link_predictor=None).retrieve(query, budget) / .answer(...)
+# RetrievalResult.stats: scored_nodes, scored_candidates (Table 7 "Scored"), candidate_pool, link_evaluations,
+# postings_total / scanned / pruned, postings_pruned_by_junction, regions_expanded / deferred, search_time_s, ...
+# link_prediction.py / link_training.py  (Eq. 8, 12, 17, 18)
+LinkPredictor: prepare(index), score(u, m), prob, upper_bound(u, v), upper_bound_problems(m, v), has(nid)
+EmbeddingLinkPredictor()                       # untrained prior ("w/o temporal link prediction" in Table 7)
+temporal_supervision(index, cutoff, horizon_years, llm=None, dates=None)
+train_link_predictor(index, config, llm=None, dates=None, exclude_concepts=(), strict=False) -> LinkPredictor
 ```
 
-### 4.3 Retrieval (`scholarpath.retrieval`)
+### 4.3 Baselines (`scholarpath.baselines`)
 
 ```python
-# query_understanding.py (Step 1)
-@dataclass class Aspect: text; weight; role ("overview"|"empirical"|"mechanism"); vector
-@dataclass class QueryAnalysis: query_id; text; kind; problem_concepts: List[str]; method_concepts: List[str];
-                                aspects: List[Aspect]; given_pair: Optional[Tuple[str, str]]
-def analyze_query(query: Query | str, llm, embedder, config: RetrievalConfig) -> QueryAnalysis
-
-# grounding.py (Step 2)
-@dataclass class Grounding: problem_scopes: List[Tuple[str, float]]; method_scopes: ...; anchors: ...
-def ground(analysis, index: SemanticIndex, embedder, config) -> Grounding
-
-# units.py, scoring.py, objective.py, search.py (Steps 3–5, Sec. 4.2–4.4, App. A.3–A.5, B.4)
-class BoundGuidedSearch  # Algorithm 2 lines 5–23; exact (selects same units as ExhaustiveGreedy)
-class ExhaustiveGreedy    # ablation "w/o bound-guided search"
-
-# compose.py (Step 6)
-def assemble_context(index, units) -> Tuple[str, List[dict]]    # hierarchical, shared nodes once
-def compose_answer(query, retrieval: RetrievalResult, llm, config) -> Answer
-
-# pipeline.py
-class ScholarPathRetriever:
-    def __init__(self, index: SemanticIndex, llm, embedder, config: RetrievalConfig, link_predictor=None)
-    def retrieve(self, query: Query, budget: Optional[int] = None) -> RetrievalResult
-    def answer(self, query: Query, budget: Optional[int] = None) -> Answer
-
-# link_prediction.py (Sec. 4.3 Eq. 8, 12; App. B.5 Eq. 17–18)
-class LinkPredictor:
-    def fit(self, index: SemanticIndex, positives, ...) -> "LinkPredictor"
-    def z_problem(self, node_id) -> np.ndarray; def z_method(self, node_id) -> np.ndarray
-    def score(self, u: str, m: str) -> float              # s_θ(u, m)
-    def upper_bound(self, u: str, v: str) -> float         # U(u, v) over methods m ⪯ v (Eq. 12)
-    def upper_bound_problems(self, m: str, v: str) -> float  # roles exchanged
-    def encode_query_concept(self, facet, description_vec, ancestor_vecs) -> np.ndarray
-    def save(path); @classmethod load(path)
-class EmbeddingLinkPredictor(LinkPredictor)   # untrained fallback: cosine of description embeddings
-def temporal_supervision(index, cutoff, horizon_years, llm=None) -> List[Tuple[str, str]]   # Eq. 17
-def train_link_predictor(index, config: LinkPredictionConfig, llm=None) -> LinkPredictor
+PassagePool.from_corpus(corpus) / .from_index(index); make_retriever(name, pool, llm, embedder, dense=None)
+# names: bm25, specter, dense, dense_rerank, raptor, lightrag, keyword; each .retrieve(query, budget) -> RetrievalResult
+pack_to_budget(candidates, budget, dedup=True, max_candidates=None)
+BudgetedQA(retriever, llm, config, *, budget=None, answer_max_tokens=None).answer(query, budget)   # single composition
+NoRetrievalQA(llm).answer(query)
+agents: PaperQA2Agent, OpenScholarAgent, AgenticScholarAgent, CodexAgent, SimulatedAgent; export_corpus_shards(...)
 ```
+Retrievers with offline indexing report its time in `RetrievalResult.stats["index_build_s"]`; QA latency excludes it.
+Every answer stores the context it was composed from in `Answer.metadata["passages"]`.
 
-### 4.4 Retrieval baselines (`scholarpath.baselines`)
+### 4.4 Data (`scholarpath.data`)
 
 ```python
-class BudgetedRetriever(Protocol):
-    name: str
-    def retrieve(self, query: Query, budget: int) -> RetrievalResult
-# bm25.BM25Retriever, dense.DenseRetriever (SPECTER / SPECTER2), rerank.DenseRerankRetriever (LLM listwise),
-# raptor.RaptorRetriever, lightrag.LightRAGRetriever, keyword.KeywordSearchRetriever
-def pack_to_budget(candidates, budget) -> List[RetrievedUnit]
-class BudgetedQA:   # pack ≤ B tokens + single composition call (prompts.answer)
-    def __init__(self, retriever, llm, config); def answer(self, query, budget) -> Answer
-class NoRetrievalQA   # "Answer LLM, no retrieval"
-# agents/: PaperQA2Agent, OpenScholarAgent, AgenticScholarAgent, CodexAgent (adapters, .answer(query) -> Answer)
+build_arxiv_sets / build_subfields_corpus / write_arxiv_corpora(snapshot, out_dir, ...)   # Sec. 5.2, App. C.2
+FulltextExtractor(make_sources(...)).run(papers, out_path)                                # Sec. 2.1 chunks
+PaperAligner(corpus).resolve(references) -> GoldResolution                                # App. C.2 coverage
+load_researchqa / load_scholarqa_cs / load_scholarqa_multi / load_taxobench / build_chime
+heldout: select_targets, reduce_corpus, generate_queries, export_annotation_sheet, apply_annotations,
+         build_heldout_benchmark(..., oversample=), save_heldout_benchmark                 # App. C.1
+make_synthetic_benchmark(...)                                                              # offline tests
 ```
 
 ### 4.5 Evaluation (`scholarpath.evaluation`)
 
 ```python
-taxonomy_metrics.soft_node_f1(pred, gold, embedder) / soft_edge_f1(...) / taxonomy_scores(...)
-organization_metrics.adjusted_rand_index(...), semantic_path_similarity(...),
-                     category_soft_f1(...), assignment_f1(...)
-retrieval_metrics.recall_at_budget(ranked, gold, num_gold), ndcg_at_budget(...)
-qa_metrics.rubric_coverage(answer, rubric, judge), citation_f1(...), correctness(...)
-hypothesis_metrics.discovery_hit(answer, query, judge, k=10), judge_hypotheses(answer, query, judges)
-judges.JudgePanel, efficiency.EfficiencyTracker, reporting.write_table(...)
+taxonomy_metrics: TaxonomyScorer, soft_node_f1, soft_edge_f1, taxonomy_scores          # Sec. 5.2
+organization_metrics: adjusted_rand_index, semantic_path_similarity, category_soft_f1,
+                      assignment_f1, organization_scores                                # TaxoBench, CHIME
+retrieval_metrics: recall_at_budget, ndcg_at_budget, evaluate_retrieval                 # Table 2
+qa_metrics: rubric_coverage, citation_prf, correctness, answer_citation_attribution,
+            prometheus_grade, scholarqabench_combined, evaluate_researchqa / _scholarqa_cs / _scholarqa_multi
+hypothesis_metrics: discovery_hit, judge_hypotheses, evaluate_hypotheses              # Table 4
+judges: JudgePanel; efficiency: EfficiencyTracker, summarize_efficiency                # Table 5
+reporting: tables / CSV / plots; official: exporters and runners for the official scripts
 ```
+
+### 4.6 Experiments (`scholarpath.experiments`)
+
+`common.py` (build cache keyed by configuration and corpus content, cost
+isolation per build, table/plot helpers), `taxonomy.py` (construction runner,
+Figs 2-4, Tables 6, 8, 9, dynamic update) and `qa.py` (data layout, index
+store, systems, record store, evaluation of Tables 2-5 and 7, agents, `ask`).
+The scripts in `scripts/` are thin command-line wrappers around them.
 
 ## 5. Processed data layout
 
@@ -263,6 +240,7 @@ data/
 │   ├── chime/{papers.jsonl.gz, gold/<topic>.json, queries.jsonl}
 │   ├── researchqa/queries.jsonl             # aligned to arxiv_subfields
 │   ├── scholarqabench/{cs,multi}.jsonl
-│   └── heldout/{queries.jsonl, removed_papers.json, reduced_corpus_ids.json}
+│   └── heldout/{queries.jsonl, targets.json, stats.json, removed_papers.json,
+│                reduced_corpus_ids.json, annotation sheet}
 └── README.md
 ```

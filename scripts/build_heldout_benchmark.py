@@ -133,11 +133,14 @@ def cmd_build(args: argparse.Namespace, rt: Runtime) -> int:
     problem, method, ref_info = _reference_taxonomies(args, rt, corpus, out)
     domains = domain_lookup(args.domain_map, corpus.papers)
     kwargs: Dict[str, Any] = {}
+    if not args.min_source_date and rt.config.llm.knowledge_cutoff:
+        args.min_source_date = str(rt.config.llm.knowledge_cutoff)  # default: the answer LLM's cutoff
     if args.min_source_date:
         kwargs["min_source_date"] = args.min_source_date
     else:
-        log.warning("No --min-source-date: App. C.1 requires every target's source paper to postdate the answer "
-                    "LLM's knowledge cutoff; pass the cutoff date so that pre-cutoff ideas cannot be selected")
+        log.warning("No --min-source-date and no llm.knowledge_cutoff: App. C.1 requires every target's source "
+                    "paper to postdate the answer LLM's knowledge cutoff; pass the cutoff date so that "
+                    "pre-cutoff ideas cannot be selected")
     bm = build_heldout_benchmark(
         corpus, (problem, method), rt.llm, primary_category_of=domains,
         n_new_problem=args.n_new_problem, n_new_method=args.n_new_method, oversample=args.oversample,

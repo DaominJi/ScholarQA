@@ -127,6 +127,14 @@ class LLMClient:
         self.json_retries = int(json_retries)
         self.max_workers = int(max_workers)
 
+    def with_meter(self, meter: CostMeter) -> "LLMClient":
+        """A shallow copy of this client that bills to ``meter`` (same backend and cache)."""
+        import copy
+
+        clone = copy.copy(self)
+        clone.meter = meter
+        return clone
+
     # ------------------------------------------------------------ backend
     def _generate(self, request: LLMRequest) -> LLMResponse:  # pragma: no cover - abstract
         raise NotImplementedError

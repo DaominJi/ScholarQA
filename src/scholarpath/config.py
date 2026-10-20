@@ -63,6 +63,9 @@ class LLMConfig:
     # in the cost meter with ``cached=True`` so cost numbers are reproducible.
     cache_dir: Optional[str] = "cache/llm"
     bill_cached_calls: bool = True
+    # Knowledge cutoff of the answer LLM (ISO date). App. C.1: held-out source
+    # papers must postdate it (default of build_heldout_benchmark --min-source-date).
+    knowledge_cutoff: Optional[str] = None
     seed: int = 0
 
 

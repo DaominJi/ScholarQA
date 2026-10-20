@@ -22,6 +22,7 @@ llm:
   price_output_per_m: 0.28
   cache_dir: cache/llm
   bill_cached_calls: true
+  knowledge_cutoff: null
   seed: 0
 embedding:
   backend: hashing
@@ -71,10 +72,14 @@ builder:
   max_llm_papers_per_node: null
   router:
     hidden_dim: 256
-    learning_rate: 0.001
+    learning_rate: 0.003
     weight_decay: 0.01
     epochs: 60
-    batch_size: 64
+    min_steps: 250
+    max_steps: 6000
+    patience: 3
+    tolerance: 0.001
+    batch_size: 32
     validation_fraction: 0.2
     threshold: 0.5
     negatives_per_positive: 3
@@ -92,10 +97,14 @@ baseline:
   llm_papers_per_call: 16
   router:
     hidden_dim: 256
-    learning_rate: 0.001
+    learning_rate: 0.003
     weight_decay: 0.01
     epochs: 60
-    batch_size: 64
+    min_steps: 250
+    max_steps: 6000
+    patience: 3
+    tolerance: 0.001
+    batch_size: 32
     validation_fraction: 0.2
     threshold: 0.5
     negatives_per_positive: 3
@@ -106,6 +115,7 @@ retrieval:
   grounding_top_k: 3
   grounding_min_sim: 0.2
   anchor_top_k: 3
+  anchor_min_sim: null
   max_aspects: 6
   granularity_weights:
     overview:
@@ -150,4 +160,20 @@ index:
   chunk_max_tokens: 512
   chunk_min_tokens: 32
   use_fulltext: true
+evaluation:
+  judge_models:
+  - gpt-6.0-sol
+  - opus-5.5
+  - grok-4.7
+  judge_provider: mock
+  judge_base_url: null
+  judge_api_key_env: SCHOLARPATH_JUDGE_API_KEY
+  judge_cache_dir: cache/judge
+  researchqa_judge_model: gpt-4.1-mini
+  scholarqa_cs_judge_model: gpt-4-turbo
+  prometheus_model: prometheus-eval/prometheus-7b-v2.0
+  attribution_judge: llm
+  discovery_k: 10
+  researchqa_dir: null
+  scholarqabench_dir: null
 seed: 0
