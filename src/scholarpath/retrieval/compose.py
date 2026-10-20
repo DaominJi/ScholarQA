@@ -305,12 +305,29 @@ def assemble_context(
                 lines.extend(_render_forest(paths, placed, renderer))
     context = "\n".join(lines)
 
+    # Text of each paper as it appears in the context (its abstract and/or the
+    # selected section chunks), so evaluators can judge citations against
+    # exactly what the composer saw (Answer.metadata["passages"]).
+    seen_text: Dict[str, List[str]] = {}
+    seen_keys: Dict[str, None] = {}
+    for u in units:
+        for key in getattr(u, "nodes", ()) or ():
+            if not isinstance(key, str) or key in seen_keys:
+                continue
+            level, _, raw = key.partition(":")
+            if level == "paper" and raw in index.papers:
+                seen_keys[key] = None
+                seen_text.setdefault(raw, []).insert(0, index.papers[raw].abstract or index.papers[raw].title)
+            elif level == "chunk" and raw in index.chunks:
+                seen_keys[key] = None
+                seen_text.setdefault(index.chunks[raw].paper_id, []).append(index.text(key))
+
     sources: Dict[Tuple[str, Optional[str]], Dict[str, Any]] = {}
 
     def add(pid: Optional[str], status: str, candidate: Optional[str]) -> None:
         if pid is not None and (pid, candidate) not in sources:
             sources[(pid, candidate)] = {"paper_id": pid, "title": index.papers[pid].title, "status": status,
-                                         "candidate": candidate}
+                                         "candidate": candidate, "text": "\n\n".join(seen_text.get(pid, []))}
 
     if sets:
         rank = {c: i for i, c in enumerate(candidate_order or [])}
@@ -359,5 +376,30 @@ def compose_answer(
         output_tokens=usage.output_tokens,
         cost_usd=usage.cost_usd,
         latency_s=retrieval.latency_s + elapsed,
-        metadata={"kind": kind, "candidates": list(retrieval.candidates), "system": "scholarpath"},
+        metadata={"kind": kind, "candidates": list(retrieval.candidates), "system": "scholarpath",
+                  "passages": context_passages(retrieval)},
     )
+
+
+def context_passages(retrieval: RetrievalResult) -> Dict[str, Dict[str, str]]:
+    """``{paper_id: {"title", "text"}}`` of the papers in a retrieval's context.
+
+    Uses the per-source text recorded by :func:`assemble_context`, else the
+    retrieved units' texts (baselines), so citation metrics can judge each
+    citation against what the system actually saw.
+    """
+    out: Dict[str, Dict[str, str]] = {}
+    for s in retrieval.sources or []:
+        pid = s.get("paper_id")
+        if pid and pid not in out:
+            out[pid] = {"title": str(s.get("title") or ""), "text": str(s.get("text") or "")}
+    texts: Dict[str, List[str]] = {}
+    for u in retrieval.units or []:
+        if getattr(u, "text", ""):
+            for pid in getattr(u, "papers", []) or []:
+                texts.setdefault(pid, []).append(u.text)
+    for pid, parts in texts.items():
+        rec = out.setdefault(pid, {"title": "", "text": ""})
+        if not rec["text"]:
+            rec["text"] = "\n\n".join(parts)
+    return out

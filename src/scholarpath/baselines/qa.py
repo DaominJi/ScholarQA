@@ -112,9 +112,12 @@ class _MeteredQA:
         if composed.get("error"):
             meta["error"] = composed["error"]
         if retrieval is not None:
+            from scholarpath.retrieval.compose import context_passages
+
             meta["retrieval_stats"] = retrieval.stats
             meta["context_papers"] = [s["paper_id"] for s in retrieval.sources]
             meta["retrieval_latency_s"] = retrieval.latency_s
+            meta["passages"] = context_passages(retrieval)  # what the composer saw, for citation metrics
         return Answer(
             query_id=query.query_id,
             text=composed["text"],
