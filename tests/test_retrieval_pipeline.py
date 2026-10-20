@@ -125,7 +125,10 @@ def test_ablation_switches_change_behaviour(index, bench, rt):
     assert [u.key for u in e_ev.units] == [u.key for u in base_ev.units]
     assert [u.key for u in e_hyp.units] == [u.key for u in base_hyp.units]
     assert e_hyp.stats["algorithm"] == "exhaustive"
-    assert e_hyp.stats["units_created"] > base_hyp.stats["units_created"]
+    assert e_hyp.stats["units_created"] >= base_hyp.stats["units_created"]
+    # The unpruned scan scores every candidate node in scope (Table 7 "Scored" = candidate pool).
+    assert e_hyp.stats["scored_candidates"] == e_hyp.stats["candidate_pool"]
+    assert e_hyp.stats["scored_candidates"] >= base_hyp.stats["scored_candidates"]
 
     # "w/o temporal link prediction" (Table 7) swaps in another (untrained) prior: candidates are still
     # scored ("Scored" column), but with different link probabilities.

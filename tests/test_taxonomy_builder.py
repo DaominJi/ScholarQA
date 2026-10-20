@@ -13,6 +13,8 @@ from scholarpath.config import RouterConfig, ScholarPathConfig
 from scholarpath.data.synthetic import make_synthetic_benchmark
 from scholarpath.embeddings import l2_normalize
 from scholarpath.llm import BUILD_COMPONENTS
+from scholarpath.llm.base import LLMResponse
+from scholarpath.llm.mock import MockLLM
 from scholarpath.runtime import Runtime
 from scholarpath.taxonomy import CERTIFIED, LEAF, OPEN, UNRESOLVED, Taxonomy
 from scholarpath.taxonomy.builder import STATE_KEY, NodeWiseBuilder, build_dual_taxonomies
@@ -25,6 +27,8 @@ from scholarpath.taxonomy.repair import (
     stratified_allocation,
 )
 from scholarpath.taxonomy.response_model import RegionDescriptor, TransferredPrior
+from scholarpath.text import count_tokens
+from scholarpath.types import Paper
 
 
 @contextlib.contextmanager
@@ -270,14 +274,29 @@ def test_all_cost_components_when_repair_pools_reach_threshold():
     """A weak router leaves disagreements and residual papers: DISCOVER and CORRECT both run (Eq. 15).
 
     The node is large enough (400 papers) that repair does not end up verifying
-    every paper, so a Stage-3 audit draws from a non-empty unverified set.
+    every paper, so a Stage-3 audit draws from a non-empty unverified set. The
+    default Stage-2 thresholds are used: CORRECT is triggered by the number of
+    misrouted papers its pool implies, which reaches max{2, 0.02 n_v} even
+    while the held-out set itself (and hence the pool) is smaller than that.
     """
     small_bench = make_synthetic_benchmark(n_papers=400, seed=3)
-    cfg = fast_config(max_depth=1, repair_pool_floor=1, repair_pool_fraction=0.0, max_cycles=3)
+    cfg = fast_config(max_depth=1, max_cycles=3)
     cfg.builder.router = RouterConfig(epochs=3, hidden_dim=16, learning_rate=1e-2, batch_size=32,
                                       min_steps=0, patience=0)  # deliberately under-trained
     rt = Runtime.from_config(cfg)
     builder = NodeWiseBuilder(rt.llm, rt.embedder, cfg.builder, small_bench.corpus)
+    triggers = []
+    stage2 = builder.stage2_repair
+
+    def spy(state, tax, ops, force=False):
+        before = ops.papers_read.get("correction", 0)
+        held, pool = len(builder.held_out(state)), len(builder.correction_pool(state))
+        threshold = builder.repair_threshold(state.n)
+        out = stage2(state, tax, ops, force)
+        triggers.append((held, pool, threshold, ops.papers_read.get("correction", 0) > before))
+        return out
+
+    builder.stage2_repair = spy
     with single_thread():
         result = builder.build("Root", "", facet="problem")
     _check_invariants(result, cfg.builder.epsilon, cfg.builder.delta, len(small_bench.corpus))
@@ -286,6 +305,45 @@ def test_all_cost_components_when_repair_pools_reach_threshold():
     # CORRECT labels at most kappa unread neighbours per disagreeing (held-out) paper.
     assert ep.papers_read["correction"] <= cfg.builder.kappa * ep.verified
     assert result.cost_breakdown()["correction"] > 0
+    # Regression: CORRECT ran while the whole held-out set was below the threshold,
+    # so comparing the pool size with max{floor, fraction n_v} could never fire.
+    assert any(ran and held < threshold for held, _, threshold, ran in triggers)
+
+
+def _state(paper_ids, verified, val_ids=(), audited=(), routed=None):
+    from scholarpath.taxonomy.builder import NodeState
+
+    return NodeState(node_id="P0", depth=0, paper_ids=sorted(paper_ids), delta_v=0.01, regions=None,
+                     rng=np.random.default_rng(0), verified=dict(verified), audited=set(audited),
+                     val_ids=list(val_ids), routed=dict(routed or {}))
+
+
+def test_correction_trigger_scales_with_implied_routing_errors(small_bench):
+    """CORRECT compares the routing errors its pool implies in P_v (not the pool size) with the threshold."""
+    cfg = fast_config()
+    rt = Runtime.from_config(cfg)
+    builder = NodeWiseBuilder(rt.llm, rt.embedder, cfg.builder, small_bench.corpus)
+    ids = [f"p{i:04d}" for i in range(2000)]
+    verified = {p: (("c1",), False) for p in ids[:50]}
+    verified[ids[50]] = ((), True)  # missing concept: not a routing-error sample
+    val = ids[:10] + [ids[50]]
+    routed = {p: ("c1",) for p in ids}
+    routed[ids[0]] = ("c2",)  # one of the 10 held-out papers disagrees
+    for p in ids[1900:]:
+        routed[p] = ()  # residual: not placed
+    state = _state(ids, verified, val_ids=val, routed=routed)
+    assert builder.held_out(state) == ids[:10]
+    assert builder.correction_pool(state) == [ids[0]]
+    unverified_placed = 1900 - 51  # placed papers minus the 51 verified ones
+    assert builder.routing_error_estimate(state) == pytest.approx(unverified_placed / 10)
+    threshold = builder.repair_threshold(state.n)
+    assert threshold == 40.0
+    # The pool (1 paper, or even the 10 held-out papers) never reaches 40, the implied errors do.
+    assert len(builder.held_out(state)) < threshold <= builder.routing_error_estimate(state)
+    # No held-out paper, or no unverified placed paper left: nothing to extrapolate to.
+    assert builder.routing_error_estimate(_state(ids, verified, routed=routed)) == 0.0
+    done = {p: (("c1",), False) for p in ids[:1900]}
+    assert builder.routing_error_estimate(_state(ids, done, val_ids=ids[:10], routed=routed)) == 0.0
 
 
 def test_budget_cap_returns_unresolved_and_is_respected(small_bench):
@@ -378,3 +436,154 @@ def test_relabel_candidates():
     out = relabel_candidates(verified, ["new"], ["c1"], paper_vecs, child_vecs)
     assert out == ["m", "near", "r"]
     assert relabel_candidates(verified, [], [], paper_vecs, child_vecs, exclude=["m"]) == []
+
+
+# ------------------------------------------- schema revisions inside one operation
+
+
+class ScriptedTaxonomyLLM(MockLLM):
+    """Deterministic LLM whose topic of a paper is the first word of its title.
+
+    ``propose_children`` / ``discover`` add a child for every topic with at
+    least two papers in the call that no child covers yet (like a real LLM, it
+    does not coin a concept from a single paper); every label is the child of
+    the paper's topic, or a missing concept.
+    """
+
+    def _generate(self, request):
+        payload = request.payload
+        children = list(payload.get("existing") or payload.get("children") or [])
+        keys = {c["name"].lower(): c["key"] for c in children}
+        new = []
+        if request.task in ("taxonomy.propose_children", "taxonomy.discover"):
+            topics = [p["title"].split()[0].lower() for p in payload["papers"]]
+            for t in sorted(set(topics)):
+                if topics.count(t) >= 2 and t not in keys:
+                    keys[t] = f"N{len(new) + 1}"
+                    new.append({"key": keys[t], "name": t.title(), "definition": f"Papers about {t}."})
+        labels = []
+        for p in payload["papers"]:
+            key = keys.get(p["title"].split()[0].lower())
+            labels.append({"paper_id": p["id"], "children": [key] if key else [], "missing_concept": key is None})
+        if request.task == "taxonomy.propose_children":
+            existing = [{k: c[k] for k in ("key", "name", "definition")} for c in children]
+            out = {"children": existing + new, "labels": labels}
+        elif request.task == "taxonomy.discover":
+            out = {"new_children": new, "refined": [], "labels": labels}
+        else:
+            out = {"labels": labels, "new_children": []}
+        text = json.dumps(out)
+        return LLMResponse(text=text, input_tokens=count_tokens(request.prompt_text),
+                           output_tokens=count_tokens(text), model=self.model)
+
+
+def _topic_papers(spec):
+    return {
+        f"{t[0]}{i}": Paper(paper_id=f"{t[0]}{i}", title=f"{t.title()} paper number {i}",
+                            abstract=f"This paper studies {t} in setting {i}.")
+        for t, k in spec.items() for i in range(k)
+    }
+
+
+@pytest.fixture()
+def scripted():
+    """A root whose seed batch takes two propose calls: Beta appears only in the second one."""
+    cfg = fast_config(max_depth=1, llm_papers_per_call=3, use_correction=False)
+    rt = Runtime.from_config(cfg)
+    llm = ScriptedTaxonomyLLM(meter=rt.meter)
+    papers = _topic_papers({"alpha": 8, "beta": 8, "gamma": 4, "delta": 4})
+    builder = NodeWiseBuilder(llm, rt.embedder, cfg.builder, papers)
+    builder._seed_batch = lambda state: ["a0", "a1", "b0", "b1", "b2", "a2"]
+    tax = Taxonomy(facet="problem", root_name="Root", root_definition="", root_papers=sorted(papers))
+    ops = builder.make_ops("problem")
+    relabelled = []
+    label = ops.label
+
+    def spy(tax_, nid, child_ids, paper_ids, component=None, allow_new=False):
+        if component == "relabeling":
+            relabelled.append(sorted(paper_ids))
+        return label(tax_, nid, child_ids, paper_ids, component=component, allow_new=allow_new)
+
+    ops.label = spy
+    allocator = DeltaAllocator(0.05, "spend", len(papers), cfg.builder.max_depth, cfg.builder.max_nodes)
+    with single_thread():
+        state = builder.init_node(tax, tax.root_id, ops, allocator)
+    by_name = {tax.nodes[c].name: c for c in tax.children(tax.root_id)}
+    return builder, tax, ops, state, by_name, relabelled
+
+
+def test_propose_children_records_the_schema_of_each_call(scripted):
+    from scholarpath.taxonomy.repair import schema_changes
+
+    builder, tax, ops, state, by_name, _ = scripted
+    tax2 = Taxonomy(facet="problem", root_name="Root", root_definition="", root_papers=sorted(builder.papers))
+    _, labels = ops.propose_children(tax2, tax2.root_id, ["a0", "a1", "b0", "b1", "b2", "a2"])
+    assert labels["b0"].schema == {"alpha": "Papers about alpha."}  # first call: Beta not proposed yet
+    assert labels["b1"].schema == {"alpha": "Papers about alpha.", "beta": "Papers about beta."}
+    final = {"A": ("Alpha", "Papers about alpha."), "B": ("Beta", "Papers about beta.")}
+    assert schema_changes(labels["b0"].schema, final) == (["B"], [])
+    assert schema_changes(labels["b1"].schema, final) == ([], [])
+    sharpened = {"A": ("Alpha", "Papers about alpha only."), "B": ("Beta", "Papers about beta.")}
+    assert schema_changes(labels["b1"].schema, sharpened) == ([], ["A"])
+    assert schema_changes(None, final) == ([], [])
+
+
+def test_init_node_relabels_seed_papers_read_before_a_later_call_changed_the_schema(scripted):
+    """App. B.2: seed labels of the first propose call are reconciled with children added by the second."""
+    builder, tax, ops, state, by_name, relabelled = scripted
+    assert set(by_name) == {"Alpha", "Beta"}
+    # b0 was read in the first call (no Beta yet, a missing concept); it is relabelled under the final schema.
+    assert state.verified["b0"] == ((by_name["Beta"],), False)
+    assert state.known_errors == 0
+    assert relabelled and set().union(*map(set, relabelled)) <= {"a0", "a1", "b0"}  # second-call papers saw it all
+    assert ops.papers_read["relabeling"] == sum(map(len, relabelled))
+
+
+def test_discover_relabels_papers_of_earlier_batches(scripted, monkeypatch):
+    """Papers of an earlier DISCOVER batch are reconciled with children added by a later batch."""
+    import scholarpath.taxonomy.builder as builder_module
+
+    builder, tax, ops, state, by_name, relabelled = scripted
+    relabelled.clear()
+    state.verified["g0"] = ((), True)  # flagged by an audit: the discovery pool is not empty
+    draws = ["g0", "d0", "d1", "g1", "g2", "a3"]  # batch 1 adds Delta, batch 2 adds Gamma
+    monkeypatch.setattr(builder_module, "discovery_draws", lambda *a, **k: list(draws))
+    with single_thread():
+        assert builder.stage2_repair(state, tax, ops, force=True)
+    names = {tax.nodes[c].name: c for c in tax.children(tax.root_id)}
+    assert {"Gamma", "Delta"} <= set(names)
+    assert state.verified["g0"] == ((names["Gamma"],), False)
+    assert state.verified["d0"] == ((names["Delta"],), False)
+    assert "g0" in set().union(*map(set, relabelled))
+    # Papers of the last batch saw the final schema and are not re-read for it.
+    assert not {"g1", "g2", "a3"} & set().union(*map(set, relabelled))
+
+
+# ------------------------------------------------------- queue (line 21)
+
+
+def test_child_holding_every_paper_of_its_parent_is_not_split(small_bench):
+    from collections import deque
+
+    from scholarpath.taxonomy.result import BuildResult
+
+    cfg = fast_config(max_depth=3)
+    rt = Runtime.from_config(cfg)
+    builder = NodeWiseBuilder(rt.llm, rt.embedder, cfg.builder, small_bench.corpus)
+    ids = sorted(small_bench.corpus.papers)
+    tax = Taxonomy(facet="problem", root_name="Root", root_definition="", root_papers=ids)
+    every = tax.add_node("General", "Every paper.", parent=tax.root_id)
+    part = tax.add_node("Part", "Half of the papers.", parent=tax.root_id)
+    for p in ids:
+        tax.assign(p, every)
+    for p in ids[: len(ids) // 2]:
+        tax.assign(p, part)
+    assert builder.splittable(tax.nodes[every]) and builder.splittable(tax.nodes[part])
+    assert not builder.splittable(tax.nodes[every], tax)  # P_c = P_v: no progress
+    assert builder.splittable(tax.nodes[part], tax)
+    assert not builder.splittable(tax.root, tax) or tax.root.parent is None
+    result = BuildResult(taxonomy=tax, method="scholarpath")
+    allocator = DeltaAllocator(0.05, "spend", len(ids), cfg.builder.max_depth, cfg.builder.max_nodes)
+    builder.process_queue(tax, deque([every]), builder.make_ops("problem"), allocator, result)
+    assert tax.nodes[every].status == LEAF and not tax.children(every) and not result.episodes
+    assert rt.meter.total().calls == 0

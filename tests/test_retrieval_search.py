@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import copy
+import json
+import logging
 import random
 from typing import Dict, List, Tuple
 
@@ -11,7 +13,10 @@ import pytest
 
 from scholarpath.data.synthetic import make_synthetic_benchmark
 from scholarpath.index import SemanticIndex
-from scholarpath.retrieval.grounding import default_anchor_min_sim, ground
+import scholarpath.retrieval.compose as compose_module
+from scholarpath.index.semantic_index import tokenizer_name
+from scholarpath.prompts.answer import compose_answer_request
+from scholarpath.retrieval.grounding import default_anchor_min_sim, distinct_matches, ground
 from scholarpath.retrieval.objective import Coverage, SelectionState, delta
 from scholarpath.retrieval.pipeline import ScholarPathRetriever
 from scholarpath.retrieval.query_understanding import Aspect, QueryAnalysis
@@ -106,9 +111,11 @@ def test_example1_evidence_query_q1(rt, toy):
     assert toy.shared_papers("u1", "m4") == {"p2", "p3"}
     r = ScholarPathRetriever(toy, rt.llm, rt.embedder, rt.config.retrieval)
     res = r.retrieve(Query("q1", "How have graph neural networks been used in drug discovery?", EVIDENCE), 1024)
-    assert res.stats["grounding"]["problem_scopes"][0][0] == "u1"
-    assert res.stats["grounding"]["method_scopes"][0][0] == "m4"
-    assert {"p2", "p3"} <= set(res.ranked_papers[:3])
+    # Grounded to (u1, m4) only: neither the sub-problem u3 nor the weakly similar sibling GCL (m3) is a scope.
+    assert res.stats["grounding"]["problem_scopes"] == [["u1", 1.0]]
+    assert res.stats["grounding"]["method_scopes"] == [["m4", 1.0]]
+    assert set(res.ranked_papers) == {"p2", "p3"}  # exactly J(u1, m4); p1 (GCL only) is no finding of q1
+    assert res.stats["studied_pair"] is True and not res.context.startswith("Note:")
     assert all(u.kind == "direct" and u.status == "established" for u in res.units)
     nodes = {k for u in res.units for k in u.nodes}
     assert {"concept:u3", "concept:u4"} <= nodes  # the sub-problems addressed in the literature
@@ -157,7 +164,7 @@ def test_example1_hypothesis_assessment(rt, toy):
     ("Could graph neural networks be applied to drug discovery?", "m4"),  # J(u1, m4) = {p2, p3}
     ("Could graph learning be applied to air-quality forecasting?", "m1"),  # J(u5, m1) = {p4}: m1 is above m4
 ])
-def test_assessment_of_a_studied_pair_returns_established_findings(rt, toy, text, method):
+def test_assessment_of_a_studied_pair_returns_established_findings(rt, toy, text, method, monkeypatch):
     """Sec. 2.1: hypotheses concern pairs with J(u, m) empty; a studied pair is answered by J(u_q, m_q)."""
     r = ScholarPathRetriever(toy, rt.llm, rt.embedder, rt.config.retrieval)
     res = r.retrieve(Query("qs", text, HYPOTHESIS_ASSESSMENT), 1024)
@@ -168,6 +175,109 @@ def test_assessment_of_a_studied_pair_returns_established_findings(rt, toy, text
     assert all(u.kind == "direct" and u.status == "established" for u in res.units)
     assert set(res.ranked_papers) <= junction
     assert "Hypothesis:" not in res.context
+    assert res.stats["studied_pair"] is True
+    # The composition call presents the verdict as an established finding, not a hypothesis.
+    seen = []
+
+    def spy(*args, **kwargs):
+        seen.append(kwargs.get("studied_pair"))
+        return compose_answer_request(*args, **kwargs)
+
+    monkeypatch.setattr(compose_module, "compose_answer_request", spy)
+    ans = r.answer(Query("qs", text, HYPOTHESIS_ASSESSMENT), 1024)
+    assert seen == [True] and ans.metadata["studied_pair"] is True
+    assert ans.items and all(it.status == "established" for it in ans.items)
+    request = compose_answer_request(text, res.context, HYPOTHESIS_ASSESSMENT, res.sources, studied_pair=True)
+    user = request.messages[-1]["content"]
+    assert "ALREADY STUDIED" in user and 'status "hypothesis"' not in user
+
+
+def test_assessment_of_an_unstudied_pair_keeps_the_hypothesis_instructions(rt, toy):
+    r = ScholarPathRetriever(toy, rt.llm, rt.embedder, rt.config.retrieval)
+    q = Query("qa", "Could graph contrastive learning be applied to air-quality forecasting?", HYPOTHESIS_ASSESSMENT)
+    res = r.retrieve(q, 1024)
+    assert res.stats["studied_pair"] is False
+    user = compose_answer_request(q.text, res.context, HYPOTHESIS_ASSESSMENT, res.sources,
+                                  studied_pair=res.stats["studied_pair"]).messages[-1]["content"]
+    assert 'The verdict item has status "hypothesis"' in user
+    # Evidence and discovery queries are never composed as a studied assessment.
+    ev = compose_answer_request("q", "ctx", EVIDENCE, [], studied_pair=True)
+    assert "ALREADY STUDIED" not in ev.messages[-1]["content"] and "studied_pair" not in ev.payload
+
+
+def test_tokenizer_is_recorded_and_checked(rt, toy, tmp_path, caplog):
+    """The token counter behind B and c(x) is recorded with the index and in every retrieval's stats."""
+    assert toy.metadata["tokenizer"] == tokenizer_name() == toy.stats()["tokenizer"]
+    res = ScholarPathRetriever(toy, rt.llm, rt.embedder, rt.config.retrieval).retrieve("graph learning", 256)
+    assert res.stats["tokenizer"] == tokenizer_name()
+    toy.save(tmp_path / "idx")
+    assert SemanticIndex.load(tmp_path / "idx").cost == toy.cost
+    # An index saved under another counter: warn and reprice its nodes with the current one.
+    meta = json.loads((tmp_path / "idx" / "metadata.json").read_text())
+    meta["tokenizer"] = "some-other-tokenizer"
+    (tmp_path / "idx" / "metadata.json").write_text(json.dumps(meta))
+    (tmp_path / "idx" / "costs.json").write_text(json.dumps({k: 10 * v for k, v in toy.cost.items()}))
+    with caplog.at_level(logging.WARNING, logger="scholarpath.index.semantic_index"):
+        loaded = SemanticIndex.load(tmp_path / "idx")
+    assert "some-other-tokenizer" in caplog.text
+    assert loaded.cost == toy.cost and loaded.metadata["tokenizer"] == tokenizer_name()
+
+
+def test_grounding_keeps_only_alternative_scopes(toy):
+    """Secondary matches must be near-ties of the best one and not nested with a kept scope (App. A.3)."""
+    tax = toy.method
+    # m1 is the parent of m3 and m4: an ancestor of the best match is no alternative scope ...
+    assert distinct_matches([("m3", 0.7), ("m1", 0.6), ("m4", 0.55)], tax, 0.5) == [("m3", 0.7), ("m4", 0.55)]
+    # ... nor is a descendant, whatever its similarity; a distant match is dropped by the margin.
+    assert distinct_matches([("m1", 0.7), ("m4", 0.69), ("m2", 0.5)], tax, 0.5) == [("m1", 0.7), ("m2", 0.5)]
+    assert distinct_matches([("m4", 0.65), ("m3", 0.25)], tax, 0.5) == [("m4", 0.65)]
+    assert distinct_matches([("m4", 0.65), ("m3", 0.25)], tax, 0.0) == [("m4", 0.65), ("m3", 0.25)]
+
+
+@pytest.mark.parametrize("text, problem, method, related", [
+    # Example 1: J(u5, m3) is empty; the parents u2 and m1 (Graph learning) are not scopes.
+    ("How has graph contrastive learning been used for air-quality forecasting?", "u5", "m3", None),
+    # J(u1, m2) is empty; the near-tie Graph learning (m1) has findings, which the note attributes to it.
+    ("How has federated learning been used for drug discovery?", "u1", "m2", "Graph learning"),
+])
+def test_evidence_query_on_an_unstudied_pair_says_so(rt, toy, text, problem, method, related):
+    """Sec. 2.1: an evidence query seeks J(u, m) != empty; other concepts' papers are never passed off silently."""
+    assert not toy.shared_papers(problem, method)
+    r = ScholarPathRetriever(toy, rt.llm, rt.embedder, rt.config.retrieval)
+    res = r.retrieve(Query("e", text, EVIDENCE), 1024)
+    g = res.stats["grounding"]
+    assert g["problem_scopes"][0][0] == problem and g["method_scopes"][0][0] == method
+    assert res.stats["studied_pair"] is False and res.units
+    first = res.context.split("\n")[0]
+    assert first.startswith("Note: no indexed paper studies")
+    if related is None:  # no scope pair shares a paper: each side separately
+        assert [s for s, _ in g["problem_scopes"]] == [problem] and [s for s, _ in g["method_scopes"]] == [method]
+        assert "each side separately" in first
+    else:
+        assert f"related concepts {related}, not the asked pair" in first
+    for budget in (80, 200):
+        tight = r.retrieve(Query("e", text, EVIDENCE), budget)
+        assert tight.context_tokens <= budget and tight.context.startswith("Note:") == bool(tight.units)
+
+
+def test_unspecified_facet_is_searched_from_its_root(rt, toy):
+    """Step 2: an unspecified facet defaults to the root; direct paths reach its sub-concepts sharing papers."""
+    r = ScholarPathRetriever(toy, rt.llm, rt.embedder, rt.config.retrieval)
+    q = Query("e", "What methods are used for drug discovery?", EVIDENCE)
+    a = r.analyze(q)
+    g = r.ground(a)
+    assert g.unspecified["method"] and g.method_scopes == [(toy.method.root_id, 1.0)]
+    space = r.search_space(a, g)
+    assert ("method", toy.method.root_id) in space.direct_roots
+    overview = {t for grp in space.aspects.groups.values() if grp.kind == "concept" for t in grp.targets}
+    # Graph learning is the only method family applied to drug discovery (m2, m5 share no paper with u1).
+    assert "concept:m1" in overview and not overview & {"concept:m2", "concept:m5"}
+    res = r.retrieve(q, 1024)
+    assert "[M] Graph learning" in res.context and res.stats["studied_pair"] is True
+    assert set(res.ranked_papers) <= toy.extent("u1")
+    # A facet the query names but nothing matches is not searched from its root (see the anchor tests).
+    far = r.retrieve(Query("e2", "How has quantum annealing hardware been used for drug discovery?", EVIDENCE), 1024)
+    assert "[M]" not in far.context
 
 
 def _analysis(rt, specs, problem, method, text="q") -> QueryAnalysis:
@@ -388,9 +498,17 @@ def test_range_minimum_queries_under_a_selection():
 def test_junction_pruning_is_reported(rt, syn):
     _, index, retriever, prepared = syn
     q, a, g = next(t for t in prepared if t[1].kind == EVIDENCE)
-    stats = BoundGuidedSearch(retriever.search_space(a, g)).run(10 ** 6).stats
+    # Leave the method facet unspecified: paths descend from the method root, and one posting-list
+    # intersection per child prunes the method families that share no paper with the problem scope.
+    a = copy.copy(a)
+    a.method_concepts = []
+    g = retriever.ground(a)
+    space = retriever.search_space(a, g)
+    assert ("method", index.method.root_id) in space.direct_roots
+    stats = BoundGuidedSearch(space).run(10 ** 6).stats
     assert stats["postings_pruned_by_junction"] > 0
     assert stats["postings_scanned"] + stats["postings_pruned"] == stats["postings_total"]
+    assert space.postings_scanned <= index.extent(g.top("problem"))
 
 
 # ---------------------------------------------------------------------------
@@ -587,6 +705,43 @@ def test_discovery_retrieves_the_already_studied_baselines(rt, toy):
     assert res.candidates[0] == "Graph contrastive learning"
     for pid in ("p4", "p5"):  # shared nodes appear once even though p4 is also a premise of the hypothesis
         assert res.context.count(f"- [{pid}] ") == 1
+
+
+@pytest.mark.parametrize("metadata", [
+    {"known_endpoint_facet": "method", "heldout_counterpart_facet": "problem"},  # held-out benchmark (App. C.1)
+    {"known_endpoint_facet": "method"},
+    {"searched_side": "problem"},
+    {},  # templated question: the discovery pattern names the searched side
+])
+def test_llm_free_problem_side_discovery(rt, toy, metadata):
+    """Without the Step-1 LLM call the query text grounds the known (method) side; problems are searched."""
+    cfg = copy.deepcopy(rt.config.retrieval)
+    cfg.llm_query_understanding = False
+    r = ScholarPathRetriever(toy, rt.llm, rt.embedder, cfg)
+    q3 = Query("q3", "Which problems could graph contrastive learning be applied to?", HYPOTHESIS_DISCOVERY,
+               metadata=metadata)
+    a = r.analyze(q3)
+    assert a.searched_side == "problem" and not a.used_llm
+    assert a.method_concepts == [q3.text] and a.problem_concepts == []
+    space = r.search_space(a, r.ground(a))
+    assert space.hyp.known_facet == "method" and space.hyp.known_id == "m3"
+    res = r.retrieve(q3, 1024)
+    assert set(res.candidates) == {"Environmental forecasting", "Air-quality forecasting"}
+    assert res.stats["retrieval_llm_calls"] == 0
+
+
+def test_llm_free_method_side_discovery(rt, toy):
+    cfg = copy.deepcopy(rt.config.retrieval)
+    cfg.llm_query_understanding = False
+    r = ScholarPathRetriever(toy, rt.llm, rt.embedder, cfg)
+    for md in ({"known_endpoint_facet": "problem", "heldout_counterpart_facet": "method"}, {}):
+        q2 = Query("q2", "Which other methods could be applied to air-quality forecasting?", HYPOTHESIS_DISCOVERY,
+                   metadata=md)
+        a = r.analyze(q2)
+        assert a.searched_side == "method" and a.problem_concepts == [q2.text] and a.method_concepts == []
+    # An untemplated query without metadata defaults to candidate methods.
+    a = r.analyze(Query("q", "Air-quality forecasting from sparse sensors", HYPOTHESIS_DISCOVERY))
+    assert a.searched_side == "method"
 
 
 def test_problem_side_discovery(rt, toy):

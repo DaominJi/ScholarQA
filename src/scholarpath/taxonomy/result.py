@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Union
+from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
 
@@ -121,6 +121,7 @@ class BuildResult:
 
     def summary(self) -> Dict[str, Any]:
         eps = self.episodes
+        routed = [e for e in eps if (e.metadata or {}).get("termination") not in ("no_schema", "no_split")]
         return {
             "method": self.method,
             "taxonomy": self.taxonomy.stats(),
@@ -133,8 +134,10 @@ class BuildResult:
             "num_episodes": len(eps),
             "certified_nodes": sum(1 for e in eps if e.certified),
             "mean_ratio": float(np.mean([e.ratio for e in eps])) if eps else 0.0,
-            "mean_abstention": float(np.mean([e.abstention for e in eps])) if eps else 0.0,
-            "mean_disagreement": float(np.mean([e.disagreement for e in eps])) if eps else 0.0,
+            # a_v and d_v are defined only at nodes that trained a router (not at
+            # leaves whose proposal yielded no usable schema).
+            "mean_abstention": float(np.mean([e.abstention for e in routed])) if routed else 0.0,
+            "mean_disagreement": float(np.mean([e.disagreement for e in routed])) if routed else 0.0,
             "metadata": self.metadata,
         }
 

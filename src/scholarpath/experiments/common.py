@@ -58,6 +58,7 @@ from scholarpath.evaluation.reporting import write_csv, write_jsonl
 from scholarpath.llm.accounting import CostMeter
 from scholarpath.llm.base import LLMClient
 from scholarpath.taxonomy.result import BuildResult
+from scholarpath.taxonomy.tree import Taxonomy
 from scholarpath.types import Paper
 
 log = logging.getLogger(__name__)
@@ -83,8 +84,11 @@ DEFAULT_DATA_DIR = Path("data") / "processed"
 
 
 def _json_default(value: Any) -> Any:
+    """JSON fallback of the experiment caches and run records (NumPy scalars / arrays, sets, paths, dataclasses)."""
     if isinstance(value, (np.integer, np.floating, np.bool_)):
         return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
     if isinstance(value, (set, frozenset)):
         return sorted(value)
     if isinstance(value, Path):
@@ -484,6 +488,7 @@ SURFACE, INK, INK_SECONDARY, GRID = "#fcfcfb", "#0b0b0b", "#52514e", "#e4e3df"
 
 
 def matplotlib_available() -> bool:
+    """Whether the optional plotting dependency is installed (every figure is also written as CSV)."""
     try:
         import matplotlib  # noqa: F401
     except ImportError:
@@ -638,6 +643,44 @@ def plot_grouped_bars(
 # ---------------------------------------------------------------------------
 
 
+def split_csv(text: Optional[str]) -> List[str]:
+    """``"a, b,,c"`` -> ``["a", "b", "c"]`` (comma-separated CLI values; :func:`csv_list` is the argparse type)."""
+    return [t.strip() for t in str(text or "").split(",") if t.strip()]
+
+
+def restrict_taxonomy(tax: Taxonomy, paper_ids: Iterable[str], drop_empty: bool = True) -> Taxonomy:
+    """Copy of ``tax`` whose extents and residual leaves only keep ``paper_ids``.
+
+    Used for prebuilt taxonomies that must not reference papers absent from
+    the indexed corpus (e.g. built over the complete corpus) and for expert
+    references restricted to a ``--limit-papers`` sample. With ``drop_empty``
+    (default), every non-root concept whose extent becomes empty is removed
+    together with its subtree (extents contain their descendants' papers,
+    so the whole subtree is empty): a concept whose papers were all removed
+    -- e.g. the new endpoint of a held-out idea (App. C.1) -- must not stay
+    in the index with its name and definition.
+    ``out.metadata["restriction"]`` records the removed papers and concepts.
+    """
+    keep = set(paper_ids)
+    out = Taxonomy.from_dict(tax.to_dict())
+    before = out.all_papers()
+    for node in out.nodes.values():
+        node.papers &= keep
+        node.residual &= keep
+    out.invalidate()
+    removed: List[str] = []
+    if drop_empty:
+        for nid in out.preorder():
+            if nid != out.root_id and nid in out.nodes and not out.nodes[nid].papers:
+                sub = list(out.descendants(nid, include_self=True))
+                removed.extend(sub)
+                out.remove_subtree(nid)
+    out.invalidate()
+    out.metadata["restriction"] = {"papers_removed": len(before - keep), "concepts_removed": len(removed),
+                                   "removed_concepts": [str(n) for n in removed[:1000]]}
+    return out
+
+
 def csv_list(cast: Callable[[str], T] = str) -> Callable[[str], List[T]]:
     """argparse ``type=`` for comma-separated lists (``"0.1,0.2"`` -> ``[0.1, 0.2]``)."""
 
@@ -731,6 +774,7 @@ __all__ = [
     "cache_from_args",
     "corpus_fingerprint",
     "csv_list",
+    "split_csv",
     "embed_corpus",
     "finite",
     "fresh_meter",
@@ -738,6 +782,7 @@ __all__ = [
     "load_corpus",
     "make_build_key",
     "matplotlib_available",
+    "restrict_taxonomy",
     "mean_of",
     "plot_grouped_bars",
     "plot_lines",

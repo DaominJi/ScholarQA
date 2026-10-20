@@ -575,6 +575,9 @@ class SearchSpace:
         self.link_predictor = link_predictor
         self.hyp = hyp
         self.direct_roots = direct_roots
+        # Whether the asked pair itself is studied, J(u_q, m_q) != empty (set by build_search_space;
+        # None for discovery queries).
+        self.studied_pair: Optional[bool] = None
         self.postings_scanned: Set[str] = set()
         self.postings_pruned_by_junction = 0
         self.scored_candidates: Set[str] = set()  # candidates whose exact eta was computed
@@ -927,19 +930,26 @@ def build_search_space(
       i.e. the papers of J(u_q, m') and the concepts m' (:func:`_instantiate_background`).
     * Assessment of a pair the literature already studies (J(u_q, m_q) != empty,
       Section 2.1): no hypothesis is formed; every aspect targets J(u_q, m_q).
+
+    ``SearchSpace.studied_pair`` records whether the asked pair itself is
+    studied, i.e. J(u_q, m_q) != empty for the best-matched scopes of an
+    evidence query or for the assessed pair (``None`` for discovery).
     """
     renderer = renderer or ContextRenderer(index)
     paths = PathFactory(index, config.max_chunks_per_paper)
     aspects = AspectSpace()
     hyp: Optional[HypothesisSpec] = None
+    studied_pair: Optional[bool] = None
     if analysis.kind == EVIDENCE:
         junction, direct_roots, observed = _evidence_scopes(index, grounding)
-        _add_evidence_notes(analysis, grounding, renderer, observed)
+        studied_pair = _add_evidence_notes(analysis, grounding, index, renderer, observed)
         _instantiate_evidence(analysis.evidence_aspects, index, junction, direct_roots, aspects)
     else:
         hyp = _hypothesis_spec(analysis, grounding, index, config, link_predictor)
         _add_anchor_notes(index, hyp, renderer)
         direct_roots = [(hyp.known_facet, r) for r in hyp.roots]
+        if hyp.mode == ASSESSMENT:
+            studied_pair = bool(hyp.studied)
         if hyp.studied:
             junction = JunctionTable(index, [(hyp.studied, 1.0)])
             direct_roots.append((hyp.cand_facet, hyp.fixed_candidate))
@@ -954,15 +964,27 @@ def build_search_space(
             premise_weight = sum(a.weight for a in analysis.aspects if a.is_premise)
             aspects.add_hypothesis_group(premise_weight, len(hyp.candidates))
     scorer = AdequacyScorer(index, analysis, config, junction)
-    return SearchSpace(index, analysis, grounding, config, scorer, aspects, renderer, paths, link_predictor,
-                       hyp, direct_roots)
+    space = SearchSpace(index, analysis, grounding, config, scorer, aspects, renderer, paths, link_predictor,
+                        hyp, direct_roots)
+    space.studied_pair = studied_pair
+    return space
 
 
 def _evidence_scopes(
     index: SemanticIndex, grounding: Grounding
 ) -> Tuple[JunctionTable, List[Tuple[str, str]], bool]:
     """Junctions J(u, m) over U_q x M_q weighted by g_u g_m, the scopes paths descend from, and
-    whether any junction is observed (``False``: the fallback to the scope extents was used)."""
+    whether any junction is observed (``False``: the fallback to the scope extents was used).
+
+    Direct paths descend from the matched scopes of each facet. An unspecified
+    facet defaults to its taxonomy root (Section 4.1, Step 2), so paths also
+    descend from that root: junction pruning keeps only the sub-concepts whose
+    extent meets J(u_q, root) = extent(u_q), i.e. the families of the facet
+    the literature applies to u_q (Section 2.1: "sub-concepts that share papers
+    with the other side"), and overview aspects can target them. A facet the
+    query names but nothing in I matches (``grounding.unmatched``) is not
+    searched from its root: other concepts must not stand in for the asked one.
+    """
     pairs = [(u, m, gu * gm) for u, gu in grounding.problem_scopes for m, gm in grounding.method_scopes]
     junction = JunctionTable.from_pairs(index, pairs)
     observed = bool(junction.findings)
@@ -977,26 +999,42 @@ def _evidence_scopes(
     for facet in FACETS:
         if not grounding.unspecified.get(facet, True):
             roots.extend((facet, s) for s, _ in grounding.scopes(facet))
+        elif not grounding.unmatched.get(facet):
+            roots.append((facet, index.taxonomy(facet).root_id))
     if not roots:
         roots = [("problem", index.problem.root_id)]
     return junction, roots, observed
 
 
 def _add_evidence_notes(
-    analysis: QueryAnalysis, grounding: Grounding, renderer: ContextRenderer, observed: bool
-) -> None:
+    analysis: QueryAnalysis,
+    grounding: Grounding,
+    index: SemanticIndex,
+    renderer: ContextRenderer,
+    observed: bool,
+) -> bool:
     """Flag explicitly when the established findings do not concern the asked pair itself.
 
     This happens when a query concept matches nothing in I (not even loosely
-    through a query-local anchor), or when no paper of the index studies the
-    matched scopes together (J(u_q, m_q) is empty). The note is budgeted
-    (:meth:`ContextRenderer.header_overhead`).
+    through a query-local anchor), when no paper of the index studies the
+    matched scopes together (no junction is observed), or when the
+    best-matched pair (u_q, m_q) has J(u_q, m_q) = empty and the findings come
+    only from the junctions of secondary scopes (Section 2.1: an evidence
+    query seeks J(u, m) != empty; Example 1: J(u5, m3) = empty). The note is
+    budgeted (:meth:`ContextRenderer.header_overhead`).
+
+    Returns whether the asked pair is studied, i.e. no facet is unmatched and
+    J(u_q, m_q) != empty for the best-matched scopes.
     """
     texts = {
         "problem": ", ".join(analysis.problem_concepts) or "the problem",
         "method": ", ".join(analysis.method_concepts) or "the method",
     }
+    top_p, top_m = grounding.top("problem"), grounding.top("method")
+    studied = observed and bool(index.shared_papers(top_p, top_m))
     unmatched = [f for f in FACETS if grounding.unmatched.get(f)]
+    if unmatched:
+        studied = False
     if len(unmatched) == 2:
         renderer.add_note(
             f'no concept in the index matches "{texts["problem"]}" or "{texts["method"]}"; the findings below are '
@@ -1015,6 +1053,22 @@ def _add_evidence_notes(
             f'no indexed paper studies "{texts["problem"]}" with "{texts["method"]}"; the findings below concern '
             "each side separately."
         )
+    elif not studied:
+        # Findings exist only for secondary (less closely matched) scopes: name them.
+        related: Dict[str, None] = {}
+        for u, _ in grounding.problem_scopes:
+            for m, _ in grounding.method_scopes:
+                if (u, m) != (top_p, top_m) and index.shared_papers(u, m):
+                    for node in (u, m):
+                        if node not in (top_p, top_m):
+                            related.setdefault(index.concept(node).name, None)
+        names = ", ".join(related) or "other matched concepts"
+        renderer.add_note(
+            f'no indexed paper studies "{index.concept(top_p).name}" with "{index.concept(top_m).name}", the '
+            f"indexed concepts closest to the asked pair; the findings below concern the related concepts {names}, "
+            "not the asked pair."
+        )
+    return studied
 
 
 def _add_anchor_notes(index: SemanticIndex, hyp: HypothesisSpec, renderer: ContextRenderer) -> None:
@@ -1284,8 +1338,20 @@ class BoundGuidedSearch:
 
     name = "bound_guided"
 
-    def __init__(self, space: SearchSpace):
+    def __init__(self, space: SearchSpace, prune: bool = True):
+        """``prune=False`` is the Table 7 "w/o bound-guided search" variant.
+
+        Every concept, chunk, candidate and bridge region is expanded and
+        scored up front (no hierarchy-bounded subtree pruning, so every
+        candidate node in scope is scanned), while the exact best-first
+        enumeration of witness pairs inside a candidate (PairGrid / PairRow)
+        and the lazy selection loop are kept. It selects the same units
+        (Proposition 7) without materializing every (known x candidate)
+        witness pair the way :class:`ExhaustiveGreedy` does.
+        """
         self.space = space
+        self.prune = bool(prune)
+        self.name = "bound_guided" if self.prune else "exhaustive"
 
     def run(self, budget: int) -> SearchResult:
         space = self.space
@@ -1306,6 +1372,16 @@ class BoundGuidedSearch:
             heapq.heappush(heap, _tie_key(key, e.is_unit, e.sort_id) + (e.version, e.eid))
 
         def add(obj: Any, is_unit: bool) -> None:
+            if not is_unit and not self.prune and not isinstance(obj, (PairGrid, PairRow)):
+                # Unpruned scan: expand every region immediately, whatever its bound.
+                stats["regions_created"] += 1
+                stats["regions_expanded"] += 1
+                us, rs = obj.expand(space)
+                for u in us:
+                    add(u, True)
+                for r in rs:
+                    add(r, False)
+                return
             e = _Entry(len(entries), obj, is_unit)
             entries[e.eid] = e
             req = obj.nodes if is_unit else obj.req
@@ -1475,14 +1551,18 @@ class BoundGuidedSearch:
 
 
 class ExhaustiveGreedy:
-    """Exhaustive greedy scan (Table 7 "w/o bound-guided search").
+    """Exhaustive greedy scan: the reference of Proposition 7.
 
-    Enumerates every candidate unit in scope (by fully expanding all regions),
-    then repeatedly selects the feasible unit of maximum delta(z | S) (ties by
-    id) until no feasible unit has a positive gain.
+    Enumerates every candidate unit in scope (by fully expanding all regions,
+    including every witness pair of every hypothesis candidate), then
+    repeatedly selects the feasible unit of maximum delta(z | S) (ties by id)
+    until no feasible unit has a positive gain. Its unit count grows with the
+    product of the witness lists, so it serves as the correctness reference in
+    the tests; the Table 7 "w/o bound-guided search" variant is the unpruned
+    :class:`BoundGuidedSearch` (``prune=False``), which selects the same units.
     """
 
-    name = "exhaustive"
+    name = "exhaustive_greedy"
 
     def __init__(self, space: SearchSpace):
         self.space = space
@@ -1582,10 +1662,8 @@ def _common_stats(space: SearchSpace, state: SelectionState, selections: Sequenc
 
 
 def make_search(space: SearchSpace) -> Any:
-    """BoundGuidedSearch, or ExhaustiveGreedy when ``use_bound_guided_search`` is off."""
-    if space.config.use_bound_guided_search:
-        return BoundGuidedSearch(space)
-    return ExhaustiveGreedy(space)
+    """BoundGuidedSearch; unpruned (Table 7 "w/o bound-guided search") when ``use_bound_guided_search`` is off."""
+    return BoundGuidedSearch(space, prune=bool(space.config.use_bound_guided_search))
 
 
 # ---------------------------------------------------------------------------

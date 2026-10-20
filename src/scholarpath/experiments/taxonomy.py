@@ -79,6 +79,7 @@ from scholarpath.experiments.common import (
     mean_of,
     plot_grouped_bars,
     plot_lines,
+    restrict_taxonomy,
     runtime_fingerprint,
     scale,
     write_markdown,
@@ -92,13 +93,14 @@ from scholarpath.taxonomy.baselines import (
     FULL,
     NODE_WISE,
     ONE_OFF,
+    TERM_NO_SPLIT,
     SelectionBuilder,
     internal_paper_count,
     method_name,
     parse_method,
     per_paper_node_cost,
 )
-from scholarpath.taxonomy.builder import NodeWiseBuilder
+from scholarpath.taxonomy.builder import TERM_NO_SCHEMA, NodeWiseBuilder
 from scholarpath.taxonomy.dynamic import DynamicUpdater, UpdateReport
 from scholarpath.taxonomy.response_model import TransferredPrior
 from scholarpath.taxonomy.result import BuildResult, EpisodeRecord
@@ -166,7 +168,7 @@ COST_COMPONENTS: Tuple[str, ...] = tuple(BUILD_COMPONENTS) + (COMPONENT_FULL, CO
 #: Columns averaged by :func:`summarize_runs`.
 SUMMARY_METRICS: Tuple[str, ...] = METRICS + (
     "relative_cost", "cost_usd", "full_cost_usd", "tokens", "calls", "papers_read", "runtime_s",
-    "abstention", "disagreement", "n_nodes", "depth", "certified_nodes", "mean_ratio",
+    "abstention", "disagreement", "n_nodes", "depth", "certified_nodes", "mean_ratio", "routed_episodes",
 )
 
 
@@ -416,18 +418,21 @@ def truncate_taxonomy(tax: Taxonomy, max_depth: Optional[int]) -> Taxonomy:
     return out
 
 
-def restrict_taxonomy(tax: Taxonomy, paper_ids: Iterable[str]) -> Taxonomy:
-    """Copy of ``tax`` restricted to ``paper_ids``; concepts left without papers are removed."""
-    keep = set(paper_ids)
-    out = Taxonomy.from_dict(tax.to_dict())
-    for node in out.nodes.values():
-        node.papers &= keep
-        node.residual &= keep
-    for nid in list(out.bfs()):
-        if nid in out.nodes and nid != out.root_id and not out.nodes[nid].papers:
-            out.remove_subtree(nid)
-    out.invalidate()
-    return out
+#: Levels of the merged TaxoBench gold below the common root (App. C.2: "814 concept nodes across 4 levels").
+TAXOBENCH_GOLD_MAX_DEPTH = 4
+
+
+def parse_max_depth(text: Union[str, int, None]) -> Optional[int]:
+    """``--gold-max-depth`` values: a positive level count, or ``none`` / ``0`` for the untruncated gold."""
+    if text is None:
+        return None
+    t = str(text).strip().lower()
+    if t in ("", "none", "off", "full", "0"):
+        return None
+    value = int(t)
+    if value < 0:
+        raise ValueError(f"max depth must be >= 0, got {text!r}")
+    return value
 
 
 def load_taxobench_dataset(
@@ -439,8 +444,9 @@ def load_taxobench_dataset(
     """TaxoBench: the pooled papers and the merged expert gold taxonomy (facet ``"topic"``).
 
     ``gold_max_depth`` cuts the merged gold below that many levels under the
-    common root (App. C.2 reports 4 levels; the public release has up to 7,
-    see data/README.md). With ``limit_papers`` (quick runs only) the gold is
+    common root (App. C.2 reports 4 levels, :data:`TAXOBENCH_GOLD_MAX_DEPTH`,
+    the default of ``run_taxonomy_experiments.py``; the public release has up
+    to 7, see data/README.md; ``None`` keeps every level). With ``limit_papers`` (quick runs only) the gold is
     restricted to the sampled papers and concepts left empty are dropped.
     """
     directory = Path(data_dir) / TAXOBENCH
@@ -632,6 +638,35 @@ def score_taxonomy(pred: Taxonomy, reference: Taxonomy, scorer: TaxonomyScorer) 
     return out
 
 
+#: Episode terminations of nodes that became leaves without a router: their seed yielded fewer than two
+#: usable children (ScholarPath ``no_schema``, baselines ``no_split``), so a_v and d_v are undefined there.
+UNROUTED_TERMINATIONS = frozenset({TERM_NO_SCHEMA, TERM_NO_SPLIT})
+
+
+def routed_episodes(result: BuildResult) -> List[EpisodeRecord]:
+    """Episodes of a build that trained a router f_theta_v (every termination but :data:`UNROUTED_TERMINATIONS`)."""
+    return [e for e in result.episodes if (e.metadata or {}).get("termination") not in UNROUTED_TERMINATIONS]
+
+
+def router_rates(result: BuildResult) -> Dict[str, Any]:
+    """Table 6's router abstention a_v and validation disagreement d_v of one build.
+
+    App. C.4 reports the *router* abstention rate a_v = |⊥_v| / n_v and the
+    validation disagreement rate d_v (Sec. 3.2); both are only defined at
+    nodes that trained a router. Leaves created because the seed batch gave
+    fewer than two usable children carry the defaults 0.0, and averaging
+    them in would deflate the rates by an amount that depends on how many
+    such leaves each variant produces. The means are therefore taken over
+    :func:`routed_episodes` (``None`` when no node trained a router).
+    """
+    eps = routed_episodes(result)
+    return {
+        "abstention": float(np.mean([e.abstention for e in eps])) if eps else None,
+        "disagreement": float(np.mean([e.disagreement for e in eps])) if eps else None,
+        "routed_episodes": len(eps),
+    }
+
+
 def run_record(
     dataset: ConstructionDataset,
     facet: str,
@@ -646,6 +681,7 @@ def run_record(
     usage = result.total_usage
     tax = result.taxonomy
     summary = result.summary()
+    rates = router_rates(result)
     breakdown = result.cost_breakdown()
     rel = None
     if full_cost is not None and full_cost > 0:
@@ -682,8 +718,11 @@ def run_record(
         "runtime_s": result.runtime_s,
         "episodes": len(result.episodes),
         "certified_nodes": summary["certified_nodes"],
-        "abstention": summary["mean_abstention"],
-        "disagreement": summary["mean_disagreement"],
+        "routed_episodes": rates["routed_episodes"],
+        # a_v / d_v over the nodes that trained a router (router_rates); the realized ratio eta_v of every
+        # episode, including unsplit leaves (their seed batch was read).
+        "abstention": rates["abstention"],
+        "disagreement": rates["disagreement"],
         "mean_ratio": summary["mean_ratio"],
     })
     for comp in COST_COMPONENTS:
@@ -1008,8 +1047,8 @@ def table6(summary: Sequence[Mapping[str, Any]], benchmark: str = ARXIV,
     """Table 6 cells (App. C.4): soft F1 (%) vs. FULL, abstention a_v (%), disagreement d_v (%), relative cost.
 
     Averages over the sets and both facets (facet ``"avg"``); a_v and d_v
-    are first averaged over the episodes of each build
-    (:meth:`BuildResult.summary`).
+    are first averaged over the episodes of each build that trained a
+    router (:func:`router_rates`; nodes left unsplit have no router).
     """
     idx = _index(summary)
     rows: Dict[str, Dict[str, Any]] = OrderedDict()
@@ -1525,6 +1564,8 @@ def dynamic_summary(
 __all__ = [
     "ABLATIONS",
     "AVG_FACET",
+    "TAXOBENCH_GOLD_MAX_DEPTH",
+    "UNROUTED_TERMINATIONS",
     "Ablation",
     "Cohort",
     "ConstructionDataset",
@@ -1556,6 +1597,7 @@ __all__ = [
     "figure4_table",
     "load_arxiv_datasets",
     "load_taxobench_dataset",
+    "parse_max_depth",
     "make_scorer",
     "nested_subsets",
     "plot_figure2",
@@ -1566,6 +1608,8 @@ __all__ = [
     "restrict_taxonomy",
     "run_construction_comparison",
     "run_dynamic_update",
+    "routed_episodes",
+    "router_rates",
     "run_record",
     "run_scalability",
     "scalability_summary",

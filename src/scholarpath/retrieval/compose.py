@@ -46,7 +46,7 @@ from scholarpath.retrieval.units import (
     key_level,
 )
 from scholarpath.text import count_tokens
-from scholarpath.types import EVIDENCE, Answer, Query
+from scholarpath.types import EVIDENCE, HYPOTHESIS_ASSESSMENT, Answer, Query
 
 HEADER_EVIDENCE = "# Established findings (direct support paths)"
 HEADER_HYPOTHESES = "# Hypotheses (complementary path sets: bridge concept path, problem-side and method-side premises)"
@@ -346,11 +346,17 @@ def compose_answer(
     llm: LLMClient,
     config: Optional[RetrievalConfig] = None,
 ) -> Answer:
-    """Single composition call over the assembled context (Algorithm 2, line 25)."""
+    """Single composition call over the assembled context (Algorithm 2, line 25).
+
+    An assessment whose pair is already studied (``stats["studied_pair"]``,
+    Section 2.1) is composed as an established finding, not a hypothesis.
+    """
     config = config or RetrievalConfig()
     kind = retrieval.stats.get("kind") or query.kind or EVIDENCE
+    studied = kind == HYPOTHESIS_ASSESSMENT and bool(retrieval.stats.get("studied_pair"))
     request = compose_answer_request(
-        query.text, retrieval.context, kind, retrieval.sources, max_tokens=config.answer_max_tokens
+        query.text, retrieval.context, kind, retrieval.sources, max_tokens=config.answer_max_tokens,
+        studied_pair=studied,
     )
     before = llm.meter.snapshot()
     t0 = time.perf_counter()
@@ -377,6 +383,7 @@ def compose_answer(
         cost_usd=usage.cost_usd,
         latency_s=retrieval.latency_s + elapsed,
         metadata={"kind": kind, "candidates": list(retrieval.candidates), "system": "scholarpath",
+                  "studied_pair": retrieval.stats.get("studied_pair"),
                   "passages": context_passages(retrieval)},
     )
 

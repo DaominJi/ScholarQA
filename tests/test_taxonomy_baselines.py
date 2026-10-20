@@ -298,6 +298,31 @@ class _NoMatchLLM(SelectionBuilder):
         return {p: [] for p in super()._induce_and_label(ctx, v, read)}
 
 
+class _CatchAllLLM(SelectionBuilder):
+    """The LLM also puts every paper it reads into the first proposed child (a catch-all concept)."""
+
+    def _induce_and_label(self, ctx, v, read):
+        labels = super()._induce_and_label(ctx, v, read)
+        first = ctx.tax.children(v)[:1]
+        return {p: list(dict.fromkeys(first + kids)) for p, kids in labels.items()}
+
+
+def test_child_holding_every_paper_of_its_parent_stays_a_leaf(rt, bench, vecs):
+    """A catch-all child (P_c = P_v) is not expanded: it would rebuild its parent's subtree under itself."""
+    res = _CatchAllLLM(rt.llm, rt.embedder, _config("full", max_depth=3), bench.corpus, vecs).build()
+    tax = res.taxonomy
+    expanded = {e.node_id for e in res.episodes}
+    catch_all = [v for v, node in tax.nodes.items()
+                 if node.parent is not None and node.papers == tax.nodes[node.parent].papers]
+    assert catch_all  # the scenario occurs (FULL reads, and the LLM labels, every paper)
+    for v in catch_all:
+        assert not tax.children(v) and tax.nodes[v].status == LEAF and v not in expanded
+    # Every expanded node below the root is a proper subset of its parent.
+    for v in expanded - {tax.root_id}:
+        assert tax.nodes[v].papers < tax.nodes[tax.nodes[v].parent].papers
+    assert internal_paper_count(tax) == sum(len(tax.nodes[v].papers) for v in tax.internal_nodes())
+
+
 @pytest.mark.parametrize("selector,eta", [("full", 1.0), ("random", 0.5)])
 def test_single_child_split_becomes_a_leaf(rt, bench, vecs, selector, eta):
     cfg = _config(selector, eta, max_depth=2)
@@ -306,10 +331,12 @@ def test_single_child_split_becomes_a_leaf(rt, bench, vecs, selector, eta):
     assert len(tax) == 1 and tax.root.status == LEAF and not tax.root.residual
     assert root.metadata["termination"] == TERM_NO_SPLIT and root.metadata["unsplit_children"] == 1
     assert root.n_children == 0 and res.routers == {} and root.verified > 0
-    # min_split_children=1 keeps the (degenerate) single-child chain.
+    # min_split_children=1 keeps the (degenerate) single-child split; the child
+    # holds every paper of the root, so it is not expanded in turn.
     chain = _OneChildLLM(rt.llm, rt.embedder, cfg, bench.corpus, vecs, min_split_children=1).build()
     only = chain.taxonomy.children(chain.taxonomy.root_id)
     assert len(only) == 1 and chain.taxonomy.nodes[only[0]].papers == chain.taxonomy.root.papers
+    assert not chain.taxonomy.children(only[0]) and len(chain.episodes) == 1
 
 
 @pytest.mark.parametrize("selector,eta", [("full", 1.0), ("random", 0.5)])

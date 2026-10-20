@@ -10,7 +10,14 @@ held-out query with the same single composition call:
   still scored ("structural analogies over text similarity", App. C.4);
 * w/o bound-guided search        -- ``use_bound_guided_search=False``: the exhaustive
   greedy scan; selects exactly the same units (Proposition 7) but scores every
-  candidate in scope;
+  candidate in scope. Cost note: the current scan
+  (``scholarpath.retrieval.search.ExhaustiveGreedy``) materializes every
+  complementary (known-side x candidate-side witness) path pair up front and
+  rescans them at each selection, so its time grows roughly quadratically
+  with the corpus (about 0.07 s vs. 1 s at 120 papers and 0.6 s vs. 93 s at
+  960 papers per query for the bound-guided vs. exhaustive search, offline
+  configuration); on the 148K-paper held-out corpus run this row on a
+  ``--limit``-ed query set or expect long run times;
 * w/o role-aware granularity     -- ``use_role_aware_granularity=False``: gamma = 1 for
   every level and role (Sec. 4.4);
 * w/o shared-cost reuse update   -- ``use_shared_cost_update=False``: the marginal cost of
@@ -67,6 +74,7 @@ from scholarpath.experiments.qa import (  # noqa: E402
     SYSTEMS,
     TABLE7,
     TABLE7_VARIANTS,
+    CacheConflictError,
     DataLayout,
     EnvironmentCache,
     RecordStore,
@@ -74,6 +82,7 @@ from scholarpath.experiments.qa import (  # noqa: E402
     add_system_args,
     answers_of,
     build_judges,
+    check_cache_conflicts,
     count_errors,
     environment_summary,
     evaluate_benchmark,
@@ -133,6 +142,12 @@ def main(argv=None) -> int:
                 ap.error(msg + " (or pass --allow-untrained-prior)")
             log.warning(msg)
     store = RecordStore(out / "answers")
+    try:  # never replace cached answers of another configuration without --resume / --force
+        check_cache_conflicts(store, [(b, v, args.budget, envs.for_benchmark(b).fingerprint(v))
+                                      for b in benchmarks for v in variants], resume=args.resume, force=args.force)
+    except CacheConflictError as err:
+        log.error("%s", err)
+        return 2
     judges = build_judges(rt.config.evaluation, seed=rt.config.seed)
     org_embedder = None
     rows: Dict[str, Dict[str, Any]] = {}
@@ -144,7 +159,7 @@ def main(argv=None) -> int:
             queries = layout.load_queries(bench, args.limit)
             env = envs.for_benchmark(bench)
             recs = run_queries(env, variant, queries, args.budget, benchmark=bench, mode="qa", store=store,
-                               resume=args.resume, fail_fast=args.fail_fast)
+                               resume=args.resume, fail_fast=args.fail_fast, force=args.force)
             if BENCHMARKS[bench].is_organization and org_embedder is None:
                 org_embedder = organization_embedder(rt)
             ev = evaluate_benchmark(bench, answers_of(recs), queries, judges, papers=env.index.papers,

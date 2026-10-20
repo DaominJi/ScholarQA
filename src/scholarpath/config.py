@@ -17,17 +17,33 @@ Defaults follow the implementation details reported in the paper
 
 Every config can be loaded from / saved to YAML or JSON
 (see ``configs/default.yaml``) and overridden from the command line with
-``--set section.field=value``.
+``--set section.field=value``. Values from files and overrides are checked
+against the field types (``"1e-3"`` becomes a float, ``"0.1x"`` or an unknown
+field raises :class:`ConfigError`), so typos fail at start-up rather than deep
+inside a run.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import difflib
+import functools
 import json
-import os
+import typing
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, Mapping, Optional, Tuple, Union
+
+
+class ConfigError(ValueError):
+    """Invalid configuration: a value of the wrong type or a malformed ``--set`` override."""
+
+
+class UnknownConfigField(ConfigError, AttributeError, KeyError):
+    """Unknown config section or field (also an ``AttributeError`` / ``KeyError`` for older callers)."""
+
+    def __str__(self) -> str:  # KeyError.__str__ would quote the message
+        return str(self.args[0]) if self.args else ""
 
 
 # ---------------------------------------------------------------------------
@@ -113,7 +129,6 @@ class RouterConfig:
     batch_size: int = 32
     validation_fraction: float = 0.2
     threshold: float = 0.5
-    negatives_per_positive: int = 3
     seed: int = 0
 
 
@@ -147,8 +162,11 @@ class BuilderConfig:
     max_rounds: int = 12  # acquisition rounds per cycle
     max_cycles: int = 6  # repair/certification cycles per node
     audit_batch_size: int = 8
-    # Stage 2 trigger: repair when the residual pool or the disagreement pool
-    # exceeds this fraction of n_v (or the absolute floor).
+    # Stage 2 trigger (Alg. 1 line 12), both measured in papers of P_v against
+    # max{repair_pool_floor, repair_pool_fraction * n_v}: DISCOVER when the
+    # residual pool (bottom_v plus missing-concept papers) reaches it, CORRECT
+    # when the number of misrouted papers implied by the held-out disagreements
+    # (|pool| / |held-out| x unverified placed papers) reaches it.
     repair_pool_fraction: float = 0.02
     repair_pool_floor: int = 2
     # Stop auditing a snapshot early when the audited error rate makes
@@ -205,6 +223,9 @@ class RetrievalConfig:
     anchor_top_k: int = 3  # neighbours of a query-local anchor concept
     # Cosine an anchor's neighbour needs to act as a scope (None: 0.5 * grounding_min_sim).
     anchor_min_sim: Optional[float] = None
+    # A secondary grounding match is kept as an alternative scope when its cosine
+    # is at least this fraction of the best match's cosine.
+    grounding_rel_margin: float = 0.5
     max_aspects: int = 6
     # Granularity weights gamma_{a, level} per evidential role (Section 4.4).
     # Roles: overview, empirical, mechanism. Levels: concept, paper, chunk.
@@ -274,9 +295,15 @@ class EvaluationConfig:
     researchqa_judge_model: str = "gpt-4.1-mini"
     scholarqa_cs_judge_model: str = "gpt-4-turbo"
     prometheus_model: str = "prometheus-eval/prometheus-7b-v2.0"
-    attribution_judge: str = "llm"  # "llm" | "nli" (osunlp/attrscore-flan-t5-xl)
+    # Statement-level citation judge of ScholarQABench Cite: "nli" is the
+    # AttrScore-Flan-T5-XL model of the official citation_correctness_eval.py
+    # (configs/paper.yaml); "llm" asks the ScholarQA-CS judge with the AttrScore
+    # prompt; "none" disables Cite. Mock judges always use "llm".
+    attribution_judge: str = "llm"
     discovery_k: int = 10  # Hit@10
-    # Official checkouts (optional; enable scripts/run_official_eval-style runs).
+    # Local checkouts of the official repositories, used by
+    # scripts/run_official_eval.py (scholarpath.evaluation.official); when unset,
+    # $SCHOLARPATH_RESEARCHQA_DIR / $SCHOLARPATH_SCHOLARQABENCH_DIR are used.
     researchqa_dir: Optional[str] = None
     scholarqabench_dir: Optional[str] = None
 
@@ -310,9 +337,15 @@ class ScholarPathConfig:
         if path.suffix in {".yaml", ".yml"}:
             import yaml
 
-            data = yaml.safe_load(text) or {}
+            try:
+                data = yaml.safe_load(text) or {}
+            except yaml.YAMLError as err:
+                raise ConfigError(f"not valid YAML: {err}") from None
         else:
-            data = json.loads(text)
+            try:
+                data = json.loads(text)
+            except ValueError as err:
+                raise ConfigError(f"not valid JSON: {err}") from None
         return cls.from_dict(data)
 
     def save(self, path: Union[str, Path]) -> None:
@@ -326,25 +359,67 @@ class ScholarPathConfig:
             path.write_text(json.dumps(self.to_dict(), indent=2), encoding="utf-8")
 
     def override(self, assignments: Iterable[str]) -> "ScholarPathConfig":
-        """Apply ``section.field=value`` overrides (values parsed as YAML)."""
+        """Apply ``section.field=value`` overrides (values parsed as YAML, then type-checked).
+
+        Nested dict entries are addressed the same way, e.g.
+        ``retrieval.granularity_weights.overview.chunk=0.4``. Raises
+        :class:`UnknownConfigField` for an unknown section / field and
+        :class:`ConfigError` for a value that does not fit the field's type.
+        """
         import yaml
 
         for item in assignments or []:
             if "=" not in item:
-                raise ValueError(f"Override must look like section.field=value, got {item!r}")
+                raise ConfigError(f"Override must look like section.field=value, got {item!r}")
             key, raw = item.split("=", 1)
-            value = _plain(yaml.safe_load(raw))
+            key = key.strip()
+            try:
+                value = _plain(yaml.safe_load(raw))
+            except yaml.YAMLError as err:
+                raise ConfigError(f"Cannot parse the value of {key}: {err}") from None
+            parts = key.split(".")
             target: Any = self
-            parts = key.strip().split(".")
-            for part in parts[:-1]:
-                target = getattr(target, part)
-            if not hasattr(target, parts[-1]):
-                raise AttributeError(f"Unknown config field: {key}")
-            current = getattr(target, parts[-1])
-            if isinstance(current, tuple) and isinstance(value, list):
-                value = tuple(value)
-            setattr(target, parts[-1], value)
+            tp: Any = ScholarPathConfig
+            for i, part in enumerate(parts):
+                dotted = ".".join(parts[: i + 1])
+                last = i == len(parts) - 1
+                if dataclasses.is_dataclass(target):
+                    names = [f.name for f in dataclasses.fields(target)]
+                    if part not in names:
+                        raise UnknownConfigField(f"Unknown config field: {dotted}{_suggest(part, names)}")
+                    tp = _field_types(type(target))[part]
+                    if last:
+                        setattr(target, part, _coerce(value, tp, key, raw=raw))
+                    else:
+                        target = getattr(target, part)
+                elif isinstance(target, dict):
+                    if part not in target:
+                        raise UnknownConfigField(f"Unknown config key: {dotted}{_suggest(part, list(target))}")
+                    args = typing.get_args(tp)
+                    tp = args[1] if len(args) == 2 else type(target[part])
+                    if last:
+                        target[part] = _coerce(value, tp, key, raw=raw)
+                    else:
+                        target = target[part]
+                else:
+                    raise UnknownConfigField(f"Unknown config field: {key} ({'.'.join(parts[:i])} is a value)")
         return self
+
+    def mock_judge_warning(self) -> Optional[str]:
+        """A warning when a real LLM backend is paired with the offline mock judges, else ``None``.
+
+        Judge-based scores (ResearchQA Rub, ScholarQA Corr / Cite, Prometheus,
+        Disc and the Feas. / Nov. / Sound. judges) are then produced by the
+        deterministic ``MockLLM`` and are not comparable with the paper.
+        """
+        if (self.llm.provider or "mock").lower() == "mock":
+            return None
+        if (self.evaluation.judge_provider or "mock").lower() != "mock":
+            return None
+        return ("llm.provider is %r but evaluation.judge_provider is 'mock': every LLM judge (Rub, Corr, "
+                "Prometheus, citation attribution, Disc, Feas./Nov./Sound.) is the offline MockLLM, so "
+                "judge-based scores are not comparable with the paper. Use configs/paper.yaml or "
+                "--set evaluation.judge_provider=openai." % self.llm.provider)
 
 
 def _plain(value: Any) -> Any:
@@ -360,31 +435,120 @@ def _plain(value: Any) -> Any:
     return value
 
 
-def _from_dict(cls: Any, data: Mapping[str, Any]) -> Any:
+def _from_dict(cls: Any, data: Mapping[str, Any], prefix: str = "") -> Any:
     if not dataclasses.is_dataclass(cls):
         return data
+    if not isinstance(data, Mapping):
+        raise ConfigError(f"{prefix.rstrip('.') or cls.__name__} must be a mapping of fields, got {data!r}")
     data = _plain(dict(data))
     kwargs: Dict[str, Any] = {}
-    hints = {f.name: f for f in dataclasses.fields(cls)}
+    names = [f.name for f in dataclasses.fields(cls)]
+    types = _field_types(cls)
     for name, value in data.items():
-        if name not in hints:
-            raise KeyError(f"Unknown field {name!r} for {cls.__name__}")
-        f = hints[name]
-        default = f.default_factory() if f.default_factory is not dataclasses.MISSING else f.default  # type: ignore[misc]
-        if dataclasses.is_dataclass(default) and isinstance(value, Mapping):
-            kwargs[name] = _from_dict(type(default), value)
-        elif isinstance(default, tuple) and isinstance(value, list):
-            kwargs[name] = tuple(value)
-        else:
-            kwargs[name] = value
+        if name not in names:
+            raise UnknownConfigField(f"Unknown config field {prefix + name!r} ({cls.__name__}){_suggest(name, names)}")
+        kwargs[name] = _coerce(value, types[name], f"{prefix}{name}")
     return cls(**kwargs)
 
 
-def resolve_path(path: Optional[str], root: Optional[Path] = None) -> Optional[Path]:
-    """Resolve a (possibly relative) path against ``root`` (default: cwd)."""
-    if path is None:
-        return None
-    p = Path(os.path.expanduser(path))
-    if not p.is_absolute() and root is not None:
-        p = root / p
-    return p
+# ---------------------------------------------------------------------------
+# Type checking of config values
+# ---------------------------------------------------------------------------
+
+_NULLS = {"null", "none", "~", ""}
+_TRUE = {"true", "yes", "on", "y", "1"}
+_FALSE = {"false", "no", "off", "n", "0"}
+
+
+@functools.lru_cache(maxsize=None)
+def _field_types(cls: Any) -> Dict[str, Any]:
+    return typing.get_type_hints(cls)
+
+
+def _suggest(name: str, candidates: Iterable[str]) -> str:
+    close = difflib.get_close_matches(name, list(candidates), n=1)
+    return f" (did you mean {close[0]!r}?)" if close else ""
+
+
+def _coerce(value: Any, tp: Any, name: str, raw: Optional[str] = None) -> Any:
+    """Check ``value`` against the field type ``tp`` and convert it where unambiguous.
+
+    ``raw`` is the unparsed text of a ``--set`` override: a ``str`` field keeps
+    it verbatim when YAML turned it into a bool / number (``off`` -> ``"off"``).
+    """
+    origin, args = typing.get_origin(tp), typing.get_args(tp)
+    if origin is Union:
+        options = [a for a in args if a is not type(None)]
+        nullable = len(options) < len(args)
+        if nullable and (value is None or (isinstance(value, str) and value.strip().lower() in _NULLS)):
+            return None
+        if len(options) == 1:
+            return _coerce(value, options[0], name, raw)
+        return value
+    if tp is Any:
+        return value
+    if dataclasses.is_dataclass(tp):
+        if isinstance(value, tp):
+            return value
+        if value is None:
+            return tp()
+        if isinstance(value, Mapping):
+            return _from_dict(tp, value, prefix=f"{name}.")
+        raise ConfigError(f"{name} is a config section; set its fields ({name}.<field>=value)")
+    if value is None:
+        raise ConfigError(f"{name} cannot be null")
+    if tp is bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, int) and value in (0, 1):
+            return bool(value)
+        if isinstance(value, str) and value.strip().lower() in _TRUE | _FALSE:
+            return value.strip().lower() in _TRUE
+        raise ConfigError(f"{name} expects true or false, got {value!r}")
+    if tp is int:
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+        if isinstance(value, float) and value.is_integer():
+            return int(value)
+        if isinstance(value, str):
+            text = value.strip()
+            try:
+                return int(text)
+            except ValueError:
+                try:
+                    number = float(text)
+                except ValueError:
+                    number = None
+                if number is not None and number.is_integer():
+                    return int(number)
+        raise ConfigError(f"{name} expects an integer, got {value!r}")
+    if tp is float:
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            try:
+                return float(value.strip())  # YAML reads 1e-3 as a string
+            except ValueError:
+                pass
+        raise ConfigError(f"{name} expects a number, got {value!r}")
+    if tp is str:
+        if isinstance(value, str):
+            return value
+        if raw is not None and isinstance(value, (bool, int, float)):
+            return raw.strip()
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return str(value)
+        raise ConfigError(f"{name} expects a string, got {value!r} (quote the value)")
+    if origin is tuple:
+        if isinstance(value, str):
+            value = [v.strip() for v in value.split(",") if v.strip()]
+        if not isinstance(value, (list, tuple)):
+            raise ConfigError(f"{name} expects a list, got {value!r}")
+        elem = args[0] if len(args) == 2 and args[1] is Ellipsis else Any
+        return tuple(_coerce(v, elem, f"{name}[{i}]") for i, v in enumerate(value))
+    if origin is dict:
+        if not isinstance(value, Mapping):
+            raise ConfigError(f"{name} expects a mapping, got {value!r}")
+        vt = args[1] if len(args) == 2 else Any
+        return {str(k): _coerce(v, vt, f"{name}.{k}") for k, v in value.items()}
+    return value

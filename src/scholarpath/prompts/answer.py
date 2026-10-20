@@ -46,6 +46,15 @@ _KIND_INSTRUCTIONS = {
     ),
 }
 
+# Assessment of a pair the literature already studies (J(u_q, m_q) non-empty, Section 2.1): retrieval
+# returns the established findings of the pair, so the verdict is an established finding, not a hypothesis.
+_STUDIED_ASSESSMENT_INSTRUCTIONS = (
+    "This is a HYPOTHESIS ASSESSMENT query, but the given problem-method pairing is ALREADY STUDIED: the "
+    "context lists established findings in which the method is applied to the problem. Report how the pairing "
+    "has been applied and what it achieved, cite every claim, and give an overall verdict grounded in these "
+    "findings. All items, including the verdict, must have status \"established\"."
+)
+
 
 def compose_answer_request(
     query: str,
@@ -54,14 +63,22 @@ def compose_answer_request(
     sources: Sequence[Dict[str, Any]] = (),
     max_tokens: int = 1536,
     component: Optional[str] = "composition",
+    studied_pair: bool = False,
 ) -> LLMRequest:
     """Build the single composition call.
 
     ``sources`` lists the citable sources present in ``context``
     (``{"paper_id", "title", "status", "candidate"}``); it is rendered in the
     context already and is passed in the payload for the offline mock.
+    ``studied_pair`` marks an assessment whose pair is already studied
+    (``RetrievalResult.stats["studied_pair"]``): its verdict is then an
+    established finding rather than a hypothesis.
     """
-    instructions = _KIND_INSTRUCTIONS.get(kind, _KIND_INSTRUCTIONS[EVIDENCE])
+    studied_pair = bool(studied_pair) and kind == HYPOTHESIS_ASSESSMENT
+    if studied_pair:
+        instructions = _STUDIED_ASSESSMENT_INSTRUCTIONS
+    else:
+        instructions = _KIND_INSTRUCTIONS.get(kind, _KIND_INSTRUCTIONS[EVIDENCE])
     ctx = context.strip() or "(no retrieved context: answer from your own knowledge and cite nothing)"
     user = (
         f"Question: {query}\n\n{instructions}\n\nContext:\n{ctx}\n\n"
@@ -72,6 +89,8 @@ def compose_answer_request(
         '            "rationale": "<why (hypotheses only)>"}]}'
     )
     payload = {"query": query, "kind": kind, "sources": list(sources), "has_context": bool(context.strip())}
+    if studied_pair:
+        payload["studied_pair"] = True
     return LLMRequest(
         task="answer.compose",
         messages=chat(SYSTEM, user),
@@ -132,7 +151,7 @@ def _mock_compose(payload: Dict[str, Any], request: LLMRequest) -> Dict[str, Any
     kind = payload.get("kind", EVIDENCE)
     sources = payload.get("sources", []) or []
     items: List[Dict[str, Any]] = []
-    if kind == EVIDENCE:
+    if kind == EVIDENCE or payload.get("studied_pair"):
         for s in sources[:12]:
             items.append({"text": f"{s.get('title', s['paper_id'])} reports relevant findings.",
                           "status": "established", "citations": [s["paper_id"]]})

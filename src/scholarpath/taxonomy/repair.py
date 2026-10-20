@@ -25,7 +25,10 @@ component (Equation 15):
   previously verified labels affected by a schema revision: verified papers
   with a missing concept, papers labelled with a refined child, and papers
   whose embedding is at least as close to a new child as to their own
-  children.
+  children. This covers labels verified before the revising operation and
+  also labels made by an earlier call of the same multi-call operation
+  (seed batch, DISCOVER draw), when a later call added or refined children
+  (:func:`schema_changes`, :func:`stale_label_candidates`).
 
 The functions here are stateless; :class:`~scholarpath.taxonomy.builder.NodeWiseBuilder`
 decides when to call them.
@@ -39,7 +42,7 @@ from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 import numpy as np
 
-from scholarpath.taxonomy.llm_ops import LabelBatch, PaperLabel, TaxonomyLLM, resolve_new_children
+from scholarpath.taxonomy.llm_ops import LabelBatch, PaperLabel, TaxonomyLLM, resolve_new_children, schema_key
 from scholarpath.taxonomy.tree import Taxonomy
 
 PoolByRegion = Union[Mapping[int, Sequence[str]], Sequence[Sequence[str]]]
@@ -261,6 +264,64 @@ def relabel_candidates(
         if not own or best_new >= max(own) - margin:
             out.append(p)
     return out
+
+
+def schema_changes(
+    seen: Optional[Mapping[str, str]], children: Mapping[str, Tuple[str, str]]
+) -> Tuple[List[str], List[str]]:
+    """Children of the current schema added or refined since a label was made.
+
+    ``seen`` is the schema the labelling call worked with
+    (:attr:`~scholarpath.taxonomy.llm_ops.PaperLabel.schema`: child name key
+    -> definition); ``children`` maps every current child node id to its
+    (name, definition). Returns ``(new, refined)`` node ids: children whose
+    name the call did not see, and children it saw with another definition.
+    ``seen=None`` (unknown) gives no change.
+    """
+    if seen is None:
+        return [], []
+    new: List[str] = []
+    refined: List[str] = []
+    for cid, (name, definition) in children.items():
+        key = schema_key(name)
+        if key not in seen:
+            new.append(cid)
+        elif (seen[key] or "") != (definition or ""):
+            refined.append(cid)
+    return new, refined
+
+
+def stale_label_candidates(
+    verified: Mapping[str, Tuple[Sequence[str], bool]],
+    labels: Mapping[str, PaperLabel],
+    children: Mapping[str, Tuple[str, str]],
+    paper_vectors: Mapping[str, np.ndarray],
+    child_vectors: Mapping[str, np.ndarray],
+    margin: float = 0.0,
+) -> List[str]:
+    """Papers of one operation whose labels a later call of the same operation may have invalidated.
+
+    An operation on more papers than fit in one call (the seed batch of
+    InitNode, a DISCOVER draw, a large acquisition batch) labels the papers of
+    its first calls before its later calls add or refine children. For every
+    paper of ``labels`` that is in ``verified`` (its recorded label), the
+    children added or refined after its call (:func:`schema_changes` of its
+    :attr:`PaperLabel.schema` against ``children``: node id -> (name,
+    definition)) select the candidates by the rules of
+    :func:`relabel_candidates`. Papers whose call saw the final schema are
+    never selected.
+    """
+    groups: Dict[Tuple[Tuple[str, ...], Tuple[str, ...]], Dict[str, Tuple[Sequence[str], bool]]] = {}
+    for pid in sorted(labels):
+        if pid not in verified:
+            continue
+        new, refined = schema_changes(labels[pid].schema, children)
+        if new or refined:
+            groups.setdefault((tuple(new), tuple(refined)), {})[pid] = verified[pid]
+    out: Set[str] = set()
+    for (new, refined), part in groups.items():
+        out.update(relabel_candidates(part, new, refined, paper_vectors, child_vectors, margin=margin))
+    return sorted(out)
 
 
 def relabel(

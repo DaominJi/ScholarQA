@@ -1,20 +1,38 @@
 # Scripts
 
-Every script adds `src/` to `sys.path`, so it runs without installation. All
-share the runtime flags of `scholarpath.runtime.add_common_args`:
+Every script adds `src/` to `sys.path`, so it runs without installation. The
+experiment scripts (all but the five data-preparation scripts below) share
+the runtime flags of `scholarpath.runtime.add_common_args`:
 
 | Flag | Meaning |
 |---|---|
-| `--config configs/paper.yaml` | paper setting (DeepSeek-V4.0-Flash + SPECTER2); default `configs/default.yaml` is offline (mock LLM + hashing embedder) |
-| `--set section.field=value` | override any config field (repeatable), e.g. `--set retrieval.budget=4096` |
+| `--config configs/paper.yaml` | paper setting (DeepSeek-V4.0-Flash + SPECTER2 + real judges); default `configs/default.yaml` is offline (mock LLM, hashing embedder, mock judges) |
+| `--set section.field=value` | override any config field (repeatable, type-checked), e.g. `--set retrieval.budget=4096` |
 | `--llm mock\|openai`, `--model`, `--embedder` | shortcuts for the LLM / embedding backends |
 | `--output-dir` | where results go (default `results/<script>/`) |
 | `--seed`, `--verbose` | seeding and logging |
 
+Scripts that read the processed data layout also take `--data-dir`
+(default `data/processed`; `data/synthetic` offline). `build_taxonomy`,
+`run_scalability` and `run_dynamic_update` take a corpus file (`--corpus`),
+and `train_link_predictor` and `ask` take an index (`--index-dir`,
+`--corpus`). Other default locations: indexes and link predictors in
+`artifacts/index/<corpus>/` (`--index-dir`), the taxonomy build cache in
+`results/taxonomy_cache/` (`--cache-dir`), and the held-out benchmark in
+`data/processed/heldout/` (`build_heldout_benchmark.py --out`).
+
+The data-preparation scripts (`download_data`, `prepare_arxiv`,
+`prepare_fulltext`, `prepare_benchmarks`, `make_synthetic_data`) have their
+own flags (`--root` / `--out`, `--only`, `--limit`, ...; see
+`data/README.md`). Only `prepare_fulltext` reads `--config` / `--set`, for the
+chunk sizes.
+
 Each script's module docstring (`--help`) states what it reproduces, the
 command for the paper setting, and a quick offline command on the synthetic
 layout (`python scripts/make_synthetic_data.py --out data/synthetic`).
-`bash scripts/smoke_test.sh` chains the offline commands end to end.
+`bash scripts/smoke_test.sh` chains the offline commands end to end. An
+invalid `--set` value or an unknown field stops a script with a one-line
+error.
 
 ## Data preparation (see `data/README.md`)
 
@@ -44,7 +62,8 @@ layout (`python scripts/make_synthetic_data.py --out data/synthetic`).
 | `train_link_predictor.py` | temporal cross-taxonomy link predictor (Sec. 4.3, App. B.5) for an index |
 | `build_heldout_benchmark.py` | held-out hypothesis benchmark (App. C.1): `build` (targets, corpus reduction, query generation, leakage screen, annotation sheet) and `apply` (annotator decisions) |
 | `run_retrieval_eval.py` | Table 2 and Fig. 5 (Recall@B / NDCG@B for ScholarPath, BM25, SPECTER, Dense + reranker, RAPTOR, LightRAG; B ∈ {2K, 4K, 6K, 8K, 16K}) |
-| `run_qa_eval.py` | Tables 3–4 and Fig. 6 (budgeted end-to-end QA: Answer LLM w/o retrieval, Keyword search, Dense retrieval, LightRAG, ScholarPath; evaluation of saved agent answers with `--answers-dir`) |
+| `run_qa_eval.py` | Table 1 (benchmark statistics), Tables 3–4 and Fig. 6 (budgeted end-to-end QA: Answer LLM w/o retrieval, Keyword search, Dense retrieval, LightRAG, ScholarPath; evaluation of saved agent answers with `--answers-dir`) |
+| `run_official_eval.py` | the ResearchQA / ScholarQABench columns of Table 3 with the official evaluation scripts (App. C.3), from the saved answers of `run_qa_eval.py` / `run_agents.py` |
 | `run_agents.py` | unbudgeted agents (PaperQA2, OpenScholar, AgenticScholar, Codex; `simulated` for offline tests) |
 | `run_efficiency.py` | Table 5 (calls, tokens, cost, latency per query) and the Sec. 5.3.3 operator statistics (`--operator-stats`) |
 | `run_retrieval_ablation.py` | Table 7 (w/o temporal link prediction, bound-guided search, role-aware granularity, shared-cost reuse update) |
@@ -56,9 +75,18 @@ layout (`python scripts/make_synthetic_data.py --out data/synthetic`).
   of the configuration and the corpus. `--resume` reuses only results
   produced under the same settings, and FULL is built once per dataset and
   facet.
-- **Judges.** They are configured in the `evaluation:` config section and
-  are mock judges offline. Their cost is metered separately and is
-  excluded from Table 5.
+- **Judges.** They are configured in the `evaluation:` config section: mock
+  judges in `configs/default.yaml`, and the real judges plus the
+  AttrScore NLI citation judge in `configs/paper.yaml`. A real backbone
+  with mock judges triggers a warning. Judge cost is metered separately and
+  is excluded from Table 5.
+- **TaxoBench gold depth.** `run_taxonomy_experiments.py --gold-max-depth`
+  (default 4, App. C.2) and `build_taxonomy.py --reference-max-depth` cut the
+  merged expert gold at evaluation time. `prepare_benchmarks.py
+  --taxobench-max-depth` truncates the stored file instead (default: all
+  levels).
+- **Failed queries** score 0 in Tables 2–4 (`run_retrieval_eval.py`,
+  `run_qa_eval.py`, `run_official_eval.py`).
 - **Clean latencies.** For Table 5 latencies without the LLM response
   cache, run with `--set llm.cache_dir=null`.
 - **RAPTOR and LightRAG on arXiv-Subfields.** They build their trees and

@@ -67,7 +67,12 @@ Reproducibility of cached runs
 Every cached record carries a fingerprint of the configuration that produced
 it (:meth:`QAEnvironment.fingerprint`: system variant, retrieval / system
 options, link predictor, LLM, embedder and index); ``--resume`` reuses a
-record only when the fingerprint matches. Table 5 latencies are computed
+record only when the fingerprint matches, and a run without ``--resume``
+refuses to replace records of another configuration
+(:class:`CacheConflictError`) unless ``--force`` is given. Indexes record
+their embedder (:func:`embedding_identity`); query vectors of another
+embedder are refused (:class:`EmbeddingMismatchError`). Failed or missing
+answers score 0 on every metric (:func:`score_missing_as_zero`). Table 5 latencies are computed
 uniformly for every budgeted system (:func:`online_latency`): wall time minus
 offline indexing, plus the recorded latency of calls served from the LLM
 response cache, so that a warm cache never favours one system.
@@ -80,7 +85,6 @@ import copy
 import dataclasses
 import hashlib
 import importlib
-import importlib.util
 import json
 import logging
 import math
@@ -98,13 +102,14 @@ from scholarpath.baselines.common import (
     index_build_seconds,
     split_usage,
 )
-from scholarpath.config import EvaluationConfig, LLMConfig, RetrievalConfig
+from scholarpath.config import EmbeddingConfig, EvaluationConfig, LLMConfig, RetrievalConfig
 from scholarpath.data.corpus import Corpus, load_queries, read_json, write_json
 from scholarpath.embeddings import l2_normalize
 from scholarpath.evaluation.efficiency import EfficiencyTracker, QueryEfficiency, summarize_efficiency
 from scholarpath.evaluation.judges import JudgePanel, JudgeSpec
 from scholarpath.evaluation.reporting import Column, TableSpec
 from scholarpath.evaluation.retrieval_metrics import RetrievalEvaluation, evaluate_retrieval
+from scholarpath.experiments.common import _json_default, matplotlib_available, restrict_taxonomy, split_csv
 from scholarpath.index.semantic_index import SemanticIndex, parse_key
 from scholarpath.llm import sum_usage
 from scholarpath.retrieval.link_prediction import LinkPredictor
@@ -188,7 +193,8 @@ class SystemSpec:
 #:   (EmbeddingLinkPredictor), so candidates are still scored ("confirming the
 #:   importance of structural analogies over text similarity", App. C.4;
 #:   Table 7 still reports 348 scored candidates);
-#: * "w/o bound-guided search" is the exhaustive greedy scan (Proposition 7);
+#: * "w/o bound-guided search" is the unpruned scan that scores every candidate
+#:   node in scope (same selections, Proposition 7);
 #: * ``scholarpath_no_link_prior`` (not a Table 7 row) drops the prior
 #:   altogether (``use_link_prediction=False``: eta_hat = phi).
 ABLATIONS: Dict[str, Tuple[str, Tuple[Tuple[str, Any], ...], str]] = {
@@ -273,7 +279,7 @@ def resolve_systems(names: Union[str, Sequence[str], None], default: Sequence[st
     """
     if names is None:
         return list(default)
-    items = csv_list(names) if isinstance(names, str) else [str(n) for n in names]
+    items = split_csv(names) if isinstance(names, str) else [str(n) for n in names]
     if not items or items == ["all"]:
         return list(default)
     out: List[str] = []
@@ -399,7 +405,7 @@ def resolve_benchmarks(names: Union[str, Sequence[str], None], available: Option
     message) unless they were requested explicitly by key.
     """
     explicit = names is not None
-    items = (csv_list(names) if isinstance(names, str) else list(names)) if names is not None else list(
+    items = (split_csv(names) if isinstance(names, str) else list(names)) if names is not None else list(
         default if default is not None else BENCHMARKS)
     out: List[str] = []
     for n in items:
@@ -614,38 +620,6 @@ def link_predictor_identity(path: PathLike) -> str:
     return f"trained:{h.hexdigest()[:16]}"
 
 
-def restrict_taxonomy(tax: Taxonomy, paper_ids: Iterable[str], drop_empty: bool = True) -> Taxonomy:
-    """Copy of ``tax`` whose extents and residual leaves only keep ``paper_ids``.
-
-    Prebuilt taxonomies (e.g. built over the complete corpus) must not
-    reference papers that are absent from the indexed corpus. With
-    ``drop_empty`` (default), every non-root concept whose extent becomes
-    empty is removed together with its subtree (extents contain their
-    descendants' papers, so the whole subtree is empty): a concept whose
-    papers were all removed -- e.g. the new endpoint of a held-out idea
-    (App. C.1) -- must not stay in the index with its name and definition.
-    ``out.metadata["restriction"]`` records the removed papers and concepts.
-    """
-    keep = set(paper_ids)
-    out = Taxonomy.from_dict(tax.to_dict())
-    before = out.all_papers()
-    for node in out.nodes.values():
-        node.papers &= keep
-        node.residual &= keep
-    out.invalidate()
-    removed: List[str] = []
-    if drop_empty:
-        for nid in out.preorder():
-            if nid != out.root_id and nid in out.nodes and not out.nodes[nid].papers:
-                sub = list(out.descendants(nid, include_self=True))
-                removed.extend(sub)
-                out.remove_subtree(nid)
-    out.invalidate()
-    out.metadata["restriction"] = {"papers_removed": len(before - keep), "concepts_removed": len(removed),
-                                   "removed_concepts": [str(n) for n in removed[:1000]]}
-    return out
-
-
 def embed_papers(corpus: Corpus, embedder: Any, batch_size: int = 1024) -> Dict[str, np.ndarray]:
     """Unit-norm embeddings of the paper summaries (title + abstract), shared by builder and index."""
     ids = corpus.ids
@@ -654,6 +628,33 @@ def embed_papers(corpus: Corpus, embedder: Any, batch_size: int = 1024) -> Dict[
         part = ids[s : s + batch_size]
         vecs = l2_normalize(np.asarray(embedder.encode(corpus.texts(part)), dtype=np.float32))
         out.update(zip(part, vecs))
+    return out
+
+
+def embedding_identity(config: EmbeddingConfig) -> Dict[str, Any]:
+    """What makes paper and query vectors comparable: backend, model / adapter (or the hashing dimension)."""
+    backend = str(config.backend or "hashing").lower()
+    backend = "sentence-transformers" if backend == "st" else backend
+    out: Dict[str, Any] = {"backend": backend}
+    if backend == "hashing":
+        out["dim"] = int(config.dim)
+    else:
+        out["model"] = config.model_name
+    if backend == "specter2":
+        out["adapter"] = config.adapter
+    return out
+
+
+class EmbeddingMismatchError(ValueError):
+    """The runtime embedder differs from the one that encoded the index's paper / chunk vectors."""
+
+
+def embedding_mismatches(index_identity: Mapping[str, Any], runtime_identity: Mapping[str, Any]) -> List[str]:
+    """Fields on which an index's embedder and the runtime's differ (only fields recorded by both)."""
+    out = []
+    for key in ("backend", "model", "adapter", "dim"):
+        if key in index_identity and key in runtime_identity and index_identity[key] != runtime_identity[key]:
+            out.append(f"{key}: index {index_identity[key]!r} vs. runtime {runtime_identity[key]!r}")
     return out
 
 
@@ -756,7 +757,7 @@ def build_index(
         "taxonomy_method": method_name,
         "index": index.stats(),
         "llm": {"provider": rt.config.llm.provider, "model": rt.config.llm.model},
-        "embedding": {"backend": rt.config.embedding.backend, "model": rt.config.embedding.model_name},
+        "embedding": embedding_identity(rt.config.embedding),
         "cost_usd": total.cost_usd,
         "llm_calls": total.calls,
         "tokens": total.total_tokens,
@@ -770,7 +771,8 @@ def build_index(
         if res is not None:
             summary[f"{facet}_build"] = res.summary()
     index.metadata.update({"name": name, "corpus": corpus.name, "taxonomy_method": method_name,
-                           "papers": len(corpus), "built_at": time.strftime("%Y-%m-%dT%H:%M:%S")})
+                           "papers": len(corpus), "built_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                           "embedding": embedding_identity(rt.config.embedding)})
     return IndexBuild(index, problem_res, method_res, summary)
 
 
@@ -878,9 +880,15 @@ class SystemOptions:
     corpora (arXiv-Subfields, 148K papers) indexing every unit with LLM
     summaries / extractions is prohibitive, so they run over a per-query
     candidate pool of the top ``graph_candidates`` papers of the SPECTER2
-    dense retriever (``candidate_retriever`` + ``candidate_papers``). Their
-    offline indexing calls are billed to ``index_build`` and excluded from
-    per-query cost (Table 5).
+    dense retriever (``candidate_retriever`` + ``candidate_papers``). This
+    is a protocol deviation: the paper's baselines index the corpus globally
+    offline, whereas here the per-query tree / graph construction (LLM
+    summaries / extractions over the candidates) runs at query time. It is
+    billed to ``index_build`` and kept out of Table 5's online Calls /
+    Tokens / Cost / Latency, as offline indexing would be, but recorded per
+    query (``index_build_calls`` / ``_tokens`` / ``_cost_usd`` and
+    ``excluded_latency_s`` of :func:`efficiency_entry`) and reported in the
+    "Index-build" columns of ``table5_detail`` (run_efficiency.py).
     """
 
     graph_candidates: int = 100
@@ -970,20 +978,6 @@ def parse_budget_tag(tag: str) -> Optional[int]:
     if m is None:
         raise ValueError(f"Bad budget tag {tag!r}")
     return int(m.group(1))
-
-
-def _json_default(value: Any) -> Any:
-    if isinstance(value, (np.integer, np.floating, np.bool_)):
-        return value.item()
-    if isinstance(value, np.ndarray):
-        return value.tolist()
-    if isinstance(value, (set, frozenset)):
-        return sorted(value)
-    if isinstance(value, Path):
-        return str(value)
-    if dataclasses.is_dataclass(value) and not isinstance(value, type):
-        return dataclasses.asdict(value)
-    return str(value)
 
 
 def config_fingerprint(config: Mapping[str, Any]) -> str:
@@ -1083,6 +1077,54 @@ class RecordStore:
     def systems(self, benchmark: str) -> List[str]:
         return sorted({s for b, s, _, _ in self.entries() if b == benchmark})
 
+    def foreign_records(self, benchmark: str, system: str, budget: Optional[int],
+                        fingerprint: Optional[str]) -> Dict[str, int]:
+        """Successful cached records produced under another configuration: ``{fingerprint: count}``."""
+        out: Dict[str, int] = {}
+        for r in self.load_file(self.path(benchmark, system, budget)).values():
+            if r.ok and r.fingerprint != fingerprint:
+                key = str(r.fingerprint)
+                out[key] = out.get(key, 0) + 1
+        return out
+
+
+class CacheConflictError(RuntimeError):
+    """A run without ``--resume`` would delete cached records of another configuration.
+
+    Answers of the paper setting are expensive (LLM calls, agents with
+    1-hour timeouts); a run that forgot ``--config`` must not silently replace
+    them with answers of the offline default configuration. The scripts map
+    this error to ``--force``.
+    """
+
+
+def check_cache_conflicts(store: RecordStore, runs: Iterable[Tuple[str, str, Optional[int], Optional[str]]],
+                          *, resume: bool = False, force: bool = False) -> None:
+    """Refuse (:class:`CacheConflictError`) to replace cached records of another configuration.
+
+    ``runs`` are ``(benchmark, system, budget, fingerprint)`` tuples of the
+    planned runs. Without ``resume`` a run replaces its cache file; if that
+    file holds successful records whose fingerprint differs from the current
+    configuration, the run is refused unless ``force``. (With ``resume``,
+    records of the current configuration are reused and records of another
+    one are regenerated and *appended*, so the older lines stay in the file.)
+    """
+    if resume or force:
+        return
+    conflicts = []
+    for bench, system, budget, fp in runs:
+        foreign = store.foreign_records(bench, system, budget, fp)
+        if foreign:
+            n = sum(foreign.values())
+            conflicts.append(f"{store.path(bench, system, budget)} ({n} answers, fingerprint "
+                             f"{', '.join(sorted(foreign))}; current {fp})")
+    if conflicts:
+        raise CacheConflictError(
+            "Refusing to replace cached records produced under another configuration:\n  "
+            + "\n  ".join(conflicts)
+            + "\nRerun with the configuration that produced them (e.g. --config configs/paper.yaml) and --resume, "
+              "evaluate them with --eval-only, write to another --output-dir, or pass --force to replace them.")
+
 
 class QAEnvironment:
     """One semantic index with every compared system over it (built lazily and cached).
@@ -1118,7 +1160,9 @@ class QAEnvironment:
                                          or f"in-memory:{type(link_predictor).__name__}:{id(link_predictor)}")
         self.options = options or SystemOptions()
         self.cache_dir = Path(cache_dir) if cache_dir else None
+        self.index_dir: Optional[Path] = None
         self.warned_untrained_prior = False
+        self._embedder_checked = False
         self._pool: Optional[PassagePool] = None
         self._dense: Any = None
         self._retrievers: Dict[str, Any] = {}
@@ -1139,6 +1183,7 @@ class QAEnvironment:
         lp = load_link_predictor(index_dir, link_predictor)
         env = cls(index, runtime, name=name or index_dir.name, link_predictor=lp, options=options,
                   cache_dir=index_dir / "baselines")
+        env.index_dir = index_dir
         log.info("Loaded index %s (%d papers, %d chunks; link predictor: %s)", index_dir, len(index.papers),
                  len(index.chunks), type(lp).__name__ if lp is not None else "untrained prior")
         return env
@@ -1151,6 +1196,42 @@ class QAEnvironment:
     @property
     def embedder(self) -> Any:
         return self.runtime.embedder
+
+    def index_embedding(self) -> Optional[Dict[str, Any]]:
+        """The embedder that encoded the index (index metadata, else ``build_summary.json``; ``None`` if unknown)."""
+        ident = (self.index.metadata or {}).get("embedding")
+        if isinstance(ident, Mapping):
+            return dict(ident)
+        if self.index_dir is not None and (self.index_dir / "build_summary.json").exists():
+            try:
+                ident = read_json(self.index_dir / "build_summary.json").get("embedding")
+            except (OSError, ValueError):
+                ident = None
+            if isinstance(ident, Mapping):
+                return dict(ident)
+        return None
+
+    def check_embedder(self) -> None:
+        """Refuse to encode queries with another embedder than the index's (:class:`EmbeddingMismatchError`).
+
+        SPECTER2 and the offline hashing embedder are both 768-d, so a query
+        vector of the wrong embedder would silently be compared with the
+        index vectors (e.g. ``run_efficiency.py --operator-stats`` without
+        ``--config configs/paper.yaml`` on a paper-setting index).
+        """
+        if self._embedder_checked:
+            return
+        ident = self.index_embedding()
+        if ident is None:
+            log.debug("Index %s does not record its embedder; skipping the embedder check", self.name)
+        else:
+            diffs = embedding_mismatches(ident, embedding_identity(self.runtime.config.embedding))
+            if diffs:
+                raise EmbeddingMismatchError(
+                    f"Index {self.name} was built with another embedder than the current configuration "
+                    f"({'; '.join(diffs)}): query vectors would not be comparable with the index vectors. "
+                    "Pass the --config / --set options the index was built with (e.g. --config configs/paper.yaml).")
+        self._embedder_checked = True
 
     @property
     def pool(self) -> PassagePool:
@@ -1168,6 +1249,7 @@ class QAEnvironment:
         if self._dense is None:
             from scholarpath.baselines.dense import DenseRetriever
 
+            self.check_embedder()
             self._dense = DenseRetriever.from_index(self.pool, self.index, self.embedder)
         return self._dense
 
@@ -1253,6 +1335,8 @@ class QAEnvironment:
 
         spec = SYSTEMS[system]
         llm, emb, opts = self.llm, self.embedder, self.options
+        if spec.family == "scholarpath" or system in ("raptor", "lightrag"):
+            self.check_embedder()  # query (and node) vectors must live in the index's embedding space
         if spec.family == "scholarpath":
             from scholarpath.retrieval.pipeline import ScholarPathRetriever
 
@@ -1397,6 +1481,7 @@ class QAEnvironment:
         tracker = tracker or EfficiencyTracker(self.llm.meter, system=system)
         record = RunRecord(query.query_id, benchmark, system, budget, fingerprint=self.fingerprint(system))
         retrieval_full: Optional[RetrievalResult] = None
+        before = self.llm.meter.snapshot()
         with tracker.track(query.query_id) as holder:
             try:
                 if mode == "retrieval":
@@ -1410,7 +1495,9 @@ class QAEnvironment:
                 record.error = f"{type(err).__name__}: {err}"
         if retrieval_full is not None:
             record.retrieval = compact_retrieval(retrieval_full, keep_context)
-        record.efficiency = efficiency_entry(holder["record"], record.answer, record.retrieval)
+        index_usage = self.llm.meter.diff(before).get("index_build")
+        record.efficiency = efficiency_entry(holder["record"], record.answer, record.retrieval,
+                                             index_build=index_usage)
         if record.answer is not None:
             record.answer.latency_s = float(record.efficiency["latency_s"])
         return record
@@ -1449,6 +1536,7 @@ def efficiency_entry(
     retrieval: Optional[RetrievalResult] = None,
     *,
     metered: bool = True,
+    index_build: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Per-query efficiency row (Table 5).
 
@@ -1463,6 +1551,13 @@ def efficiency_entry(
     with :meth:`EfficiencyTracker.record_answer`) keep the latency the system
     reported. ``composition_calls`` counts the calls of the ``composition``
     component, ``retrieval_calls`` every other online call.
+
+    ``index_build`` (the ``index_build`` usage the query triggered: RAPTOR /
+    LightRAG trees and graphs built at query time over a per-query candidate
+    pool on large corpora, :class:`SystemOptions`) is kept out of the online
+    columns but recorded as ``index_build_calls`` / ``index_build_tokens`` /
+    ``index_build_cost_usd`` next to ``excluded_latency_s``, so that
+    ``table5_detail`` can report this per-query construction work.
     """
     d = measured.to_dict()
     d["wall_clock_s"] = measured.latency_s
@@ -1476,6 +1571,11 @@ def efficiency_entry(
     comp = (measured.components or {}).get("composition", {})
     d["composition_calls"] = int(comp.get("calls", 0) or 0)
     d["retrieval_calls"] = int(measured.calls) - d["composition_calls"]
+    if metered:
+        ib = index_build
+        d["index_build_calls"] = int(getattr(ib, "calls", 0) or 0)
+        d["index_build_tokens"] = int(getattr(ib, "total_tokens", 0) or 0)
+        d["index_build_cost_usd"] = float(getattr(ib, "cost_usd", 0.0) or 0.0)
     return d
 
 
@@ -1492,6 +1592,7 @@ def run_queries(
     fail_fast: bool = False,
     keep_context: bool = False,
     log_every: int = 25,
+    force: bool = False,
 ) -> Dict[str, RunRecord]:
     """Run one system over a benchmark's queries at one budget, caching every record.
 
@@ -1499,13 +1600,18 @@ def run_queries(
     succeeded AND were produced under the current configuration
     (:meth:`QAEnvironment.fingerprint`); failed queries and records of
     another configuration (e.g. before ``--no-query-llm`` or a retrained link
-    predictor) are regenerated, the latter with a warning. Without
-    ``resume`` the cache file is replaced. Queries are processed
-    sequentially so that per-query cost-meter diffs are exact.
+    predictor) are regenerated, the latter with a warning (the new records
+    are appended; :meth:`RecordStore.load_latest` reads the latest
+    configuration). Without ``resume`` the cache file is replaced -- unless
+    it holds records of another configuration, which raises
+    :class:`CacheConflictError` (``force=True`` replaces them anyway).
+    Queries are processed sequentially so that per-query cost-meter diffs
+    are exact.
     """
     fp = env.fingerprint(system)
     done: Dict[str, RunRecord] = {}
     if store is not None:
+        check_cache_conflicts(store, [(benchmark, system, budget, fp)], resume=resume, force=force)
         if resume:
             cached = store.load(benchmark, system, budget)
             wanted = {q.query_id for q in queries}
@@ -1597,6 +1703,7 @@ class AgentOptions:
     agenticscholar_fn: Optional[str] = None  # "package.module:function"
     codex_binary: str = "codex"
     codex_isolation: str = "unshare"
+    codex_wire_api: str = "chat"  # the paper's Codex v0.42 + a chat-completions backbone endpoint
     paperqa_embedding: Optional[str] = None
 
 
@@ -1644,7 +1751,7 @@ def build_agent(key: str, env: QAEnvironment, options: AgentOptions, export_dir:
         if export_dir is None:
             raise ValueError("Codex needs the exported corpus shards (export_dir)")
         return A.CodexAgent(export_dir, cfg, binary=options.codex_binary, isolation=options.codex_isolation,
-                            valid_ids=list(env.index.papers))
+                            wire_api=options.codex_wire_api, valid_ids=list(env.index.papers))
     raise ValueError(f"Unknown agent {key!r}; expected one of {AGENT_SYSTEMS + (SIMULATED,)}")
 
 
@@ -1672,7 +1779,9 @@ def agent_task_query(query: Query) -> Query:
 def agent_fingerprint(key: str, env: QAEnvironment, options: AgentOptions) -> str:
     """Cache fingerprint of an agent run: agent, index, backbone LLM and the agent options."""
     llm = env.runtime.config.llm
-    opts = {k: v for k, v in dataclasses.asdict(options).items() if k != "workdir"}
+    # workdir is scratch space; the default Codex wire API is omitted so that earlier fingerprints stay valid.
+    opts = {k: v for k, v in dataclasses.asdict(options).items()
+            if k != "workdir" and not (k == "codex_wire_api" and v == "chat")}
     return config_fingerprint({
         "system": key,
         "index": {"name": env.name, "papers": len(env.index.papers),
@@ -1695,6 +1804,7 @@ def run_agent(
     valid_ids: Optional[Iterable[str]] = None,
     llm_config: Optional[LLMConfig] = None,
     fingerprint: Optional[str] = None,
+    force: bool = False,
 ) -> Dict[str, RunRecord]:
     """Run an unbudgeted agent over a benchmark; records use the budget tag ``unbudgeted``.
 
@@ -1708,13 +1818,15 @@ def run_agent(
     system, App. C.3). For organization queries the records are additionally
     stored as a hierarchy (:func:`records_to_hierarchy`). With ``resume``,
     records are reused only if their ``fingerprint`` matches
-    (:func:`agent_fingerprint`). An
+    (:func:`agent_fingerprint`); without it, cached answers of another
+    configuration raise :class:`CacheConflictError` unless ``force``. An
     :class:`~scholarpath.baselines.agents.AgentUnavailableError` aborts the run.
     """
     from scholarpath.baselines.agents import AgentUnavailableError
 
     done: Dict[str, RunRecord] = {}
     if store is not None:
+        check_cache_conflicts(store, [(benchmark, system, None, fingerprint)], resume=resume, force=force)
         if resume:
             cached = store.load(benchmark, system, None)
             stale = [qid for qid, r in cached.items() if r.ok and r.fingerprint != fingerprint]
@@ -1945,6 +2057,63 @@ def evaluate_organization(
     return summary, rows
 
 
+def score_missing_as_zero(
+    summary: Mapping[str, Any],
+    counts: Mapping[str, Optional[float]],
+    *,
+    n_missing: int,
+    n_expected: int,
+) -> Dict[str, Any]:
+    """Fold failed / missing answers into the means as 0 (Table 3 evidence metrics).
+
+    The official ResearchQA / ScholarQABench scripts average over the answers
+    they receive; a system that fails or times out on a query (an agent with
+    a 1-hour timeout, a crashed retrieval) would then be averaged over its
+    successful queries only, while Recall@B, the organization metrics and
+    Disc count the same failure as 0. Every metric in ``counts`` (key ->
+    number of answers it was averaged over) is rescaled to the mean over
+    those answers plus ``n_missing`` zeros: ``v * n / (n + n_missing)``. This
+    is exact for arithmetic means and for Cite = F1(mean precision, mean
+    recall), whose precision and recall both scale by the same factor. A
+    metric without any scored answer becomes 0 when answers are missing.
+
+    The answered-only values are kept as ``<key>_answered``; ``n`` becomes
+    ``n_expected`` (the benchmark's number of queries, which weights
+    ScholarQA-CS / -Multi in :func:`qa_table_row`), ``n_scored`` the number
+    of answered queries and ``n_missing`` the failed / missing ones.
+    """
+    out: Dict[str, Any] = dict(summary)
+    for key, n in counts.items():
+        value = summary.get(key)
+        n = float(n or 0.0)
+        if value is None:
+            if n_missing > 0 and n == 0.0:
+                out[key] = 0.0
+            continue
+        out[f"{key}_answered"] = value
+        if n_missing > 0:
+            out[key] = float(value) * n / (n + n_missing)
+    out["n_scored"] = float(summary.get("n") or 0.0)
+    out["n_missing"] = float(n_missing)
+    out["n"] = float(n_expected)
+    return out
+
+
+def _missing_rows(query_ids: Iterable[str], benchmark: str, keys: Sequence[str]) -> List[Dict[str, Any]]:
+    """Per-query rows of failed / missing answers (every reported metric 0)."""
+    return [{"query_id": qid, "benchmark": benchmark, "missing": True, **{k: 0.0 for k in keys}}
+            for qid in query_ids]
+
+
+def _first_per_text(query_ids: Sequence[str], queries: Sequence[Query]) -> List[str]:
+    """One query id per distinct question text (ScholarQA-CS scores doubly annotated questions once)."""
+    text_of = {q.query_id: q.text for q in queries}
+    seen: Dict[str, str] = {}
+    for qid in query_ids:
+        seen.setdefault(text_of.get(qid, qid), qid)
+    return list(seen.values())
+
+
 def evaluate_benchmark(
     benchmark: str,
     answers: Mapping[str, Answer],
@@ -1968,26 +2137,47 @@ def evaluate_benchmark(
     * TaxoBench / CHIME: :func:`evaluate_organization`;
     * Held-out hypothesis queries: Disc (Hit@10) and the three-judge
       Feasibility / Novelty / Soundness scores (0-100) and their average.
+
+    A query without an answer in ``answers`` (failed or missing) scores 0
+    on every metric (:func:`score_missing_as_zero`; the organization and
+    hypothesis protocols already do so), so systems that fail are not
+    averaged over their successful queries only.
     """
     from scholarpath.evaluation import hypothesis_metrics as H
     from scholarpath.evaluation import qa_metrics as QM
 
     spec = BENCHMARKS[benchmark]
     out = BenchmarkEval(benchmark, system, budget)
+    cite_keys = ("Cite", "citation_prec", "citation_rec") if judges.attribution is not None else ()
     if spec.protocol == PROTOCOL_RESEARCHQA:
         ev = QM.evaluate_researchqa(answers, queries, judges.researchqa, papers=papers)
-        out.summary, out.rows = dict(ev.summary), ev.rows
-        out.summary["n_missing"] = float(len(ev.missing))
+        n_rows = float(len(ev.rows))
+        out.summary = score_missing_as_zero(
+            ev.summary, {"Rub": ev.summary.get("n"), "Cite": n_rows, "cite_P": n_rows, "cite_R": n_rows},
+            n_missing=len(ev.missing), n_expected=len(queries))
+        out.rows = ev.rows + _missing_rows(ev.missing, benchmark, ("Rub", "Cite"))
     elif spec.protocol == PROTOCOL_CS:
         ev = QM.evaluate_scholarqa_cs(answers, queries, judges.scholarqa_cs, attribution_judge=judges.attribution,
                                       papers=papers)
-        out.summary, out.rows = dict(ev.summary), ev.rows
-        out.summary["n_missing"] = float(len(ev.missing))
+        # Doubly annotated questions are scored once (official rubric_eval.py): count distinct questions.
+        n_expected = len({q.text for q in queries})
+        n_cite = float(sum(1 for r in ev.rows if "citation_prec" in r))
+        counts: Dict[str, Optional[float]] = {"Corr": ev.summary.get("n"), "ann_score": ev.summary.get("n")}
+        counts.update({k: n_cite for k in cite_keys})
+        out.summary = score_missing_as_zero(ev.summary, counts, n_missing=max(0, n_expected - len(ev.rows)),
+                                            n_expected=n_expected)
+        scored_ids = {r["query_id"] for r in ev.rows}
+        scored_texts = {q.text for q in queries if q.query_id in scored_ids}
+        missing = _first_per_text([q.query_id for q in queries if q.text not in scored_texts], queries)
+        out.rows = ev.rows + _missing_rows(missing, benchmark, ("Corr",) + cite_keys[:1])
     elif spec.protocol == PROTOCOL_MULTI:
         ev = QM.evaluate_scholarqa_multi(answers, queries, judges.prometheus, attribution_judge=judges.attribution,
                                          papers=papers)
-        out.summary, out.rows = dict(ev.summary), ev.rows
-        out.summary["n_missing"] = float(len(ev.missing))
+        n_cite = float(sum(1 for r in ev.rows if "citation_prec" in r))
+        counts = {"Corr": ev.summary.get("n")}
+        counts.update({k: n_cite for k in cite_keys})
+        out.summary = score_missing_as_zero(ev.summary, counts, n_missing=len(ev.missing), n_expected=len(queries))
+        out.rows = ev.rows + _missing_rows(ev.missing, benchmark, ("Corr",) + cite_keys[:1])
     elif spec.protocol == PROTOCOL_ORGANIZATION:
         layout = layout or DataLayout()
         titles = {pid: p.title for pid, p in papers.items()}
@@ -2001,7 +2191,30 @@ def evaluate_benchmark(
     else:  # pragma: no cover - guarded by BENCHMARKS
         raise ValueError(f"Unknown protocol {spec.protocol!r}")
     out.summary.setdefault("n_queries", float(len(queries)))
+    n_answered = sum(1 for q in queries if q.query_id in answers)
+    out.summary["n_answered"] = float(n_answered)
+    out.summary["n_unanswered"] = float(len(queries) - n_answered)
     return out
+
+
+#: Column of Tables 3-4 counting failed / missing answers (scored 0), shown only when some system has any.
+FAILED_COLUMN = Column("Failed", "Failed", higher_is_better=False)
+
+
+def unanswered_cell(evals: Iterable[BenchmarkEval]) -> Tuple[int, int, str]:
+    """``(failed, total, "failed/total")`` over a system's evaluations (failed = no answer, scored 0)."""
+    failed = total = 0
+    for ev in evals:
+        total += int(ev.summary.get("n_queries") or 0)
+        failed += int(ev.summary.get("n_unanswered") or 0)
+    return failed, total, f"{failed}/{total}"
+
+
+def with_failed_column(spec: TableSpec, rows: Mapping[str, Mapping[str, Any]]) -> TableSpec:
+    """``spec`` plus :data:`FAILED_COLUMN` if any row reports failed answers (``row["n_failed"] > 0``)."""
+    if not any(int(r.get("n_failed") or 0) > 0 for r in rows.values()):
+        return spec
+    return dataclasses.replace(spec, columns=list(spec.columns) + [FAILED_COLUMN])
 
 
 def qa_table_row(evals: Mapping[str, BenchmarkEval]) -> Dict[str, Any]:
@@ -2056,13 +2269,19 @@ def table3_spec(groups: Iterable[str]) -> TableSpec:
 
 
 TABLE5_DETAIL = TableSpec(
-    "table5_detail", "Table 5 (detail): per-query LLM calls split into composition and other online calls.",
+    "table5_detail", "Table 5 (detail): per-query LLM calls split into composition and other online calls; "
+                     "index-build columns = tree / graph construction triggered at query time (RAPTOR / LightRAG "
+                     "per-query candidate pools), excluded from the online columns.",
     [Column("Calls", "Calls", higher_is_better=False),
      Column("Composition calls", "Composition calls", higher_is_better=False),
      Column("Retrieval calls", "Retrieval calls", higher_is_better=False),
      Column("Tokens (K)", "Tokens (K)", higher_is_better=False),
      Column("Cost ($)", "Cost ($)", higher_is_better=False, digits=4),
      Column("Latency (s)", "Latency (s)", higher_is_better=False, digits=2),
+     Column("Index-build calls", "Index-build calls", higher_is_better=False),
+     Column("Index-build tokens (K)", "Index-build tokens (K)", higher_is_better=False),
+     Column("Index-build cost ($)", "Index-build cost ($)", higher_is_better=False, digits=4),
+     Column("Index-build latency (s)", "Index-build latency (s)", higher_is_better=False, digits=2),
      Column("n", "Queries", higher_is_better=False, digits=0)],
 )
 
@@ -2073,6 +2292,87 @@ TABLE7 = TableSpec(
      Column("Scored", "Scored", higher_is_better=False, digits=0)],
     first_header="Variant",
 )
+
+
+TABLE1 = TableSpec(
+    "table1", "Table 1: Statistics of the QA benchmarks.",
+    [Column("Queries", "Queries", digits=0), Column("Corpus", "Corpus", digits=0), Column("Gold/Q", "Gold/Q")],
+    first_header="Benchmark",
+)
+
+#: Held-out settings of App. C.1 and their Table 1 row labels.
+HELDOUT_SETTING_ROWS = (("new_problem_existing_method", "– New Prob. / Exist. Meth."),
+                        ("new_method_existing_problem", "– New Meth. / Exist. Prob."))
+
+
+def query_gold_count(query: Query) -> Optional[int]:
+    """Gold papers of one query for Table 1's Gold/Q.
+
+    Evidence queries: the gold citations including the unaligned ones
+    (:attr:`Query.num_gold`, kept in every denominator, App. C.2). Held-out
+    hypothesis queries have no gold paper in the *reduced* corpus -- the
+    papers that realize the expected answer are removed (App. C.1) -- so
+    their count is the target's supporting papers J(u, m) on the complete
+    corpus (``metadata["supporting_papers"]``). The paper does not define
+    Gold/Q for the held-out rows (4.3 / 4.2 / 4.5); this is the closest
+    quantity the construction records. ``None`` (left out of the mean) for a
+    hypothesis query without that record (e.g. the planted synthetic ones).
+    """
+    if query.num_gold:
+        return int(query.num_gold)
+    md = query.metadata or {}
+    if "supporting_papers" in md:
+        return len(md.get("supporting_papers") or [])
+    return None if query.kind in _HYPOTHESIS_KINDS else 0
+
+
+def table1_rows(
+    queries: Mapping[str, Sequence[Query]],
+    corpus_sizes: Mapping[str, Optional[int]],
+) -> Tuple[Dict[str, Dict[str, Any]], List[Tuple[str, List[str]]]]:
+    """Table 1 (benchmark statistics): queries, corpus size and mean gold papers per query.
+
+    ``queries`` maps benchmark keys to their (possibly ``--limit``-ed) queries
+    and ``corpus_sizes`` to the number of papers each benchmark is searched
+    over (the indexed corpus: for the held-out rows the *reduced* corpus,
+    whereas the paper's Table 1 lists the complete 148,400). ScholarQA-CS and
+    ScholarQA-Multi are pooled into one ScholarQABench row; the held-out
+    benchmark gets one row per setting.
+    """
+    rows: Dict[str, Dict[str, Any]] = {}
+    evidence: List[str] = []
+    hypothesis: List[str] = []
+    by_group: Dict[str, List[str]] = {}
+    for key in queries:
+        by_group.setdefault(BENCHMARKS[key].group, []).append(key)
+
+    def row(qs: Sequence[Query], keys: Sequence[str]) -> Dict[str, Any]:
+        sizes = [corpus_sizes.get(k) for k in keys if corpus_sizes.get(k) is not None]
+        gold = [g for g in (query_gold_count(q) for q in qs) if g is not None]
+        return {"Queries": len(qs), "Corpus": max(sizes) if sizes else None,
+                "Gold/Q": float(np.mean(gold)) if gold else None}
+
+    ordered = [g for g in GROUP_ORDER if g in by_group] + [g for g in by_group if g not in GROUP_ORDER]
+    for group in ordered:
+        keys = by_group[group]
+        qs = [q for k in keys for q in queries[k]]
+        if all(BENCHMARKS[k].is_hypothesis for k in keys):
+            name = "Held-Out Total" if group == "heldout" else f"{GROUP_DISPLAY.get(group, group)} Total"
+            rows[name] = row(qs, keys)
+            hypothesis.append(name)
+            for setting, label in HELDOUT_SETTING_ROWS:
+                sub = [q for q in qs if (q.metadata or {}).get("setting") == setting]
+                if sub:
+                    rows[label] = row(sub, keys)
+                    hypothesis.append(label)
+        else:
+            name = "ScholarQABench" if group == "scholarqabench" else (
+                BENCHMARKS[keys[0]].display if len(keys) == 1 else GROUP_DISPLAY.get(group, group))
+            rows[name] = row(qs, keys)
+            evidence.append(name)
+    sections = [(t, names) for t, names in (("Evidence Queries", evidence), ("Hypothesis Queries", hypothesis))
+                if names]
+    return rows, sections
 
 
 def budget_sections(budgeted: Sequence[str], unbudgeted: Sequence[str], budget: int) -> List[Tuple[str, List[str]]]:
@@ -2145,6 +2445,13 @@ def efficiency_summary(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Optional[
         summary["Retrieval calls"] = (summary["Calls"] or 0.0) - summary["Composition calls"]
     else:
         summary["Composition calls"] = summary["Retrieval calls"] = None
+    # Query-time index construction (RAPTOR / LightRAG per-query candidate pools), excluded from the columns above.
+    for key, out_key, scale_by in (("index_build_calls", "Index-build calls", 1.0),
+                                   ("index_build_tokens", "Index-build tokens (K)", 1e-3),
+                                   ("index_build_cost_usd", "Index-build cost ($)", 1.0),
+                                   ("excluded_latency_s", "Index-build latency (s)", 1.0)):
+        vals = [float(r[key]) for r in rows if r.get(key) is not None]
+        summary[out_key] = scale_by * sum(vals) / len(vals) if vals else None
     return summary
 
 
@@ -2433,11 +2740,6 @@ def format_ask(result: AskResult, index: SemanticIndex, show_paths: int = 20) ->
 # ---------------------------------------------------------------------------
 
 
-def csv_list(text: Optional[str]) -> List[str]:
-    """``"a, b,,c"`` -> ``["a", "b", "c"]``."""
-    return [t.strip() for t in str(text or "").split(",") if t.strip()]
-
-
 def parse_budgets(text: Union[str, Sequence[int], None]) -> List[int]:
     """Budgets from ``"2K,4K,6K,8192,16K"`` (K = 1,024 tokens, as in Figs. 5-6); ``none`` -> []."""
     if text is None:
@@ -2447,7 +2749,7 @@ def parse_budgets(text: Union[str, Sequence[int], None]) -> List[int]:
     if text.strip().lower() in ("", "none", "off"):
         return []
     out = []
-    for t in csv_list(text):
+    for t in split_csv(text):
         m = re.fullmatch(r"(\d+(?:\.\d+)?)\s*([kK]?)", t)
         if m is None:
             raise argparse.ArgumentTypeError(f"Bad budget {t!r}")
@@ -2485,6 +2787,9 @@ def add_data_args(parser: argparse.ArgumentParser, *, benchmarks: bool = True, l
     if run_flags:
         g.add_argument("--resume", action="store_true",
                        help="reuse cached per-query records (failed queries are retried)")
+        g.add_argument("--force", action="store_true",
+                       help="without --resume: replace cached records even if another configuration produced "
+                            "them (refused by default)")
         g.add_argument("--fail-fast", action="store_true", help="abort on the first failing query")
     return g
 
@@ -2559,11 +2864,6 @@ class EnvironmentCache:
             return dict(self.layout.load_corpus(corpus, with_chunks=False).papers)
 
 
-def matplotlib_available() -> bool:
-    """Whether the optional plotting dependency is installed (Figs. 5-6 are also written as CSV)."""
-    return importlib.util.find_spec("matplotlib") is not None
-
-
 def environment_summary(runtime: Runtime, options: Optional[SystemOptions] = None) -> Dict[str, Any]:
     """Backends, system options and the Table 5 call-count switch, stored with every result."""
     cfg = runtime.config
@@ -2587,10 +2887,13 @@ __all__ = [
     "BenchmarkEval",
     "BenchmarkSpec",
     "CORPORA",
+    "CacheConflictError",
     "CorpusSpec",
     "DataLayout",
     "EVIDENCE_BENCHMARKS",
+    "EmbeddingMismatchError",
     "EnvironmentCache",
+    "FAILED_COLUMN",
     "IndexBuild",
     "IndexStore",
     "JudgeSet",
@@ -2603,6 +2906,7 @@ __all__ = [
     "SYSTEMS",
     "SystemOptions",
     "SystemSpec",
+    "TABLE1",
     "TABLE2_SYSTEMS",
     "TABLE34_AGENT_ORDER",
     "TABLE4_SYSTEMS",
@@ -2619,14 +2923,16 @@ __all__ = [
     "build_agent",
     "build_index",
     "build_judges",
+    "check_cache_conflicts",
     "collect_efficiency",
     "combine_retrieval",
     "compact_retrieval",
     "config_fingerprint",
-    "csv_list",
     "domain_lookup",
     "efficiency_entry",
     "efficiency_summary",
+    "embedding_identity",
+    "embedding_mismatches",
     "evaluate_benchmark",
     "evaluate_organization",
     "evaluate_retrieval_records",
@@ -2635,12 +2941,14 @@ __all__ = [
     "link_predictor_identity",
     "link_predictor_path",
     "load_link_predictor",
+    "matplotlib_available",
     "measure_operator_stats",
     "online_latency",
     "operator_rows_from_records",
     "order_systems",
     "parse_budgets",
     "qa_table_row",
+    "query_gold_count",
     "records_to_hierarchy",
     "resolve_benchmarks",
     "resolve_kind",
@@ -2649,9 +2957,14 @@ __all__ = [
     "restrict_taxonomy",
     "run_agent",
     "run_queries",
+    "score_missing_as_zero",
+    "split_csv",
     "summarize_operator_stats",
     "support_paths",
+    "table1_rows",
     "table2_spec",
     "table3_spec",
+    "unanswered_cell",
+    "with_failed_column",
     "write_reduced_corpus",
 ]

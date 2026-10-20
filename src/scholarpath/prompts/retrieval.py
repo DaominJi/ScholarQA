@@ -212,6 +212,19 @@ _ASSESS = re.compile(
 _GENERIC_METHOD_WORDS = {"other", "methods", "method", "approaches", "techniques", "models", "new", "alternative"}
 
 
+def infer_searched_side(query: str) -> Optional[str]:
+    """Searched side of a templated discovery question, or None when no pattern matches.
+
+    ``"method"`` for "Which (other) methods could be applied to X?", ``"problem"``
+    for "Which problems could X be applied to?". Used by the LLM-free Step 1.
+    """
+    if _DISCOVER_METHOD.match(query):
+        return "method"
+    if _DISCOVER_PROBLEM.match(query):
+        return "problem"
+    return None
+
+
 def _short(text: str, k: int = 6) -> str:
     toks = [t for t in tokenize(text) if t not in STOPWORDS] or tokenize(text)
     return " ".join(toks[:k])

@@ -1,6 +1,8 @@
 """Shared runtime setup for scripts: config, LLM, embedder, cost meter, logging.
 
-Every script under ``scripts/`` uses::
+Every experiment script under ``scripts/`` (all but the data-preparation
+scripts ``download_data``, ``prepare_arxiv``, ``prepare_fulltext``,
+``prepare_benchmarks`` and ``make_synthetic_data``) uses::
 
     parser = argparse.ArgumentParser(...)
     add_common_args(parser)
@@ -15,6 +17,10 @@ Common flags:
 * ``--set llm.provider=openai --set retrieval.budget=4096`` -- overrides
 * ``--llm mock|openai`` / ``--embedder hashing|specter2`` -- shortcuts
 * ``--output-dir results/...`` and ``--seed``
+
+An invalid ``--set`` override or config file, or a missing optional
+dependency of the configured backends, ends the script with a one-line error
+(exit status 2 / 1) instead of a traceback.
 """
 
 from __future__ import annotations
@@ -27,12 +33,12 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, NoReturn, Optional
 
 import numpy as np
 
-from scholarpath.config import ScholarPathConfig
-from scholarpath.embeddings import Embedder, build_embedder
+from scholarpath.config import ConfigError, ScholarPathConfig
+from scholarpath.embeddings import Embedder, MissingDependencyError, build_embedder
 from scholarpath.llm import CostMeter, LLMClient, build_llm
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -73,6 +79,37 @@ def add_common_args(parser: argparse.ArgumentParser, default_output: Optional[st
     g.add_argument("--verbose", "-v", action="store_true")
 
 
+def _fail(message: str, status: int = 2) -> NoReturn:
+    """Exit like argparse: ``<script>: error: <message>`` on stderr."""
+    prog = Path(sys.argv[0]).name if sys.argv and sys.argv[0] else "scholarpath"
+    print(f"{prog}: error: {message}", file=sys.stderr)
+    raise SystemExit(status)
+
+
+def config_from_args(args: argparse.Namespace) -> ScholarPathConfig:
+    """The configuration of ``--config`` plus the ``--set`` / shortcut overrides (exits on invalid input)."""
+    overrides = list(getattr(args, "overrides", []) or [])
+    if getattr(args, "llm", None):
+        overrides.append(f"llm.provider={args.llm}")
+    if getattr(args, "model", None):
+        overrides.append(f"llm.model={args.model}")
+    if getattr(args, "embedder", None):
+        overrides.append(f"embedding.backend={args.embedder}")
+    if getattr(args, "seed", None) is not None:
+        overrides.append(f"seed={args.seed}")
+    path = getattr(args, "config", None)
+    try:
+        config = ScholarPathConfig.load(path)
+    except FileNotFoundError:
+        _fail(f"config file not found: {path}")
+    except ConfigError as err:
+        _fail(f"invalid config file {path}: {err}")
+    try:
+        return config.override(overrides)
+    except ConfigError as err:
+        _fail(f"invalid --set override: {err}")
+
+
 @dataclass
 class Runtime:
     config: ScholarPathConfig
@@ -101,21 +138,18 @@ class Runtime:
     @classmethod
     def from_args(cls, args: argparse.Namespace) -> "Runtime":
         setup_logging(getattr(args, "verbose", False))
-        config = ScholarPathConfig.load(getattr(args, "config", None))
-        overrides = list(getattr(args, "overrides", []) or [])
-        if getattr(args, "llm", None):
-            overrides.append(f"llm.provider={args.llm}")
-        if getattr(args, "model", None):
-            overrides.append(f"llm.model={args.model}")
-        if getattr(args, "embedder", None):
-            overrides.append(f"embedding.backend={args.embedder}")
-        if getattr(args, "seed", None) is not None:
-            overrides.append(f"seed={args.seed}")
-        config.override(overrides)
-        rt = cls.from_config(config, getattr(args, "output_dir", None))
+        config = config_from_args(args)
+        try:
+            rt = cls.from_config(config, getattr(args, "output_dir", None))
+        except MissingDependencyError as err:
+            _fail(str(err), status=1)
         if rt.output_dir is not None:
             config.save(rt.output_dir / "config.yaml")
-        log.info("LLM backend: %s (%s); embedder: %s", config.llm.provider, config.llm.model, config.embedding.backend)
+        log.info("LLM backend: %s (%s); embedder: %s; judges: %s", config.llm.provider, config.llm.model,
+                 config.embedding.backend, config.evaluation.judge_provider)
+        warning = config.mock_judge_warning()
+        if warning:
+            log.warning(warning)
         return rt
 
     def write_json(self, name: str, obj: Any) -> Path:

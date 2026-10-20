@@ -32,6 +32,12 @@ Official formats (see ``data/README.md`` for download notes):
   (``assert len(gold) == len(preds)``), so :func:`export_prometheus` writes a
   gold file in exactly the prediction order. References are never appended to
   the graded output (``response["docs"] is True`` is always false).
+
+:func:`run_official_evaluation` chains the exporters and runners for one
+benchmark's answers; ``scripts/run_official_eval.py`` applies it to the saved
+answers of ``run_qa_eval.py`` / ``run_agents.py``. The checkouts come from
+``evaluation.researchqa_dir`` / ``evaluation.scholarqabench_dir``
+(:meth:`OfficialPaths.from_config`), else the environment variables below.
 """
 
 from __future__ import annotations
@@ -83,6 +89,18 @@ class OfficialPaths:
     researchqa_dir: Optional[str] = field(default_factory=lambda: os.environ.get("SCHOLARPATH_RESEARCHQA_DIR"))
     scholarqabench_dir: Optional[str] = field(default_factory=lambda: os.environ.get("SCHOLARPATH_SCHOLARQABENCH_DIR"))
     python: str = field(default_factory=lambda: os.environ.get("SCHOLARPATH_EVAL_PYTHON", sys.executable))
+
+    @classmethod
+    def from_config(cls, config: Any = None, **overrides: Optional[str]) -> "OfficialPaths":
+        """Paths from ``overrides``, then ``config`` (an ``EvaluationConfig``), then the environment."""
+        paths = cls()
+        for name in ("researchqa_dir", "scholarqabench_dir"):
+            value = overrides.get(name) or (getattr(config, name, None) if config is not None else None)
+            if value:
+                setattr(paths, name, str(value))
+        if overrides.get("python"):
+            paths.python = str(overrides["python"])
+        return paths
 
     def researchqa(self) -> Path:
         return _checkout(self.researchqa_dir, "ResearchQA", "SCHOLARPATH_RESEARCHQA_DIR")
@@ -232,6 +250,29 @@ def export_prometheus(
     if gold_path is not None:
         _write_json(gold_path, gold)
     return preds
+
+
+def export_researchqa_data(queries: Sequence[Query], path: PathLike) -> List[Dict[str, Any]]:
+    """The official data file of ``compute_coverage.py`` (``researchqa_loader.load_researchqa_data``) for ``queries``.
+
+    One record per query: ``id`` (:func:`official_id`), ``general_domain``,
+    ``subdomain``, ``field``, ``query``, ``date`` and the ``rubric`` items
+    (``rubric_item``, ``type``; types from ``metadata["rubric_types"]``).
+    """
+    records = []
+    for q in queries:
+        meta = q.metadata or {}
+        types = meta.get("rubric_types") or []
+        rubric = []
+        for i, item in enumerate(q.rubric):
+            kind = types[i] if i < len(types) else [t for t in (item.kind or "").split(",") if t]
+            rubric.append({"rubric_item": item.text, "type": kind, "citation_metadata": None})
+        records.append({"id": official_id(q), "general_domain": str(meta.get("domain", "")),
+                        "subdomain": str(meta.get("subdomain", "")), "field": str(meta.get("field", "")),
+                        "query": q.text, "date": str(meta.get("raw_date") or meta.get("date") or ""),
+                        "rubric": rubric})
+    _write_json(path, records)
+    return records
 
 
 # ---------------------------------------------------------------------------
@@ -436,18 +477,133 @@ def run_prometheus_eval(
     return summary
 
 
+# ---------------------------------------------------------------------------
+# One benchmark end to end
+# ---------------------------------------------------------------------------
+
+OFFICIAL_BENCHMARKS = ("researchqa", "scholarqa_cs", "scholarqa_multi")
+
+
+def _zero_filled(value: Optional[float], n_scored: float, n_missing: float) -> Optional[float]:
+    """A mean over ``n_scored`` answers re-averaged with ``n_missing`` zeros (failed queries)."""
+    if value is None or n_missing <= 0:
+        return value
+    total = n_scored + n_missing
+    return float(value) * n_scored / total if total > 0 else value
+
+
+def run_official_evaluation(
+    benchmark: str,
+    answers: Mapping[str, Answer],
+    queries: Sequence[Query],
+    out_dir: PathLike,
+    paths: Optional[OfficialPaths] = None,
+    *,
+    papers: Optional[Any] = None,
+    system: str = "system",
+    researchqa_model: str = "gpt-4.1-mini",
+    coverage_script: Optional[PathLike] = None,
+    prometheus_model: str = "prometheus-eval/prometheus-7b-v2.0",
+    load_vllm: bool = True,
+    citations: bool = True,
+    missing: str = "zero",
+    timeout: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Score one benchmark's answers with the official scripts (App. C.3) and return the Table 3 cells.
+
+    * ``researchqa``: ``compute_coverage.py`` (Rub). The official repository
+      has no citation metric; ``Cite`` is the citation F1 against the gold
+      papers of :func:`~scholarpath.evaluation.qa_metrics.citation_f1`.
+    * ``scholarqa_cs``: ``rubric_eval.py --rubrics --snippets`` (Corr) and,
+      with ``citations``, ``citation_correctness_eval.py`` (Cite).
+    * ``scholarqa_multi``: ``prometheus_eval.py`` with the expert answers as
+      references (Corr) and ``citation_correctness_eval.py`` (Cite).
+
+    The official scripts only score the answers they are given. With
+    ``missing="zero"`` (default, as :mod:`.qa_metrics`), queries without an
+    answer count as 0, i.e. every mean is re-averaged over all queries;
+    ``missing="skip"`` reports the official numbers as they are. Inputs and
+    raw outputs are written under ``out_dir``.
+    """
+    from scholarpath.evaluation.qa_metrics import MISSING_POLICIES, aggregate_prf, citation_f1, citation_prf
+
+    if benchmark not in OFFICIAL_BENCHMARKS:
+        raise ValueError(f"No official script for {benchmark!r}; expected one of {OFFICIAL_BENCHMARKS}")
+    if missing not in MISSING_POLICIES:
+        raise ValueError(f"missing must be one of {MISSING_POLICIES}, got {missing!r}")
+    paths = paths or OfficialPaths()
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    answered = [q for q in queries if q.query_id in answers]
+    absent = [q for q in queries if q.query_id not in answers]
+    n_missing = float(len(absent)) if missing == "zero" else 0.0
+    summary: Dict[str, Any] = {"benchmark": benchmark, "system": system, "n_queries": float(len(queries)),
+                               "n_missing": float(len(absent))}
+    if not answered:
+        raise OfficialEvalError(f"No answers to score for {benchmark} ({system})")
+
+    def add_citations(prefix: str) -> None:
+        items = export_citation_eval(answers, answered, out / f"{prefix}_citations.json", papers=papers)
+        if not items:
+            return
+        cite = run_citation_eval(out / f"{prefix}_citations.json", paths=paths, timeout=timeout)
+        n = float(len(items))
+        p = _zero_filled(cite.get("citation_prec"), n, n_missing)
+        r = _zero_filled(cite.get("citation_rec"), n, n_missing)
+        summary.update(citation_prec=p, citation_rec=r,
+                       Cite=(100.0 * f1_score(p / 100.0, r / 100.0)) if p is not None and r is not None else None)
+
+    if benchmark == "researchqa":
+        export_researchqa_data(queries, out / "researchqa_data.json")
+        export_researchqa_responses(answers, out / "responses.json", queries=answered, papers=papers)
+        cov = run_compute_coverage(out / "researchqa_data.json", out / "responses.json", out / "coverage.json",
+                                   paths=paths, coverage_script=coverage_script, model=researchqa_model,
+                                   timeout=timeout)
+        scored = float(len(cov.per_answer))
+        summary.update(Rub=_zero_filled(cov.rub, scored, n_missing), n=scored + n_missing,
+                       n_failed=float(len(answered)) - scored, unparsed_labels=float(cov.unparsed_labels))
+        prfs = [citation_f1(answers[q.query_id], q, valid_ids=papers) for q in answered]
+        if missing == "zero":
+            prfs += [citation_prf([], q.gold_papers, q.num_gold) for q in absent]
+        summary.update({k: v for k, v in aggregate_prf(prfs).items() if k != "n"})
+    elif benchmark == "scholarqa_cs":
+        qa_dir = out / "qa"
+        export_scholarqa_cs(answers, qa_dir / f"{system}.jsonl", queries=answered, papers=papers)
+        result = run_rubric_eval(qa_dir, out / "rubric_eval.json", paths=paths, src_names=[system],
+                                 timeout=timeout).get(system, {})
+        scored = float(result.get("n") or 0.0)
+        summary.update(Corr=_zero_filled(result.get("Corr"), scored, n_missing),
+                       ann_score=_zero_filled(result.get("ann_score"), scored, n_missing), n=scored + n_missing)
+        if citations:
+            add_citations("cs")
+    else:
+        export_prometheus(answers, answered, out / "prometheus_preds.json", gold_path=out / "prometheus_gold.json")
+        prom = run_prometheus_eval(out / "prometheus_preds.json", out / "prometheus", out / "prometheus_gold.json",
+                                   paths=paths, model=prometheus_model, load_vllm=load_vllm, timeout=timeout)
+        scored = float(len(answered))
+        summary.update(Corr=_zero_filled(prom.get("Corr"), scored, n_missing), n=scored + n_missing,
+                       prometheus=prom)
+        if citations:
+            add_citations("multi")
+    _write_json(out / "official_summary.json", summary)
+    return summary
+
+
 __all__ = [
+    "OFFICIAL_BENCHMARKS",
     "OfficialCoverage",
     "OfficialEvalError",
     "OfficialPaths",
     "coverage_from_judgements",
     "export_citation_eval",
     "export_prometheus",
+    "export_researchqa_data",
     "export_researchqa_responses",
     "export_scholarqa_cs",
     "official_id",
     "run_citation_eval",
     "run_compute_coverage",
+    "run_official_evaluation",
     "run_prometheus_eval",
     "run_rubric_eval",
 ]

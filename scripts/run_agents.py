@@ -31,7 +31,9 @@ The ``simulated`` agent (plan -> BM25 + dense search -> reflect -> answer
 with the in-process LLM) is NOT a paper baseline; it exercises this path
 offline.
 
-Paper setting (external systems installed, see scholarpath/baselines/agents/*.py)::
+Paper setting (external systems installed, see scholarpath/baselines/agents/*.py; Codex pinned to the
+paper's v0.42 with ``npm install -g @openai/codex@0.42.0`` -- later releases reject the chat wire API of the
+backbone endpoint, see ``--codex-wire-api``)::
 
     python scripts/run_agents.py --config configs/paper.yaml --agents openscholar,paperqa2,agenticscholar,codex \\
         --openscholar-dir ~/OpenScholar --agenticscholar-url http://localhost:8800/run --resume
@@ -59,6 +61,7 @@ from scholarpath.experiments.qa import (  # noqa: E402
     SIMULATED,
     SYSTEMS,
     AgentOptions,
+    CacheConflictError,
     DataLayout,
     EnvironmentCache,
     RecordStore,
@@ -104,6 +107,9 @@ def main(argv=None) -> int:
     g.add_argument("--agenticscholar-fn", default=None, help="AgenticScholar Python callable module:function")
     g.add_argument("--codex-binary", default="codex")
     g.add_argument("--codex-isolation", choices=("unshare", "none"), default="unshare")
+    g.add_argument("--codex-wire-api", choices=("chat", "responses"), default="chat",
+                   help="wire API of the backbone endpoint in Codex's config (paper: Codex v0.42 with 'chat'; "
+                        "Codex releases after 0.42 only accept 'responses', which needs a Responses-API endpoint)")
     g.add_argument("--paperqa-embedding", default=None, help="PaperQA2 embedding model name")
     args = ap.parse_args(argv)
 
@@ -121,6 +127,7 @@ def main(argv=None) -> int:
                            meter_with_proxy=not args.no_proxy, openscholar_dir=args.openscholar_dir,
                            agenticscholar_url=args.agenticscholar_url, agenticscholar_fn=args.agenticscholar_fn,
                            codex_binary=args.codex_binary, codex_isolation=args.codex_isolation,
+                           codex_wire_api=args.codex_wire_api,
                            paperqa_embedding=args.paperqa_embedding)
     # The agents only need the corpus, the passage pool and the SPECTER2 dense retriever of each index.
     envs = EnvironmentCache(rt, layout, index_store_from_args(args), SystemOptions(), link_predictor="none")
@@ -151,11 +158,15 @@ def main(argv=None) -> int:
                         agent = built[(key, env.name)] = build_agent(key, env, options, export_dir)
                     recs = run_agent(agent, key, queries, benchmark=bench, store=store, resume=args.resume,
                                      fail_fast=args.fail_fast, valid_ids=env.index.papers.keys(),
-                                     llm_config=rt.config.llm, fingerprint=agent_fingerprint(key, env, options))
+                                     llm_config=rt.config.llm, fingerprint=agent_fingerprint(key, env, options),
+                                     force=args.force)
                 except AgentUnavailableError as err:
                     log.error("%s is unavailable: %s", system_display(key), err)
                     unavailable[key] = str(err)
                     continue
+                except CacheConflictError as err:  # cached answers of another configuration (no --resume/--force)
+                    log.error("%s", err)
+                    return 2
                 rows = [r.efficiency for r in recs.values() if r.efficiency is not None and r.error is None]
                 summary["results"].setdefault(bench, {})[system_display(key)] = {
                     "queries": len(queries), "answered": sum(1 for r in recs.values() if r.ok),

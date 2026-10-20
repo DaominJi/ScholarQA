@@ -29,11 +29,12 @@ are that child's arrivals. A repair can also move existing papers between
 children; a certified node that loses r of its n papers keeps the valid
 bound n U_old / (n - r) (all errors may remain among the rest).
 
-:class:`BuildResult.save` does not persist the frozen routers. On a reloaded
-result :class:`DynamicUpdater` therefore retrains every missing router from
-the node's persisted verified labels, at zero LLM cost (see
-:meth:`NodeWiseBuilder.rebuild_router`). Existing assignments are never
-re-routed, so the certificates stay valid.
+:meth:`BuildResult.save` / :meth:`BuildResult.load` persist the frozen
+routers (``routers.npz`` + ``routers.json``). When a router is missing (e.g.
+only ``taxonomy.json`` was kept, or a node was created after the build),
+:class:`DynamicUpdater` retrains it from the node's persisted verified labels
+at zero LLM cost (see :meth:`NodeWiseBuilder.rebuild_router`). Existing
+assignments are never re-routed, so the certificates stay valid.
 """
 
 from __future__ import annotations
@@ -144,8 +145,8 @@ class DynamicUpdater:
         if missing and not self.rebuild_routers:
             raise ValueError(
                 f"{len(missing)} internal nodes have no frozen router (e.g. {missing[:3]}). "
-                "BuildResult.save does not persist routers; pass rebuild_routers=True to retrain them "
-                "from the persisted verified labels at zero LLM cost"
+                "(e.g. the result was loaded without routers.npz); pass rebuild_routers=True to retrain "
+                "them from the persisted verified labels at zero LLM cost"
             )
         cfg = builder.config
         state = result.metadata.get("allocator")
@@ -238,7 +239,7 @@ class DynamicUpdater:
             # A leaf that crossed the size limit with these arrivals (a rebuild of
             # its subtree would now run an episode for it).
             crossed = node.size - len(arrivals) < cfg.min_node_size
-            if arrivals and crossed and b.splittable(node) and nid not in report.grown_leaves:
+            if arrivals and crossed and b.splittable(node, tax) and nid not in report.grown_leaves:
                 report.grown_leaves.append(nid)
             return {}, {}
         router = self.result.routers.get(nid)
@@ -312,7 +313,7 @@ class DynamicUpdater:
             todo: Deque[str] = deque()
             for c in new_kids:
                 added.pop(c, None)
-                if b.splittable(tax.nodes[c]):
+                if b.splittable(tax.nodes[c], tax):
                     todo.append(c)
                 else:
                     tax.nodes[c].status = LEAF

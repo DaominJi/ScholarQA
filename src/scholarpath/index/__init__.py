@@ -11,6 +11,8 @@ from scholarpath.index.semantic_index import (
     concept_key,
     paper_key,
     parse_key,
+    tokenizer_name,
 )
 
-__all__ = ["CHUNK", "CONCEPT", "LEVELS", "PAPER", "Ball", "SemanticIndex", "chunk_key", "concept_key", "paper_key", "parse_key"]
+__all__ = ["CHUNK", "CONCEPT", "LEVELS", "PAPER", "Ball", "SemanticIndex", "chunk_key", "concept_key", "paper_key", "parse_key",
+           "tokenizer_name"]

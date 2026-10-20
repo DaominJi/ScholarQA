@@ -1043,10 +1043,3 @@ class FulltextExtractor:
                                      "tried": [s.name for s in self.sources]}) + "\n")
             stats.abstract_only += len(remaining)
         return stats
-
-
-def iter_chunks(path: PathLike, paper_ids: Optional[Set[str]] = None) -> Iterator[Chunk]:
-    """Stream chunks from a ``chunks.jsonl(.gz)`` file (optionally only those of ``paper_ids``)."""
-    for d in read_jsonl(path):
-        if paper_ids is None or str(d.get("paper_id")) in paper_ids:
-            yield Chunk.from_dict(d)

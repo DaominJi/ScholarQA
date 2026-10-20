@@ -11,7 +11,15 @@ python scripts/prepare_fulltext.py --sources gcs --cache-dir data/fulltext/cache
 python scripts/prepare_benchmarks.py            # benchmarks + corpus alignment report
 ```
 
-All scripts accept `--help` and `--limit N` for quick runs, and every loader
+Every script documents its flags in `--help`. `prepare_arxiv.py`,
+`prepare_fulltext.py` and `prepare_benchmarks.py` take `--limit N` for quick
+runs. `download_data.py` selects datasets with `--only` / `--all` and has
+`--dry-run` and `--max-shards`. Unlike the experiment scripts, these
+data-preparation scripts do not use `--config` / `--set` / `--output-dir`;
+`prepare_fulltext.py` alone reads the chunk sizes from `--config` / `--set`.
+Downloads go to `--root` (default `data/raw`). `prepare_arxiv.py` and
+`prepare_benchmarks.py` write under `--out` (default `data/processed`), and
+`prepare_fulltext.py` writes the chunk file next to its corpus. Every loader
 in `scholarpath.data` also accepts pre-downloaded local files.
 
 ## 1. Datasets
@@ -56,7 +64,7 @@ prints manual instructions; place the files as below and continue.
 
 Manual alternatives:
 
-* ResearchQA: `python -c "from datasets import load_dataset; load_dataset('realliyifei/ResearchQA', split='test_mini').to_json('data/raw/researchqa/test_mini.jsonl', force_ascii=False)"` (JSON/JSONL exports are accepted).
+* ResearchQA: `python -c "from datasets import load_dataset; load_dataset('realliyifei/ResearchQA', split='test_mini').to_json('data/raw/researchqa/test_mini.jsonl', force_ascii=False)"` (JSON/JSONL exports are accepted; `scholarpath.data.load_researchqa_hf()` returns the same records in Python).
 * CHIME annotations: CSV / JSONL / parquet exports of the three datasets, or `datasets.save_to_disk` directories, named `chime-<task>*` under `data/raw/chime_annotations/`.
 * arXiv: download the Kaggle dataset in a browser and put `arxiv-metadata-oai-snapshot.json` (or `arxiv.zip`, or a `.gz`) into `data/raw/arxiv/`. (The public GCS copy `gs://arxiv-dataset/metadata-v5/arxiv-metadata-oai.json` is a stale August-2020 snapshot.)
 
@@ -120,12 +128,13 @@ papers without full text keep only their abstract.
 
 * **ResearchQA**: one `Query` per record (`kind="evidence"`, `benchmark="researchqa"`); rubric items keep
   their type lists (`RubricItem.kind = "comparison,example"`, `metadata["rubric_types"]`); metadata `id`,
-  `domain`, `subdomain`, `field`, `date` (survey date, the retrieval cutoff). Gold papers = the cited papers of
+  `domain`, `subdomain`, `field`, `date` (survey date; informational only, since queries search the whole
+  corpus with no date cutoff, as in the paper). Gold papers = the cited papers of
   `Citation`-type rubric items (`citation_metadata`; titles parsed from the item text if it is missing),
   aligned to arXiv-Subfields.
 * **ScholarQA-CS**: one query per unique question (the first of the 10 double-annotated cases, as the official
   scorer; the other case is kept in `metadata["alternate_cases"]`), full `metric_config` kept for
-  `scripts/rubric_eval.py`; rubric = `other_properties` (weights, evidence quotes). Gold papers are
+  ScholarQABench's `scripts/rubric_eval.py`; rubric = `other_properties` (weights, evidence quotes). Gold papers are
   reconstructed from the evidence quotes (see Caveats).
 * **ScholarQA-Multi**: one query per expert answer (`reference_answer`), gold = the `ctxs` citations
   (citation markers in the answers are **0-based**).
@@ -191,13 +200,34 @@ python scripts/prepare_benchmarks.py --raw tests/fixtures --out /tmp/bench --cor
 
 `prepare_benchmarks.py` writes the reproduced numbers to `coverage_report.json`.
 
-## 7. Caveats
+## 7. Dataset licenses
+
+The datasets are downloaded from their sources and are not redistributed with
+this repository. Their terms apply to the raw files and to everything derived
+from them under `data/processed/`:
+
+| Dataset | Terms |
+|---|---|
+| arXiv metadata (Kaggle `Cornell-University/arxiv`) | CC0 1.0 for the metadata. The full texts fetched by `prepare_fulltext.py` keep each paper's own license (`metadata["license"]` of the paper record). |
+| TaxoBench | Code: Apache-2.0. **Annotations** (expert trees, paper-to-category mappings): **CC BY-NC 4.0, non-commercial research use only** (`DATASET_LICENSE.md` of the repository). Titles and abstracts may be subject to their publishers' rights. |
+| CHIME | Code and resources: Apache-2.0 (github.com/allenai/chime). Expert annotation tables: see the Hugging Face dataset cards of `joe32140/chime-*`. |
+| ResearchQA | See the Hugging Face dataset card of `realliyifei/ResearchQA`. The GitHub repository has no license file. |
+| ScholarQABench | MIT (github.com/AkariAsai/ScholarQABench). |
+| S2ORC v2 / S2AG papers | Semantic Scholar dataset license, accepted with the API key. |
+
+`THIRD_PARTY_NOTICES.md` covers the code and prompts that this repository
+reproduces or re-implements.
+
+## 8. Caveats
 
 * **Network.** Hugging Face, Kaggle, arxiv.org and api.semanticscholar.org may be blocked by proxies;
   GitHub and the public GCS bucket usually work. All loaders accept local files.
 * **TaxoBench.** The public v0.2.0 data reproduces 72 surveys / 3,815 citations / 3,044 distinct papers
-  exactly, but its trees have 1,637 concept nodes over up to 7 levels below the common root, not the 814
-  nodes over 4 levels reported for the merged gold; `--taxobench-max-depth` truncates the merged tree.
+  exactly, but its trees have 1,637 concept nodes (the common root excluded) over up to 7 levels below the
+  common root, not the 814 concept nodes over 4 levels reported for the merged gold. Cut at 4 levels they
+  have 1,030 concept nodes. `prepare_benchmarks.py` stores the full tree (`--taxobench-max-depth N` truncates
+  the stored file); the construction experiments cut it at evaluation time (`run_taxonomy_experiments.py
+  --gold-max-depth 4`, the default, and `build_taxonomy.py --reference-max-depth 4`).
 * **CHIME reconstruction.** No corrected-hierarchy file is released. We parse Claude-2's hierarchies
   (472 reviews / 2,174 hierarchies with CHIME's own parser; our parser also expands claim ranges such as
   "Claim 18-22"), keep the hierarchies present in the expert annotation tables, drop parent-child edges and

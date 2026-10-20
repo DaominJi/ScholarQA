@@ -5,10 +5,22 @@ descriptions of T_P / T_M by cosine similarity (``index.concept_matrix``).
 The matched nodes are the *scopes* that confine the search:
 
 * up to ``grounding_top_k`` concepts per query concept with similarity at
-  least ``grounding_min_sim`` are kept, giving the matched sets U_q and M_q
-  with grounding similarities g_u, g_m (Appendix A.3). Similarities are
-  normalized so that the best match of each facet has g = 1, hence a query
-  with a single matched pair has junction weights in {0, 1} (Section 4.3);
+  least ``grounding_min_sim`` are candidate matches. "Several candidate
+  scopes" (Appendix A.3) are alternatives for an ambiguous query concept, so
+  a secondary candidate is kept only when it is a near-tie of the concept's
+  best match (cosine >= ``grounding_rel_margin`` times the best cosine, see
+  :func:`default_grounding_margin`) and is neither an ancestor nor a
+  descendant of a better-matched kept scope. A nested candidate is no
+  alternative: an ancestor of the asked concept would pass off the papers of
+  its *other* sub-concepts (e.g. GNN papers for a question about graph
+  contrastive learning) as findings about the asked concept, and a
+  descendant adds no junction paper the better match does not already hold.
+  The kept matches form U_q and M_q with grounding similarities g_u, g_m
+  (Appendix A.3), normalized so that the best match of each facet has g = 1:
+  a query with a single matched pair then has junction weights in {0, 1}
+  (Section 4.3). For an observed junction the rescaling multiplies every
+  weight of the query by the same constant, so it does not change which
+  units are selected;
 * an unspecified facet defaults to the taxonomy root;
 * a concept absent from I (no description reaches ``grounding_min_sim``)
   becomes a *query-local anchor* attached to its ``anchor_top_k`` closest
@@ -50,6 +62,10 @@ from scholarpath.retrieval.units import ANCHOR_PREFIX
 from scholarpath.types import HYPOTHESIS_ASSESSMENT, HYPOTHESIS_DISCOVERY
 
 FACETS = ("problem", "method")
+
+# A secondary match of a query concept is an alternative scope only when its cosine is at least
+# this fraction of the concept's best match (near-ties; Appendix A.3 "several candidate scopes").
+GROUNDING_REL_MARGIN = 0.5
 
 
 def other_facet(facet: str) -> str:
@@ -103,6 +119,43 @@ class Grounding:
         }
 
 
+def _nested(tax, a: str, b: str) -> bool:
+    """Whether one of two concepts of a taxonomy lies below the other."""
+    return a in tax.ancestors(b) or b in tax.ancestors(a)
+
+
+def distinct_matches(
+    ranked: Sequence[Tuple[str, float]], tax, margin: float
+) -> List[Tuple[str, float]]:
+    """The alternatives among the candidate matches of one query concept.
+
+    ``ranked`` lists ``(node id, cosine)`` best first. The best match is
+    always kept; a later candidate is kept when its cosine is at least
+    ``margin`` times the best one (a near-tie, i.e. the concept is ambiguous)
+    and it is neither an ancestor nor a descendant of a kept match.
+    """
+    kept: List[Tuple[str, float]] = []
+    for node, sim in ranked:
+        if kept:
+            best = kept[0][1]
+            if best <= 0.0 or sim < margin * best:
+                break
+            if any(_nested(tax, node, k) for k, _ in kept):
+                continue
+        kept.append((node, float(sim)))
+    return kept
+
+
+def default_grounding_margin(config: RetrievalConfig) -> float:
+    """Relative cosine a secondary match needs to count as an alternative scope.
+
+    ``config.grounding_rel_margin`` when the configuration defines it,
+    otherwise :data:`GROUNDING_REL_MARGIN`.
+    """
+    value = getattr(config, "grounding_rel_margin", None)
+    return GROUNDING_REL_MARGIN if value is None else float(value)
+
+
 def _normalize(scopes: Dict[str, float]) -> List[Tuple[str, float]]:
     if not scopes:
         return []
@@ -138,10 +191,12 @@ def ground(
     """Algorithm 2, line 4: match the query concepts to scopes in T_P and T_M.
 
     ``anchor_min_sim`` overrides :func:`default_anchor_min_sim`, the cosine an
-    anchor's neighbour needs to stand in for it as a scope.
+    anchor's neighbour needs to stand in for it as a scope. Secondary matches
+    are filtered by :func:`distinct_matches`.
     """
     config = config or RetrievalConfig()
     floor = default_anchor_min_sim(config) if anchor_min_sim is None else float(anchor_min_sim)
+    margin = default_grounding_margin(config)
     out = Grounding(problem_scopes=[], method_scopes=[])
     for facet in FACETS:
         tax = index.taxonomy(facet)
@@ -167,8 +222,8 @@ def ground(
             col = sims[:, j] if len(ids) else np.zeros(0)
             order = sorted(range(len(ids)), key=lambda i: (-float(col[i]), ids[i]))
             hits = [i for i in order[: config.grounding_top_k] if float(col[i]) >= config.grounding_min_sim]
-            for i in hits:
-                matched[ids[i]] = max(matched.get(ids[i], 0.0), float(col[i]))
+            for node, sim in distinct_matches([(ids[i], float(col[i])) for i in hits], tax, margin):
+                matched[node] = max(matched.get(node, 0.0), sim)
             if not hits and not searched and order and anchor_id is None:
                 anchor_id = _make_anchor(out, index, embedder, facet, text, ids, col, order, config, link_predictor)
         out.similarities.update(matched)
@@ -178,7 +233,8 @@ def ground(
         else:
             proxies: Dict[str, float] = {}
             if anchor_id is not None:
-                proxies = {n: s for n, s in out.anchors[anchor_id].neighbors if s > 0.0 and s >= floor}
+                close = [(n, s) for n, s in out.anchors[anchor_id].neighbors if s > 0.0 and s >= floor]
+                proxies = dict(distinct_matches(close, tax, margin))
             if proxies:
                 _set(out, facet, _normalize(proxies))
                 out.unspecified[facet] = False

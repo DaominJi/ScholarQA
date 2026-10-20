@@ -34,9 +34,10 @@ and full-text section chunks. It contributes two components:
 
 Everything in the paper's evaluation is included: dataset preparation,
 the selection-based taxonomy baselines, the retrieval / RAG / agent
-baselines, all metrics and LLM judges, and one script per table and figure.
-The whole pipeline also runs **offline** with a deterministic mock LLM and a
-hashing embedder, so it can be tested without API keys or downloads.
+baselines, all metrics and LLM judges, and a script for every table and
+figure (Tables 1–9, Figs 2–6). The whole pipeline also runs **offline** with
+a deterministic mock LLM and a hashing embedder, so it can be tested without
+API keys or downloads.
 
 ## Contents
 
@@ -50,6 +51,7 @@ hashing embedder, so it can be tested without API keys or downloads.
 - [Implementation notes](#implementation-notes)
 - [Known differences from the paper text](#known-differences-from-the-paper-text)
 - [Tests](#tests)
+- [License and citation](#license-and-citation)
 
 ## Repository structure
 
@@ -57,9 +59,9 @@ hashing embedder, so it can be tested without API keys or downloads.
 .
 ├── configs/
 │   ├── default.yaml          # all hyper-parameters (paper defaults), offline backends
-│   └── paper.yaml            # DeepSeek-V4.0-Flash + SPECTER2 (the paper's setting)
+│   └── paper.yaml            # DeepSeek-V4.0-Flash + SPECTER2 + real judges (the paper's setting)
 ├── docs/ARCHITECTURE.md      # paper -> code map, conventions, module contracts
-├── data/README.md            # datasets: download, preprocessing, layout, coverage
+├── data/README.md            # datasets: download, preprocessing, layout, coverage, licenses
 ├── scripts/                  # one script per pipeline stage / table / figure (scripts/README.md)
 ├── src/scholarpath/
 │   ├── config.py, types.py, text.py, embeddings.py, runtime.py
@@ -78,8 +80,15 @@ hashing embedder, so it can be tested without API keys or downloads.
 │   ├── evaluation/           # soft node/edge F1, Recall@B/NDCG@B, Rub/Cite/Corr, ARI/Sem, Cat/Assn,
 │   │                         #   Disc + LLM judges, efficiency, reporting, official-script wrappers
 │   └── experiments/          # experiment runners behind the scripts
-└── tests/                    # offline unit and integration tests
+├── tests/                    # offline unit and integration tests
+└── THIRD_PARTY_NOTICES.md    # reproduced / re-implemented third-party material and its licenses
 ```
+
+Generated files (all git-ignored): `data/raw/`, `data/processed/` (datasets),
+`artifacts/index/<corpus>/` (semantic indexes, with the trained link
+predictor in `link_predictor/`), `results/<script>/` (experiment outputs),
+`results/taxonomy_cache/` (taxonomy builds shared by the construction
+scripts) and `cache/{llm,judge,embeddings}/` (response and embedding caches).
 
 `docs/ARCHITECTURE.md` maps every section, algorithm line and equation of
 the paper to the code.
@@ -89,12 +98,12 @@ the paper to the code.
 ```bash
 pip install -e .                      # core: numpy, scipy, scikit-learn, pyyaml, tqdm
 pip install -e ".[llm]"               # OpenAI-compatible client + tiktoken token counts
-pip install -e ".[embeddings]"        # SPECTER2 (torch, transformers, adapters)
-pip install -e ".[data]"              # dataset downloads, PDF text extraction
+pip install -e ".[embeddings]"        # SPECTER2 (torch, transformers, adapters), AttrScore NLI judge
+pip install -e ".[data]"              # HF downloads, parquet reading (pandas, pyarrow), PDF text extraction
 pip install -e ".[eval]"              # nltk (statement splitting of the ScholarQABench citation eval)
 pip install -e ".[baselines]"         # umap-learn (RAPTOR), networkx (LightRAG graph export)
 pip install -e ".[agents]"            # paper-qa (PaperQA2; Python >= 3.11)
-pip install -e ".[dev]"               # pytest
+pip install -e ".[dev]"               # pytest, ruff
 ```
 
 Python ≥ 3.9 is required. The Codex CLI and an OpenScholar checkout are
@@ -106,31 +115,37 @@ external tools; see [Unbudgeted agents](#unbudgeted-agents).
 bash scripts/smoke_test.sh        # ~3 minutes on a laptop; outputs under results/smoke/
 ```
 
-The smoke test runs every stage of the pipeline on a small synthetic
-repository with the mock LLM and the hashing embedder:
+The smoke test runs the pipeline on a small synthetic repository with the
+mock LLM and the hashing embedder:
 1. Synthetic data.
 2. Dual taxonomies with Algorithm 1.
 3. Construction experiments, ablation, scalability and dynamic update.
-4. Index building and link-predictor training.
-5. Retrieval accuracy, end-to-end QA, the agent path, efficiency and the
-   retrieval ablation.
+4. Index building, link-predictor training, and the held-out benchmark
+   construction (`build_heldout_benchmark.py build` / `apply --auto-accept`).
+5. Retrieval accuracy, end-to-end QA, the agent path (offline simulated
+   agent), efficiency and the retrieval ablation; then the data-preparation
+   scripts (`prepare_arxiv`, `prepare_fulltext`, `prepare_benchmarks`) on the
+   format samples in `tests/fixtures/`, followed by retrieval and QA on them.
 6. One interactive question.
 
-It writes every table of the paper in the paper's format. **The mock
-backends only exercise the code paths: their numbers are not the paper's
-results.**
+It writes Tables 1–9 and the data of Figs 2–6 in the paper's format. It does
+not exercise the downloads, the real LLM / SPECTER2 backends, the external
+agents or the official evaluation scripts. **The mock backends only exercise
+the code paths: their numbers are not the paper's results.**
 
 ## Paper setting: LLM backbone and embeddings
 
 The paper uses DeepSeek-V4.0-Flash as the backbone LLM for every component
 and baseline ($0.14 / 1M input tokens, $0.28 / 1M output tokens). It embeds
 papers, concepts and chunks with SPECTER2 (768-d). `configs/paper.yaml`
-selects both:
+selects both, plus the real judges of Section 5.3:
 
 ```bash
-pip install -e ".[llm,embeddings]"
+pip install -e ".[llm,embeddings,eval]"
 export SCHOLARPATH_LLM_API_KEY=...                            # your provider's key
 export SCHOLARPATH_LLM_BASE_URL=https://api.deepseek.com/v1   # or any OpenAI-compatible endpoint
+export SCHOLARPATH_JUDGE_API_KEY=...                          # judge endpoint (evaluation scripts only)
+export SCHOLARPATH_JUDGE_BASE_URL=...                         # e.g. https://openrouter.ai/api/v1
 python scripts/<script>.py --config configs/paper.yaml ...
 ```
 
@@ -143,14 +158,20 @@ python scripts/<script>.py --config configs/paper.yaml ...
   `--set llm.cache_dir=null`.
 - **Judges.** The LLM judges of Section 5.3 (GPT-6.0-Sol, Opus-5.5,
   Grok-4.7; the official ResearchQA / ScholarQA-CS judge models;
-  Prometheus-2 7B) are set in the `evaluation:` section. They use the
-  `SCHOLARPATH_JUDGE_BASE_URL` / `SCHOLARPATH_JUDGE_API_KEY` endpoint. Pass
-  `--set evaluation.judge_provider=openai` to enable real judges. Judge cost
-  is metered separately and never counts as system cost.
+  Prometheus-2 7B) are set in the `evaluation:` section and use the
+  `SCHOLARPATH_JUDGE_BASE_URL` / `SCHOLARPATH_JUDGE_API_KEY` endpoint.
+  `configs/paper.yaml` enables them (`judge_provider: openai`) together with
+  the AttrScore-Flan-T5-XL NLI citation judge of the official ScholarQABench
+  script (`attribution_judge: nli`). `configs/default.yaml` uses offline mock
+  judges. Every script logs a warning when a real backbone LLM is combined
+  with mock judges, whose scores are not comparable with the paper. Judge
+  cost is metered separately and never counts as system cost.
 
 Overrides of the paper defaults (ε = 0.10, 1 − δ = 0.95, η_A = 0.02, β = 16,
 κ = 3, min node size 16, max depth 5, B = 8,192, …) go through
-`--set section.field=value`, e.g. `--set retrieval.budget=4096`.
+`--set section.field=value`, e.g. `--set retrieval.budget=4096`. Values are
+checked against the field types, so a typo (`--set builder.epsilon=0.1x`,
+`--set retrieval.budgte=4096`) stops the script with a one-line error.
 
 ## Data
 
@@ -164,23 +185,35 @@ python scripts/prepare_benchmarks.py   # benchmarks -> data/processed/, corpus a
 ```
 
 For offline runs, `python scripts/make_synthetic_data.py --out data/synthetic`
-writes a synthetic repository in the same processed layout. Every script
-accepts `--data-dir data/synthetic`.
+writes a synthetic repository in the same processed layout. The experiment
+scripts that read the processed layout take `--data-dir data/synthetic`.
+The others take a corpus file (`build_taxonomy`, `run_scalability`,
+`run_dynamic_update`: `--corpus data/synthetic/arxiv_sets/synthetic.jsonl.gz`)
+or an index (`train_link_predictor`, `ask`: `--index-dir`, `--corpus`); see
+their `--help`. The data-preparation scripts have their own flags
+(`data/README.md`).
 
 ## Reproducing the experiments
 
-All scripts accept `--config`, `--set`, `--output-dir` and `--help`. Their
+Every experiment script (all of `scripts/` except the five data-preparation
+scripts) accepts `--config`, `--set`, `--output-dir` and `--help`. Their
 docstrings give the paper-setting command and a quick offline command.
-Outputs go to `results/<script>/` as CSV/JSONL rows, Markdown tables shaped
-like the paper's, and plot data. Builds and per-query records are cached
+Results go to `--output-dir` (default `results/<script>/`) as CSV/JSONL rows,
+Markdown tables shaped like the paper's, and plot data. `build_index.py`
+writes indexes to `artifacts/index/<corpus>/` (`--index-dir`), and
+`build_heldout_benchmark.py` writes the held-out benchmark to
+`data/processed/heldout/` (`--out`). Builds and per-query records are cached
 under a configuration fingerprint, so `--resume` reuses only results
-produced under the same settings.
+produced under the same settings. Without `--resume`, the QA scripts
+(`run_retrieval_eval`, `run_qa_eval`, `run_agents`, `run_retrieval_ablation`)
+refuse to replace cached records of another configuration unless `--force`
+is given.
 
 ### Taxonomy construction (Section 5.2)
 
 | Paper | Command |
 |---|---|
-| Fig. 2 (soft node/edge F1 vs η), Fig. 3 (relative cost), Tables 8–9 (one-off vs node-wise) | `python scripts/run_taxonomy_experiments.py --config configs/paper.yaml --resume` |
+| Fig. 2 (soft node/edge F1 vs η), Fig. 3 (relative cost), Tables 8–9 (one-off vs node-wise) | `python scripts/run_taxonomy_experiments.py --config configs/paper.yaml --gold-max-depth 4 --resume` |
 | Table 6 (construction ablation) | `python scripts/run_taxonomy_ablation.py --config configs/paper.yaml --resume` |
 | Fig. 4 (scalability 2K → 148.4K papers) | `python scripts/run_scalability.py --config configs/paper.yaml --resume` |
 | Sec. 3.4 / App. B.3 (dynamic update) | `python scripts/run_dynamic_update.py --config configs/paper.yaml --corpus data/processed/arxiv_sets/cs.DB.jsonl.gz --cutoff 2024-01-01 --compare-scratch` |
@@ -189,7 +222,12 @@ produced under the same settings.
 On the arXiv sets, every method builds both the problem and the method
 taxonomy and is evaluated against FULL (η = 1.0). On TaxoBench, every
 method, FULL included, builds one topic taxonomy over the pooled 3,044
-papers and is evaluated against the merged expert taxonomy.
+papers and is evaluated against the merged expert taxonomy, cut at 4 levels
+below the common root as in App. C.2. Three flags control this cut:
+`--gold-max-depth` in `run_taxonomy_experiments.py` (default 4), `--reference-max-depth` in
+`build_taxonomy.py` (pass 4 for a TaxoBench reference), and
+`--taxobench-max-depth` in `prepare_benchmarks.py`, which truncates the stored
+gold file (default: keep all levels, so that the experiments can choose).
 
 ### Query answering (Section 5.3)
 
@@ -201,6 +239,7 @@ python scripts/build_index.py --config configs/paper.yaml --corpus chime
 python scripts/train_link_predictor.py --config configs/paper.yaml --corpus arxiv_subfields
 # 2. Held-out hypothesis benchmark (App. C.1): build on the complete corpus, annotate, apply, index the reduced corpus
 python scripts/build_heldout_benchmark.py --config configs/paper.yaml build --oversample 1.5 --min-source-date <LLM cutoff>
+#    ... two annotators fill data/processed/heldout/annotation_sheet.csv ...
 python scripts/build_heldout_benchmark.py apply
 python scripts/build_index.py --config configs/paper.yaml --corpus heldout
 python scripts/train_link_predictor.py --config configs/paper.yaml --corpus heldout
@@ -209,11 +248,32 @@ python scripts/train_link_predictor.py --config configs/paper.yaml --corpus held
 | Paper | Command |
 |---|---|
 | Table 2, Fig. 5 (Recall@B / NDCG@B; B = 2K…16K) | `python scripts/run_retrieval_eval.py --config configs/paper.yaml --resume` |
-| Tables 3–4, Fig. 6 (end-to-end QA, budgeted methods) | `python scripts/run_qa_eval.py --config configs/paper.yaml --set evaluation.judge_provider=openai --resume` |
-| Tables 3–5 (unbudgeted agents) | `python scripts/run_agents.py --config configs/paper.yaml --agents paperqa2,openscholar,agenticscholar,codex`, then `run_qa_eval.py --answers-dir results/run_agents` |
-| Table 5 (per-query efficiency) and Sec. 5.3.3 operator statistics | `python scripts/run_efficiency.py --inputs results/run_qa_eval,results/run_agents --operator-stats` |
-| Table 7 (retrieval ablation on hypothesis queries) | `python scripts/run_retrieval_ablation.py --config configs/paper.yaml` |
+| Table 1 (benchmark statistics), Tables 3–4, Fig. 6 (end-to-end QA, budgeted methods) | `python scripts/run_qa_eval.py --config configs/paper.yaml --resume` |
+| Tables 3–5 (unbudgeted agents) | `python scripts/run_agents.py --config configs/paper.yaml --agents paperqa2,openscholar,agenticscholar,codex --openscholar-dir <OpenScholar checkout> --agenticscholar-url <endpoint> --resume`, then `python scripts/run_qa_eval.py --config configs/paper.yaml --answers-dir results/run_agents --eval-only` |
+| Table 3 with the official evaluation scripts (App. C.3) | `python scripts/run_official_eval.py --config configs/paper.yaml --answers-dir results/run_qa_eval/answers,results/run_agents/answers --researchqa-dir <ResearchQA checkout> --scholarqabench-dir <ScholarQABench checkout>` |
+| Table 5 (per-query efficiency) and Sec. 5.3.3 operator statistics | `python scripts/run_efficiency.py --config configs/paper.yaml --inputs results/run_qa_eval,results/run_agents --operator-stats` |
+| Table 7 (retrieval ablation on hypothesis queries) | `python scripts/run_retrieval_ablation.py --config configs/paper.yaml --resume` |
 | Ask your own question | `python scripts/ask.py --config configs/paper.yaml --corpus arxiv_subfields "Which other methods could be applied to air-quality forecasting?"` |
+
+Every evaluation command needs `--config configs/paper.yaml`. It selects the
+real judges, and `run_efficiency.py --operator-stats` re-runs retrieval with
+the configured embedder, which must be the one the indexes were built with.
+With `--answers-dir`, `run_qa_eval.py` evaluates the agents' answers next to
+the cached budgeted answers and regenerates nothing. A failed or timed-out
+query scores 0 on every metric of Tables 2–4. The "Failed" column of Tables
+3–4 counts these queries and appears only when a system has failures.
+
+**Table 3 metrics.** `run_qa_eval.py` computes Rub, Corr and Cite with
+in-process re-implementations of the official ResearchQA and ScholarQABench
+protocols (`scholarpath.evaluation.qa_metrics`: same prompts, batching,
+retries and aggregation), so that they run with any judge backend.
+`run_official_eval.py` scores the same cached answers with the official
+scripts themselves (`compute_coverage.py`, `rubric_eval.py`,
+`citation_correctness_eval.py`, `prometheus_eval.py`), as App. C.3
+describes. The checkouts come from `evaluation.researchqa_dir` /
+`evaluation.scholarqabench_dir`, the flags, or `$SCHOLARPATH_RESEARCHQA_DIR` /
+`$SCHOLARPATH_SCHOLARQABENCH_DIR`. The scripts run in an environment with
+their requirements (`$SCHOLARPATH_EVAL_PYTHON`); see the script's docstring.
 
 #### Unbudgeted agents
 
@@ -224,15 +284,22 @@ records with cited paper IDs and an established / hypothesis status.
 
 - **PaperQA2:** `pip install paper-qa` (Python ≥ 3.11). The adapter points
   its LLMs at the same OpenAI-compatible endpoint.
-- **OpenScholar:** clone github.com/AkariAsai/OpenScholar and pass its path.
-  The adapter runs `run.py` with the exported corpus as its datastore.
-- **AgenticScholar:** provide the implementation as a Python callable or an
-  HTTP endpoint. It receives the same constructed taxonomies as ScholarPath.
-- **Codex:** `npm i -g @openai/codex`. The adapter runs `codex exec` with a
-  `model_providers` entry for the backbone; recent Codex versions require
-  an endpoint that implements the Responses API. External web access is
+- **OpenScholar:** clone github.com/AkariAsai/OpenScholar and pass its path
+  (`--openscholar-dir`). The adapter runs `run.py` with the exported corpus
+  as its datastore.
+- **AgenticScholar:** provide the implementation as a Python callable
+  (`--agenticscholar-fn module:function`) or an HTTP endpoint
+  (`--agenticscholar-url`). It receives the same constructed taxonomies as
+  ScholarPath.
+- **Codex:** `npm install -g @openai/codex@0.42.0`, the version used in the
+  paper (App. C.3). The adapter runs `codex exec` with a `model_providers`
+  entry for the backbone. Later Codex releases require an endpoint that
+  implements the Responses API (see `--codex-wire-api`). External web access is
   disabled with a Linux `unshare -n` network namespace and a local
   forwarding proxy to the LLM endpoint.
+- An agent whose checkout, implementation or tool is missing is reported as
+  unavailable and skipped. Check the "Unavailable agents" line and
+  `summary.json` before building Tables 3–5.
 - **Offline smoke tests:** `simulated` is a deterministic multi-step agent.
   It is not a paper baseline.
 
@@ -297,6 +364,16 @@ module docstrings:
   metric. We report citation F1 of the cited papers against the gold
   survey citations, with unaligned citations kept in the denominator. Its
   coverage on Citation-type rubric items is reported as well.
+- **Failed queries.** The official scripts only score the answers they
+  receive. A query on which a system failed or timed out therefore counts as
+  0 in Tables 2–4 (`run_retrieval_eval.py`, `run_qa_eval.py`,
+  `run_official_eval.py`), so a system
+  cannot gain from failing on hard queries. `qa_metrics.evaluate_*(...,
+  missing="zero")` does the same, and the default `"skip"` keeps the
+  official behaviour.
+- **ResearchQA queries** search the whole arXiv-Subfields corpus. The survey
+  date of a query is kept in its metadata but is not used as a retrieval
+  cutoff, since the paper describes none.
 
 ## Known differences from the paper text
 
@@ -306,16 +383,21 @@ module docstrings:
   `retrieval.llm_query_understanding=true` (default) gives 2 calls, and
   `--no-query-llm` / `false` uses the embedding-only parser and 1 call.
   `run_efficiency.py` reports composition and other calls separately.
-- **TaxoBench merged gold.** The released expert trees give 1,638 concept
-  nodes over up to 7 levels; truncated to 4 levels
-  (`--gold-max-depth 4`), they give 1,031. The paper reports 814 nodes
-  over 4 levels, and we found no rule that reproduces that number. The
+- **TaxoBench merged gold.** The released expert trees give 1,637 concept
+  nodes (the common root excluded) over up to 7 levels. Truncated to 4
+  levels (`--gold-max-depth 4`, the default of the construction
+  experiments), they give 1,030 concept nodes. The paper reports 814 concept
+  nodes over 4 levels, and we found no rule that reproduces that number. The
   3,815 citations and 3,044 distinct papers match exactly.
-- **CHIME.** The 100 expert-annotated topics join to 2,439 studies in the
-  released files, against 2,146 in the paper. The human-corrected
-  hierarchies are reconstructed from the generated hierarchies and the
-  expert annotation tables (`joe32140/chime-*` on Hugging Face); see
-  `data/README.md`.
+- **CHIME.** The 100 expert-annotated topics join to 2,439 study rows
+  (2,438 distinct studies) in the released files, against 2,146 studies in
+  the paper. The human-corrected hierarchies are reconstructed from the
+  generated hierarchies and the expert annotation tables
+  (`joe32140/chime-*` on Hugging Face); see `data/README.md`.
+- **Table 3 scorers.** By default Table 3 is computed with faithful
+  re-implementations of the official evaluation scripts, which run with any
+  judge backend. `run_official_eval.py` runs the official scripts themselves
+  (App. C.3).
 - **TaxoBench Sem.** Pass the all-MiniLM-L6-v2 embedder used by TaxoBench
   (`organization_metrics.load_taxobench_embedder`) to obtain comparable
   semantic path similarity. The public scorer falls back to string
@@ -325,5 +407,29 @@ module docstrings:
 
 ```bash
 pip install -e ".[dev]"
-python -m pytest -q tests/            # ~440 offline tests, about 1-2 minutes
+python -m pytest -q tests/            # ~500 offline tests, about 1-2 minutes
+ruff check src scripts tests          # pyflakes rules (configured in pyproject.toml)
+```
+
+## License and citation
+
+The license of the ScholarPath code itself is chosen by the authors; no
+license file is included yet (add `LICENSE` and a `license` field in
+`pyproject.toml` before release).
+`THIRD_PARTY_NOTICES.md` lists the third-party material it reproduces or
+re-implements: ScholarQABench prompts and rubrics (MIT), the TaxoBench
+scorer and CHIME parser (Apache-2.0), and the ResearchQA judge prompt (no
+license file upstream). The datasets are not redistributed. Each has its own
+terms, and TaxoBench's annotations are CC BY-NC 4.0, i.e. non-commercial only.
+See the dataset license table in `data/README.md`.
+
+If you use ScholarPath, please cite the paper:
+
+```bibtex
+@inproceedings{scholarpath2027,
+  title     = {Empowering Automated Research Agent At Scale: the Role of Evidence Query and Hypothesis Query},
+  booktitle = {Proceedings of the ACM SIGMOD International Conference on Management of Data (SIGMOD '27)},
+  year      = {2027},
+  note      = {Under submission}
+}
 ```

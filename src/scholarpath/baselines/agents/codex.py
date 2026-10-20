@@ -32,6 +32,15 @@ category". This adapter reproduces that setup:
 Setup: ``npm install -g @openai/codex@0.42.0`` (or put the ``codex`` binary on
 ``PATH``); ``isolation="unshare"`` needs unprivileged user namespaces
 (``sysctl kernel.unprivileged_userns_clone=1`` on some distributions).
+
+**Version.** Pin the paper's v0.42: later Codex releases removed the
+chat-completions wire API and reject ``wire_api = "chat"`` when they parse
+``config.toml`` (the backbone endpoint of the paper is chat-completions
+only). The adapter reads ``codex --version`` and warns when it is not 0.42;
+if Codex rejects the chat wire API, the run aborts with
+:class:`AgentUnavailableError` naming the fix (install
+``@openai/codex@0.42.0``, or ``wire_api="responses"`` with an endpoint that
+implements the Responses API) instead of failing every query.
 """
 
 from __future__ import annotations
@@ -68,6 +77,35 @@ log = logging.getLogger(__name__)
 
 PROVIDER_ID = "scholarpath"
 API_KEY_VAR = "SCHOLARPATH_AGENT_API_KEY"
+#: Codex version of the paper (App. C.3: "Codex (v0.42)"); later releases removed ``wire_api = "chat"``.
+PAPER_CODEX_VERSION = (0, 42)
+INSTALL_HINT = "npm install -g @openai/codex@0.42.0"
+
+_VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")
+
+
+def parse_codex_version(text: str) -> Optional[Tuple[int, int, int]]:
+    """``"codex-cli 0.42.0"`` -> ``(0, 42, 0)`` (``None`` if no version number is found)."""
+    m = _VERSION_RE.search(text or "")
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else None
+
+
+def codex_version(binary: str, timeout_s: float = 30.0) -> Optional[Tuple[int, int, int]]:
+    """Version reported by ``<binary> --version`` (``None`` when it cannot be determined)."""
+    try:
+        proc = subprocess.run([binary, "--version"], capture_output=True, text=True, timeout=timeout_s)
+    except (OSError, subprocess.SubprocessError) as err:
+        log.debug("codex --version failed: %s", err)
+        return None
+    if proc.returncode != 0:
+        return None
+    return parse_codex_version((proc.stdout or "") + " " + (proc.stderr or ""))
+
+
+def chat_wire_api_rejected(stderr: str) -> bool:
+    """Whether Codex refused ``wire_api = "chat"`` (removed after v0.42; codex-rs ``CHAT_WIRE_API_REMOVED_ERROR``)."""
+    text = (stderr or "").lower()
+    return "wire_api" in text and "chat" in text and ("no longer supported" in text or "unknown variant" in text)
 
 ENVIRONMENT_NOTE = (
     "Environment: you are running non-interactively without internet access. The local paper corpus is in the "
@@ -260,14 +298,22 @@ class CodexAgent(AgentAdapter):
         self.extra_config = dict(extra_config or {})
         self.bridge_port = int(bridge_port) if bridge_port else free_port()
         self._workdir: Optional[Path] = None
+        self._version_checked = False
+        self.version: Optional[Tuple[int, int, int]] = None
 
     # ------------------------------------------------------------ checks
     def check_available(self) -> None:
         if shutil.which(self.binary) is None:
             raise AgentUnavailableError(
-                f"Codex CLI {self.binary!r} not found on PATH: npm install -g @openai/codex@0.42.0 "
-                "(the paper uses v0.42)."
+                f"Codex CLI {self.binary!r} not found on PATH: {INSTALL_HINT} (the paper uses v0.42)."
             )
+        if not self._version_checked:
+            self._version_checked = True
+            self.version = codex_version(self.binary)
+            if self.version is not None and self.version[:2] != PAPER_CODEX_VERSION and self.wire_api == "chat":
+                log.warning("Codex %s found; the paper uses v0.42 (%s). Releases after 0.42 removed "
+                            "wire_api='chat', which the chat-completions backbone endpoint needs; the run aborts "
+                            "if this version rejects it.", ".".join(map(str, self.version)), INSTALL_HINT)
         if not (self.corpus_dir / "manifest.json").exists():
             raise AgentUnavailableError(
                 f"{self.corpus_dir} is not a corpus export: run "
@@ -363,6 +409,13 @@ class CodexAgent(AgentAdapter):
         (qdir / "stderr.log").write_text(proc.stderr or "", encoding="utf-8")
         parsed = parse_codex_events((proc.stdout or "").splitlines())
         final = last.read_text(encoding="utf-8") if last.exists() else (parsed["final_message"] or "")
+        if proc.returncode != 0 and not final and self.wire_api == "chat" and chat_wire_api_rejected(proc.stderr):
+            version = ".".join(map(str, self.version)) if self.version else "this version"
+            raise AgentUnavailableError(
+                f"Codex {version} rejects wire_api = \"chat\" (removed after v0.42), which the chat-completions "
+                f"backbone endpoint requires. Install the paper's version ({INSTALL_HINT}), or pass "
+                "wire_api='responses' with an endpoint that implements the Responses API. See "
+                f"{qdir / 'stderr.log'}.")
         if proc.returncode != 0 and not final:
             tail = (proc.stderr or "")[-2000:]
             raise RuntimeError(f"codex exec failed (exit {proc.returncode}); see {qdir}:\n{tail}")

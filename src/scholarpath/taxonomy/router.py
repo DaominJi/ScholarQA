@@ -123,7 +123,13 @@ class MLPRouter:
         targets: Sequence[Set[int]],
         sample_weight: Optional[np.ndarray] = None,
     ) -> "MLPRouter":
-        """Train on every (paper i, child c) pair; ``targets[i]`` = set of positive child indices."""
+        """Train on every (paper i, child c) pair; ``targets[i]`` = set of positive child indices.
+
+        No negatives are subsampled: a node has at most ``max_children``
+        children, so all pairs are cheap, and positives and negatives are
+        balanced by the loss weights instead (App. C.3 trains on the
+        LLM-labelled papers without negative sampling).
+        """
         cfg = self.config
         rng = np.random.default_rng(cfg.seed)
         n, C = paper_vecs.shape[0], child_vecs.shape[0]

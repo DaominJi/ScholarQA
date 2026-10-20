@@ -13,8 +13,13 @@ For hypothesis queries each aspect also carries a *target*: the problem-side
 or method-side premise of Eq. (9), or background evidence.
 
 ``config.llm_query_understanding = False`` selects an LLM-free fallback that
-uses the whole query as a single aspect (and as the concept text of both
-facets, so that grounding can still locate scopes by similarity).
+uses the whole query as a single aspect and as the concept text of the facets
+it names: both facets for evidence and assessment queries, and only the known
+endpoint's facet for discovery, whose candidates are searched on the other
+side. The searched side comes from the query metadata (``searched_side``, or
+the held-out benchmark's ``heldout_counterpart_facet`` / ``known_endpoint_facet``,
+App. C.1), else from the templated discovery patterns of
+:func:`scholarpath.prompts.retrieval.infer_searched_side`, else ``"method"``.
 """
 
 from __future__ import annotations
@@ -32,6 +37,7 @@ from scholarpath.prompts.retrieval import (
     TARGET_EVIDENCE,
     TARGET_METHOD_PREMISE,
     TARGET_PROBLEM_PREMISE,
+    infer_searched_side,
     parse_query_understanding,
     query_understanding_request,
 )
@@ -107,8 +113,34 @@ def _as_query(query: Union[Query, str]) -> Query:
     return Query(query_id="q", text=str(query), kind="")
 
 
-def _fallback_spec(text: str, kind: str) -> Dict[str, Any]:
-    """LLM-free Step 1: the whole query is the single aspect and the concept text of both facets."""
+_FACETS = ("problem", "method")
+
+
+def searched_side_hint(query: Query) -> Optional[str]:
+    """Searched side of a discovery query known without an LLM call (or None).
+
+    Read from ``Query.metadata``: ``searched_side``, else the held-out
+    counterpart's facet (``heldout_counterpart_facet``), else the facet
+    opposite to the known endpoint (``known_endpoint_facet``; App. C.1); else
+    from the templated discovery patterns of the query text.
+    """
+    md = query.metadata or {}
+    side = md.get("searched_side") or md.get("heldout_counterpart_facet")
+    if side in _FACETS:
+        return str(side)
+    known = md.get("known_endpoint_facet")
+    if known in _FACETS:
+        return "method" if known == "problem" else "problem"
+    return infer_searched_side(query.text)
+
+
+def _fallback_spec(text: str, kind: str, side_hint: Optional[str] = None) -> Dict[str, Any]:
+    """LLM-free Step 1: the whole query is the single aspect and the concept text of the facets it names.
+
+    A discovery query names only its known endpoint: the query text is the
+    concept of the facet opposite to the searched side (``side_hint``,
+    default ``"method"``), and the searched facet is left to its root.
+    """
     if kind in HYPOTHESIS_KINDS:
         # One aspect used for both premises of Eq. (9).
         aspects = [
@@ -117,11 +149,12 @@ def _fallback_spec(text: str, kind: str) -> Dict[str, Any]:
         ]
     else:
         aspects = [{"text": text, "role": "empirical", "weight": 1.0, "target": TARGET_EVIDENCE}]
+    side = (side_hint if side_hint in _FACETS else "method") if kind == HYPOTHESIS_DISCOVERY else None
     return {
         "kind": kind,
-        "searched_side": "method" if kind == HYPOTHESIS_DISCOVERY else None,
-        "problem_concepts": [text],
-        "method_concepts": [text] if kind != HYPOTHESIS_DISCOVERY else [],
+        "searched_side": side,
+        "problem_concepts": [text] if side != "problem" else [],
+        "method_concepts": [text] if side != "method" else [],
         "given_pair": (text, text) if kind == HYPOTHESIS_ASSESSMENT else None,
         "aspects": aspects,
     }
@@ -161,7 +194,8 @@ def analyze_query(
 
     The benchmark-provided ``Query.kind`` is preferred when set. With
     ``config.llm_query_understanding`` disabled (or ``llm=None``) no LLM call
-    is made and the whole query is used as one aspect.
+    is made and the whole query is used as one aspect; the searched side of a
+    discovery query then comes from :func:`searched_side_hint`.
     """
     config = config or RetrievalConfig()
     q = _as_query(query)
@@ -177,7 +211,11 @@ def analyze_query(
         except JSONParseError as err:  # pragma: no cover - depends on the backend
             log.warning("Query understanding failed for %s (%s); using the LLM-free fallback", q.query_id, err)
     if spec is None:
-        spec = _fallback_spec(q.text, kind_hint or EVIDENCE)
+        kind = kind_hint or EVIDENCE
+        hint = searched_side_hint(q) if kind == HYPOTHESIS_DISCOVERY else None
+        if kind == HYPOTHESIS_DISCOVERY and hint is None:
+            log.info("LLM-free Step 1: no searched side known for %s; searching candidate methods", q.query_id)
+        spec = _fallback_spec(q.text, kind, hint)
     spec = _complete_spec(spec, q.text)
 
     raw = spec["aspects"]

@@ -61,12 +61,14 @@ from scholarpath.experiments.qa import (  # noqa: E402
     SWEEP_BUDGETS,
     SYSTEMS,
     TABLE2_SYSTEMS,
+    CacheConflictError,
     DataLayout,
     EnvironmentCache,
     RecordStore,
     add_data_args,
     add_system_args,
     budget_tag,
+    check_cache_conflicts,
     combine_retrieval,
     count_errors,
     environment_summary,
@@ -125,6 +127,13 @@ def main(argv=None) -> int:
 
     evals: Dict[str, Dict[int, Dict[str, Any]]] = {s: {b: {} for b in budgets} for s in systems}
     errors: Dict[str, Dict[int, int]] = {s: {b: 0 for b in budgets} for s in systems}
+    try:  # never replace cached retrievals of another configuration without --resume / --force
+        check_cache_conflicts(store, [(b, s, bud, envs.for_benchmark(b).fingerprint(s))
+                                      for b in benchmarks for s in systems for bud in budgets],
+                              resume=args.resume, force=args.force)
+    except CacheConflictError as err:
+        log.error("%s", err)
+        return 2
     for bench in benchmarks:
         env = envs.for_benchmark(bench)
         group = BENCHMARKS[bench].group
@@ -132,7 +141,7 @@ def main(argv=None) -> int:
             for budget in budgets:
                 recs = run_queries(env, system, queries[bench], budget, benchmark=bench, mode="retrieval",
                                    store=store, resume=args.resume, fail_fast=args.fail_fast,
-                                   keep_context=args.keep_context)
+                                   keep_context=args.keep_context, force=args.force)
                 evals[system][budget][bench] = evaluate_retrieval_records(recs, queries[bench], budget, group)
                 errors[system][budget] += count_errors(recs)
 

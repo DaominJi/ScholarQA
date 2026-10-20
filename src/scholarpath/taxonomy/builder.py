@@ -14,9 +14,10 @@ processing of one node v is an *episode* (Algorithm 1, lines 3-21):
 
 * **InitNode** (line 3): allocate delta_v, group P_v into
   G_v = min{8, floor(n_v / 24)} k-means regions, let the LLM read a seed
-  batch from every region (initial schema + labels), train the router
-  f_theta_v on the training split of the LLM-labelled papers D_v and route
-  P_v \\ D_v.
+  batch from every region (initial schema + labels; seed papers labelled
+  before a later propose call added or refined children are relabelled,
+  App. B.2), train the router f_theta_v on the training split of the
+  LLM-labelled papers D_v and route P_v \\ D_v.
 * **Stage 1 -- quality-targeted Bayesian acquisition** (lines 5-10,
   Section 3.2): if the loss estimate F_{v,t}(0) = L^_{v,t} exceeds eps (or
   the last audit found errors), Thompson-sample the regional response
@@ -25,7 +26,9 @@ processing of one node v is an *episode* (Algorithm 1, lines 3-21):
   slope posteriors.
 * **Stage 2 -- audit-guided repair** (lines 11-13, Section 3.3): DISCOVER
   for missing concepts and CORRECT for routing errors when their pools reach
-  the repair threshold, then retrain and reroute.
+  the repair threshold max{floor, fraction * n_v}, then retrain and reroute.
+  Both pools are measured in papers of P_v: the residual pool by its size,
+  the disagreement pool by the number of misrouted papers it implies.
 * **Stage 3 -- audit-based certification** (lines 14-20, Section 3.3):
   freeze snapshot j, audit uniform batches of unverified papers and certify
   once U_{v,j,a} <= eps (Eq. 4); otherwise j <- j + 1 and the audited
@@ -38,7 +41,9 @@ then Stage 3 audits the snapshot left by the last repair.
 
 After the episode the final assignments are written to the taxonomy, the
 episode is recorded in the history H (which updates the transferred prior,
-Eq. 14) and the children above the size limit are enqueued (line 21).
+Eq. 14) and the children above the size limit are enqueued (line 21),
+except a child that received every paper of v: organizing it would
+re-organize the same papers, so it stays a leaf.
 
 The proxies used by Stage 1 (Section 3.2) are
 
@@ -83,6 +88,7 @@ from scholarpath.taxonomy.repair import (
     discovery_draws,
     relabel,
     relabel_candidates,
+    stale_label_candidates,
 )
 from scholarpath.taxonomy.response_model import (
     RegionDescriptor,
@@ -116,6 +122,12 @@ TERM_NO_SCHEMA = "no_schema"
 
 Label = Tuple[Tuple[str, ...], bool]  # (LLM children, missing concept)
 PapersLike = Union[Mapping[str, Paper], Corpus]
+
+
+def same_extent_as_parent(tax: Taxonomy, node: TaxonomyNode) -> bool:
+    """True if ``node`` holds every paper of its parent (P_c = P_v; children are subsets of P_v)."""
+    parent = tax.nodes.get(node.parent) if node.parent is not None else None
+    return parent is not None and bool(node.papers) and node.papers == parent.papers
 
 
 # ---------------------------------------------------------------------------
@@ -299,9 +311,20 @@ class NodeWiseBuilder:
             max_children=cfg.max_children,
         )
 
-    def splittable(self, node: TaxonomyNode) -> bool:
-        """Line 21: a node enters the queue if it is above the size limit and not too deep."""
-        return node.size >= self.config.min_node_size and node.depth < self.config.max_depth
+    def splittable(self, node: TaxonomyNode, tax: Optional[Taxonomy] = None) -> bool:
+        """Line 21: a node enters the queue if it is above the size limit and not too deep.
+
+        With ``tax``, a node that holds every paper of its parent is not
+        split either: its episode would re-organize the papers its parent's
+        episode just organized (with multi-label routing a catch-all child can
+        receive all of P_v), rebuilding the parent's subtree under it level
+        after level. It stays a leaf.
+        """
+        if node.size < self.config.min_node_size or node.depth >= self.config.max_depth:
+            return False
+        if tax is not None and same_extent_as_parent(tax, node):
+            return False
+        return True
 
     def _rng(self, facet: str, node_id: str, salt: int = 0) -> np.random.Generator:
         return np.random.default_rng([int(self.config.seed), stable_hash(facet, node_id, salt) % (2 ** 32)])
@@ -375,7 +398,7 @@ class NodeWiseBuilder:
         while queue:
             nid = queue.popleft()
             node = tax.nodes[nid]
-            if not self.splittable(node) or allocator.count >= cfg.max_nodes:
+            if not self.splittable(node, tax) or allocator.count >= cfg.max_nodes:
                 node.status = LEAF
                 continue
             state = self.init_node(tax, nid, ops, allocator)
@@ -391,7 +414,7 @@ class NodeWiseBuilder:
                 sum(episode.papers_read.values()), episode.verified, episode.rounds, episode.cycles,
             )
             for c in tax.children(nid):
-                if self.splittable(tax.nodes[c]):
+                if self.splittable(tax.nodes[c], tax):
                     queue.append(c)
                 else:
                     tax.nodes[c].status = LEAF
@@ -425,6 +448,9 @@ class NodeWiseBuilder:
             node.metadata[STATE_KEY] = {"termination": TERM_NO_SCHEMA, "delta_v": state.delta_v, "n": state.n}
             return state
         self.record_labels(state, tax, labels)
+        # The seed takes several propose calls when it exceeds llm_papers_per_call;
+        # reconcile the labels of earlier calls with children added or refined later.
+        self.schema_revision(state, tax, ops, labels=labels)
         self.retrain(state, tax)
         self._init_responses(state, tax)
         return state
@@ -537,22 +563,45 @@ class NodeWiseBuilder:
         state: NodeState,
         tax: Taxonomy,
         ops: TaxonomyLLM,
-        new_children: Sequence[str],
+        new_children: Sequence[str] = (),
         refined: Sequence[str] = (),
         exclude: Iterable[str] = (),
+        labels: Optional[Mapping[str, PaperLabel]] = None,
     ) -> List[str]:
-        """Schema-dependent relabeling (App. B.2) after children were added or refined."""
-        if not new_children and not refined:
-            return []
+        """Schema-dependent relabeling (App. B.2) after an operation added or refined children.
+
+        Two kinds of verified labels can be stale:
+
+        * labels verified before the operation (every verified paper outside
+          ``exclude``, normally the papers the operation read), when it added
+          ``new_children`` or refined ``refined``;
+        * labels made by the operation itself (``labels``) in an earlier call
+          of a multi-call operation (the seed batch of InitNode, a DISCOVER
+          draw, an acquisition batch above ``llm_papers_per_call``), when a
+          later call added or refined children. Each label records the schema
+          of its call (:attr:`PaperLabel.schema`); papers whose call saw the
+          final schema are left alone.
+
+        The candidates of both kinds (:func:`relabel_candidates`) are re-read
+        against the current schema in one relabeling pass (budget-capped).
+        Returns the relabelled papers.
+        """
         children = tax.children(state.node_id)
+        if not children or not (new_children or refined or labels):
+            return []
         child_vecs = {c: self.concept_vector(tax.nodes[c].text) for c in children}
-        candidates = relabel_candidates(
-            state.verified, [c for c in new_children if c in child_vecs], [c for c in refined if c in child_vecs],
-            self._vectors, child_vecs, exclude=exclude,
-        )
-        candidates = candidates[: self._budget_left(state, ops)]
-        labels = relabel(ops, tax, state.node_id, candidates)
-        return self.record_labels(state, tax, labels)
+        candidates: Set[str] = set()
+        new = [c for c in new_children if c in child_vecs]
+        ref = [c for c in refined if c in child_vecs]
+        if new or ref:
+            candidates.update(relabel_candidates(state.verified, new, ref, self._vectors, child_vecs, exclude=exclude))
+        if labels:
+            schema = {c: (tax.nodes[c].name, tax.nodes[c].definition) for c in children}
+            own = {p: state.verified[p] for p in labels if p in state.verified}
+            candidates.update(stale_label_candidates(own, labels, schema, self._vectors, child_vecs))
+        ordered = sorted(candidates)[: self._budget_left(state, ops)]
+        relabelled = relabel(ops, tax, state.node_id, ordered)
+        return self.record_labels(state, tax, relabelled)
 
     # ============================================================ router
     def retrain(self, state: NodeState, tax: Taxonomy) -> None:
@@ -599,9 +648,10 @@ class NodeWiseBuilder:
     def rebuild_router(self, tax: Taxonomy, nid: str) -> NodeRouter:
         """Retrain the frozen router of a finished node from its persisted verified labels.
 
-        Zero LLM cost. :meth:`BuildResult.save` does not store routers, so a
-        reloaded taxonomy needs this before :class:`DynamicUpdater` can
-        route arrivals. The router is fit exactly as :meth:`retrain` fits it:
+        Zero LLM cost. :meth:`BuildResult.save` stores routers; this is
+        needed only when a router is missing (a taxonomy reloaded without
+        ``routers.npz``, or a node created after the build) before
+        :class:`DynamicUpdater` can route arrivals. The router is fit exactly as :meth:`retrain` fits it:
         the verified, non-audited papers in ``node.metadata[STATE_KEY]``,
         split 80/20, on the node's current children. The result can differ
         slightly from the original router, for example when children that
@@ -825,7 +875,7 @@ class NodeWiseBuilder:
         self.record_labels(state, tax, lb.labels)
         new = [c for c in tax.children(state.node_id) if c not in before]
         if new:
-            self.schema_revision(state, tax, ops, new, (), exclude=lb.labels.keys())
+            self.schema_revision(state, tax, ops, new, (), exclude=lb.labels.keys(), labels=lb.labels)
         self.retrain(state, tax)
 
     def _observe_responses(self, state: NodeState, before: LossEstimate, after: LossEstimate,
@@ -859,6 +909,12 @@ class NodeWiseBuilder:
 
     # ---------------------------------------------------------- Stage 2
     def repair_threshold(self, n_v: int) -> float:
+        """Stage-2 trigger max{floor, fraction * n_v}, in papers of P_v (line 12).
+
+        Both pools are measured in papers of P_v: the DISCOVER pool by its
+        size (:meth:`discovery_pool`), the CORRECT pool by the number of
+        misrouted papers it implies (:meth:`routing_error_estimate`).
+        """
         cfg = self.config
         return max(float(cfg.repair_pool_floor), cfg.repair_pool_fraction * n_v)
 
@@ -866,22 +922,47 @@ class NodeWiseBuilder:
         """Residual leaf bottom_v plus papers flagged with a missing concept."""
         return [p for p in state.paper_ids if state.is_residual(p) or state.verified.get(p, ((), False))[1]]
 
+    @staticmethod
+    def held_out(state: NodeState) -> List[str]:
+        """Held-out verified papers without a missing concept: validation split + audited papers."""
+        held = set(state.val_ids) | set(state.audited)
+        return sorted(p for p in held if p in state.verified and not state.verified[p][1])
+
     def correction_pool(self, state: NodeState) -> List[str]:
         """Validation or audited papers whose router assignment disagrees with the LLM label."""
-        held = set(state.val_ids) | set(state.audited)
-        return sorted(
-            p for p in held
-            if p in state.verified and not state.verified[p][1]
-            and set(state.routed.get(p, ())) != set(state.verified[p][0])
-        )
+        return [p for p in self.held_out(state) if set(state.routed.get(p, ())) != set(state.verified[p][0])]
+
+    def routing_error_estimate(self, state: NodeState, pool: Optional[Sequence[str]] = None) -> float:
+        """Number of misrouted papers of P_v implied by the CORRECT pool.
+
+        The pool is the disagreeing part of the held-out verified papers, a
+        sample of the router's errors. Its rate |pool| / |held out| times
+        the number of placed papers that are still unverified (verified
+        papers keep their LLM labels and cannot be misrouted) estimates the
+        routing errors of P_v (about n_v sum_g pi_g (1 - m^_g) e^_g of
+        Section 3.2, with the unshrunk node-level rate). It puts the CORRECT
+        pool on the scale of the DISCOVER pool, so both are compared with
+        the same :meth:`repair_threshold`. The size of the pool itself is no
+        such measure: the held-out set holds only the papers the LLM read,
+        far fewer than ``repair_pool_fraction * n_v`` at large nodes.
+        """
+        held = self.held_out(state)
+        if not held:
+            return 0.0
+        n_dis = len(self.correction_pool(state) if pool is None else pool)
+        unverified_placed = sum(1 for p in state.paper_ids if p not in state.verified and state.routed.get(p))
+        return n_dis / len(held) * unverified_placed
 
     def stage2_repair(self, state: NodeState, tax: Taxonomy, ops: TaxonomyLLM, force: bool = False) -> bool:
         """Stage 2: audit-guided repair (lines 11-13, Section 3.3). Returns True if anything ran.
 
-        DISCOVER and CORRECT each run when their pool reaches
-        :meth:`repair_threshold`. With ``force`` (a dynamic update whose
-        cohort audit exposed drift, Section 3.4 / App. B.3) any non-empty
-        pool triggers its operation.
+        DISCOVER runs when its pool (residual leaf plus missing-concept
+        papers) reaches :meth:`repair_threshold`; CORRECT runs when its pool
+        of disagreeing held-out papers is non-empty and the number of
+        misrouted papers it implies (:meth:`routing_error_estimate`) reaches
+        the same threshold. With ``force`` (a dynamic update whose cohort
+        audit exposed drift, Section 3.4 / App. B.3) any non-empty pool
+        triggers its operation.
         """
         cfg = self.config
         if not cfg.use_targeted_repair:
@@ -900,12 +981,13 @@ class NodeWiseBuilder:
                     res = discover(ops, tax, state.node_id, draws, cfg.max_children)
                     self.record_labels(state, tax, res.labels)
                     if res.schema_changed:
-                        self.schema_revision(state, tax, ops, res.new_children, res.refined, exclude=res.labels.keys())
+                        self.schema_revision(state, tax, ops, res.new_children, res.refined,
+                                             exclude=res.labels.keys(), labels=res.labels)
                     self.retrain(state, tax)
                     repaired = True
         if cfg.use_correction:
             pool = self.correction_pool(state)
-            if pool and len(pool) >= threshold:
+            if pool and (force or self.routing_error_estimate(state, pool) >= threshold):
                 targets = correction_targets(
                     pool, state.region_of, self._vectors, state.unread(), cfg.kappa,
                     max_targets=self._budget_left(state, ops),

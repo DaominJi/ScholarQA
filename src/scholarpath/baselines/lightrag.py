@@ -46,9 +46,15 @@ Table 5. The candidate-pool option (``candidate_retriever`` +
 top-k candidate papers of a query, like RAPTOR; extractions are cached per
 text unit so that overlapping candidate sets are extracted once. Graph
 construction (extraction, description summaries, entity / relation
-embedding) is offline indexing: its calls are billed to ``index_build`` and
+embedding) is treated as indexing: its calls are billed to ``index_build`` and
 its wall time is reported as ``RetrievalResult.stats["index_build_s"]`` and
-excluded from ``RetrievalResult.latency_s``.
+excluded from ``RetrievalResult.latency_s``. With a per-query candidate pool
+(corpora above ``SystemOptions.graph_global_max_papers``, i.e.
+arXiv-Subfields) this construction runs at query time -- a deviation from
+the paper's globally indexed LightRAG -- so the "2 calls per query" of
+Table 5 cover the online keyword and composition calls only; the per-query
+extraction work is recorded with every answer and reported in the
+"Index-build" columns of run_efficiency.py's ``table5_detail``.
 
 **Citations of graph units.** An entity / relation description merges
 fragments extracted from several text units, so its unit cites (and is

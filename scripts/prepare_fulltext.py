@@ -27,11 +27,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from scholarpath.config import ScholarPathConfig  # noqa: E402
 from scholarpath.data.corpus import Corpus  # noqa: E402
 from scholarpath.data.download import USER_AGENT  # noqa: E402
 from scholarpath.data.fulltext import DEFAULT_SOURCE_ORDER, FulltextExtractor, make_sources  # noqa: E402
-from scholarpath.runtime import DEFAULT_CONFIG  # noqa: E402
+from scholarpath.runtime import DEFAULT_CONFIG, config_from_args  # noqa: E402
 
 
 def main(argv=None) -> int:
@@ -54,7 +53,7 @@ def main(argv=None) -> int:
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s", datefmt="%H:%M:%S")
 
-    config = ScholarPathConfig.load(args.config).override(args.overrides)
+    config = config_from_args(args)  # exits with a one-line error on an invalid --config / --set
     corpus = Corpus.load(args.corpus)
     papers = list(corpus)
     if args.ids is not None:

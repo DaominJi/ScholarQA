@@ -31,7 +31,9 @@ kind *evidence*):
   (query id -> references) adds externally obtained section citations;
 * ``metadata``: ``id``, ``domain`` (``general_domain``), ``subdomain``,
   ``field``, ``date`` (zero-padded ISO; the raw value is kept as
-  ``raw_date``) -- the survey date serves as the retrieval cutoff.
+  ``raw_date``). The survey date is informational only: as in the paper,
+  every ResearchQA query searches the whole arXiv-Subfields corpus, with no
+  per-query date cutoff.
 """
 
 from __future__ import annotations

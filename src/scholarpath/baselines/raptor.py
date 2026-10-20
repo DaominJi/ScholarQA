@@ -52,7 +52,10 @@ summaries hit the LLM response cache). Its summarization calls are billed to
 ``index_build``, and its wall time is reported as
 ``RetrievalResult.stats["index_build_s"]`` and excluded from
 ``RetrievalResult.latency_s``; per-query QA accounting excludes both (Table 5
-counts online calls only) but reports them separately.
+counts online calls only) but reports them separately (the "Index-build"
+columns of run_efficiency.py's ``table5_detail``). Building the tree at query
+time is a deviation from the paper's globally indexed baseline, used only on
+corpora above ``SystemOptions.graph_global_max_papers`` (arXiv-Subfields).
 """
 
 from __future__ import annotations

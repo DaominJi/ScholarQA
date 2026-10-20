@@ -9,6 +9,12 @@ callers decide how to apply proposed children, refinements and labels.
 Every call is billed to the cost component given by the caller
 (``acquisition``, ``auditing``, ``discovery``, ``correction``, ``relabeling``
 for ScholarPath; ``full`` / ``selection`` for the baselines).
+
+An operation on many papers takes several calls, and a later call can add
+children or sharpen definitions after an earlier call labelled its papers.
+Every :class:`PaperLabel` therefore records the schema its call worked with
+(:attr:`PaperLabel.schema`), so that the builder can reconcile labels of
+earlier calls with the final schema (schema-dependent relabeling, App. B.2).
 """
 
 from __future__ import annotations
@@ -51,6 +57,10 @@ class PaperLabel:
     paper_id: str
     children: List[str] = field(default_factory=list)
     missing: bool = False
+    #: Children of v as the call that produced the label saw them:
+    #: :func:`schema_key` of the name -> definition, including the children
+    #: that call proposed or refined. ``None``: unknown (treated as current).
+    schema: Optional[Dict[str, str]] = None
 
     @property
     def is_missing(self) -> bool:
@@ -62,6 +72,23 @@ class LabelBatch:
     labels: Dict[str, PaperLabel] = field(default_factory=dict)
     new_children: List[ChildSpec] = field(default_factory=list)  # index k <-> "new:k"
     refined: Dict[str, str] = field(default_factory=dict)  # node id -> new definition
+
+
+def schema_key(name: str) -> str:
+    """Identity of a child concept by name (proposed children are merged by it, see :func:`resolve_new_children`)."""
+    return str(name).strip().lower()
+
+
+def _schema_of(children: Sequence[object]) -> Dict[str, str]:
+    """``{schema_key(name): definition}`` of prompt children (dicts) or :class:`ChildSpec` objects."""
+    out: Dict[str, str] = {}
+    for c in children:
+        if isinstance(c, dict):
+            name, definition = c.get("name", ""), c.get("definition", "")
+        else:
+            name, definition = getattr(c, "name", ""), getattr(c, "definition", "")
+        out[schema_key(str(name))] = str(definition or "")
+    return out
 
 
 class TaxonomyLLM:
@@ -164,6 +191,10 @@ class TaxonomyLLM:
         schema proposed so far as ``existing`` children. Returns the final
         children (existing ones carry ``node_id``) and labels of every paper
         read (child placeholders ``"new:k"`` index the returned list).
+
+        Labels of earlier calls are re-keyed to the final schema but not
+        re-read: their :attr:`PaperLabel.schema` is the schema of their call,
+        so children added or refined by later calls can be told apart.
         """
         node = self.node_context(tax, node_id)
         schema: List[ChildSpec] = [
@@ -212,6 +243,7 @@ class TaxonomyLLM:
                 lab.children = [remap[c] for c in lab.children if c in remap]
                 lab.missing = not lab.children
             schema = new_schema
+            seen = _schema_of(schema)
             ktoi = {k: f"new:{v}" for k, v in key_map.items()}
             for item in obj.get("labels", []) or []:
                 if not isinstance(item, dict):
@@ -220,7 +252,7 @@ class TaxonomyLLM:
                 if pid not in batch:
                     continue
                 kids = [ktoi[str(k)] for k in (item.get("children") or []) if str(k) in ktoi]
-                labels[pid] = PaperLabel(pid, list(dict.fromkeys(kids)), not kids)
+                labels[pid] = PaperLabel(pid, list(dict.fromkeys(kids)), not kids, schema=dict(seen))
         # Express labels of existing children by node id.
         for lab in labels.values():
             lab.children = [
@@ -261,7 +293,12 @@ class TaxonomyLLM:
             offset = len(out.new_children)
             new = self._parse_new(obj.get("new_children")) if allow_new else []
             out.new_children.extend(spec for _, spec in new)
-            out.labels.update(self._parse_labels(obj.get("labels"), key_to_id, offset, set(batch)))
+            # Concurrent calls: each saw the given children plus only its own proposals.
+            seen = _schema_of(list(ctx) + [spec for _, spec in new])
+            parsed = self._parse_labels(obj.get("labels"), key_to_id, offset, set(batch))
+            for lab in parsed.values():
+                lab.schema = dict(seen)
+            out.labels.update(parsed)
         return out
 
     def discover(
@@ -272,7 +309,13 @@ class TaxonomyLLM:
         paper_ids: Sequence[str],
         component: Optional[str] = "discovery",
     ) -> LabelBatch:
-        """DISCOVER: assign / refine / add children for residual or flagged papers."""
+        """DISCOVER: assign / refine / add children for residual or flagged papers.
+
+        Batches run in sequence: children added by earlier batches are offered
+        to later ones as existing children. Each label records the schema of
+        its batch (:attr:`PaperLabel.schema`), so papers of earlier batches can
+        be reconciled with children added or refined by later ones.
+        """
         node = self.node_context(tax, node_id)
         ctx, key_to_id = self.children_context(tax, child_ids)
         out = LabelBatch()
@@ -293,11 +336,19 @@ class TaxonomyLLM:
                 continue
             self._count(component, len(batch))
             offset = len(out.new_children)
-            out.new_children.extend(spec for _, spec in self._parse_new(obj.get("new_children")))
+            new = [spec for _, spec in self._parse_new(obj.get("new_children"))]
+            out.new_children.extend(new)
+            seen = _schema_of(ctx_b)
             for r in obj.get("refined", []) or []:
                 if isinstance(r, dict) and str(r.get("key")) in key_to_id and r.get("definition"):
-                    out.refined[key_to_id[str(r["key"])]] = str(r["definition"]).strip()
-            out.labels.update(self._parse_labels(obj.get("labels"), k2i, offset, set(batch)))
+                    definition = str(r["definition"]).strip()
+                    out.refined[key_to_id[str(r["key"])]] = definition
+                    seen[schema_key(tax.nodes[key_to_id[str(r["key"])]].name)] = definition
+            seen.update(_schema_of(new))
+            parsed = self._parse_labels(obj.get("labels"), k2i, offset, set(batch))
+            for lab in parsed.values():
+                lab.schema = dict(seen)
+            out.labels.update(parsed)
         return out
 
 
@@ -314,7 +365,7 @@ def resolve_new_children(
     merged into it. Returns the mapping placeholder -> node id. Children
     beyond ``max_children`` are not created (their labels are dropped).
     """
-    existing = {tax.nodes[c].name.strip().lower(): c for c in tax.children(parent_id)}
+    existing = {schema_key(tax.nodes[c].name): c for c in tax.children(parent_id)}
     mapping: Dict[str, str] = {}
     for k, spec in enumerate(specs):
         if spec.node_id is not None:
@@ -322,7 +373,7 @@ def resolve_new_children(
             if spec.definition and spec.definition != tax.nodes[spec.node_id].definition:
                 tax.nodes[spec.node_id].definition = spec.definition
             continue
-        norm = spec.name.strip().lower()
+        norm = schema_key(spec.name)
         if norm in existing:
             mapping[f"new:{k}"] = existing[norm]
             continue

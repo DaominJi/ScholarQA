@@ -20,7 +20,9 @@ Benchmarks (``--benchmarks``):
   facet; results per facet and averaged over sets x facets.
 * ``taxobench`` -- every method, FULL included, builds one topic-and-approach
   taxonomy over the pooled papers, evaluated against the merged expert gold
-  taxonomy (``<data-dir>/taxobench/gold_taxonomy.json``).
+  taxonomy (``<data-dir>/taxobench/gold_taxonomy.json``) cut at 4 levels
+  below the common root as in App. C.2 (``--gold-max-depth``, default 4;
+  ``--gold-max-depth none`` scores against all levels of the released trees).
 
 Cost is the total billed LLM cost of a build (Eq. 15) relative to FULL on the
 same dataset and facet. FULL is built once per (dataset, facet) and reused by
@@ -41,7 +43,7 @@ Outputs (``--output-dir``, default ``results/run_taxonomy_experiments``)::
 
 Paper setting (DeepSeek-V4.0-Flash, SPECTER2; App. C.2 reports the merged gold with 4 levels)::
 
-    python scripts/run_taxonomy_experiments.py --config configs/paper.yaml --gold-max-depth 4 --resume
+    python scripts/run_taxonomy_experiments.py --config configs/paper.yaml --resume   # --gold-max-depth 4 (default)
 
 Quick offline run on the synthetic layout (mock LLM, hashing embedder)::
 
@@ -78,11 +80,13 @@ from scholarpath.experiments.taxonomy import (  # noqa: E402
     FIG3_SELECTOR,
     TABLE89_ETA,
     TAXOBENCH,
+    TAXOBENCH_GOLD_MAX_DEPTH,
     ConstructionRunner,
     construction_methods,
     load_arxiv_datasets,
     load_taxobench_dataset,
     make_scorer,
+    parse_max_depth,
     render_table,
     run_construction_comparison,
     summarize_runs,
@@ -114,8 +118,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                          "even if it is not in --selectors); 'mean' averages --selectors")
     ap.add_argument("--table-eta", type=float, default=TABLE89_ETA, help="ratio of Tables 8-9 (default 0.2)")
     ap.add_argument("--no-one-off", action="store_true", help="skip one-off selection (Tables 8-9 lose a section)")
-    ap.add_argument("--gold-max-depth", type=int, default=None,
-                    help="cut the TaxoBench gold below this many levels under the common root (paper: 4)")
+    ap.add_argument("--gold-max-depth", type=parse_max_depth, default=TAXOBENCH_GOLD_MAX_DEPTH,
+                    help="cut the TaxoBench gold below this many levels under the common root (default 4, as in "
+                         "App. C.2; 'none' keeps all levels of the released trees)")
     ap.add_argument("--metric-text", choices=("name", "name_definition"), default="name",
                     help="node label embedded by the soft F1 metrics")
     add_experiment_args(ap)
@@ -156,7 +161,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                                       plots=not args.no_plots)
     report: Dict[str, Any] = {
         "datasets": [{"name": d.name, "benchmark": d.benchmark, "papers": len(d.corpus), "facets": list(d.facets),
-                      "reference": {f: d.reference_kind(f) for f in d.facets}} for d in datasets],
+                      "reference": {f: d.reference_kind(f) for f in d.facets},
+                      "gold": {f: {"concepts": len(g.nodes) - 1, "depth": g.max_depth} for f, g in d.gold.items()}}
+                     for d in datasets],
+        "gold_max_depth": args.gold_max_depth,
         "methods": [m.key for m in methods],
         "seeds": seeds,
         "fig3_selector": args.fig3_selector,

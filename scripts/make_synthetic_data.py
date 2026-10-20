@@ -16,10 +16,23 @@ Layout written under ``--out`` (default ``data/synthetic``), mirroring
     arxiv_subfields/chunks.jsonl.gz        # section chunks of the QA corpus
     arxiv_subfields_full/papers.jsonl.gz   # QA corpus *with* the held-out papers
     arxiv_subfields_full/chunks.jsonl.gz
-    evidence/queries.jsonl                 # evidence queries (gold = J(u, m))
-    heldout/queries.jsonl                  # held-out hypothesis queries
+    evidence/queries.jsonl                 # evidence queries (gold = J(u, m), two rubric items each)
+    heldout/queries.jsonl                  # held-out hypothesis queries (planted)
+    heldout_reference/{problem_taxonomy.json, method_taxonomy.json, domains.json}
     taxobench/{papers.jsonl.gz, gold_taxonomy.json, gold/<id>.json, queries.jsonl}
     gold/{problem_taxonomy.json, method_taxonomy.json}
+
+``heldout_reference/`` holds planted *reference* taxonomies over the complete
+corpus (``arxiv_subfields_full``) and a domain per paper, the inputs of the
+held-out benchmark construction of App. C.1: the first held-out pair becomes a
+small "emerging" problem concept (new problem / existing method) and the
+second a small "emerging" method concept (new method / existing problem),
+whose papers postdate the rest of the corpus and belong to a new domain::
+
+    python scripts/build_heldout_benchmark.py --data-dir data/synthetic build --force \\
+        --problem-taxonomy data/synthetic/heldout_reference/problem_taxonomy.json \\
+        --method-taxonomy data/synthetic/heldout_reference/method_taxonomy.json \\
+        --domain-map data/synthetic/heldout_reference/domains.json --n-new-problem 1 --n-new-method 1
 
 Example::
 
@@ -31,13 +44,65 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
+from typing import Dict, List, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from scholarpath.data.corpus import Corpus, save_queries, write_json  # noqa: E402
-from scholarpath.data.synthetic import make_synthetic_benchmark  # noqa: E402
+from scholarpath.data.synthetic import SyntheticBenchmark, make_synthetic_benchmark  # noqa: E402
 from scholarpath.taxonomy.tree import Taxonomy  # noqa: E402
-from scholarpath.types import EVIDENCE, Query  # noqa: E402
+from scholarpath.types import EVIDENCE, Query, RubricItem  # noqa: E402
+
+#: Domain of the planted held-out papers (a new domain: their counterparts come from established ones).
+EMERGING_DOMAIN = "emerging"
+
+
+def with_rubrics(queries: List[Query]) -> List[Query]:
+    """Two ResearchQA-style rubric items per synthetic evidence query (content + citation), so that the
+    rubric-coverage path (Rub) runs offline."""
+    for q in queries:
+        method, problem = q.metadata.get("method", ""), q.metadata.get("problem", "")
+        q.rubric = [
+            RubricItem(text=f"Does the response explain how {method} is applied to {problem}?", kind="Other"),
+            RubricItem(text=f"Does the response cite at least one paper that uses {method} for {problem}?",
+                       kind="Citation"),
+        ]
+    return queries
+
+
+def heldout_reference(bench: SyntheticBenchmark) -> Tuple[Taxonomy, Taxonomy, Dict[str, str]]:
+    """Planted reference taxonomies over the complete corpus and a domain map (App. C.1 inputs).
+
+    The gold taxonomies plus the held-out papers at their (sub-problem, method)
+    leaves; held-out pair 0 gets a new problem concept below its sub-problem
+    and pair 1 a new method concept below its method, each holding only that
+    pair's papers (<= 4: an emerging idea). Regular papers belong to the
+    domain of their sub-problem, held-out papers to :data:`EMERGING_DOMAIN`.
+    """
+    P = Taxonomy.from_dict(bench.problem_gold.to_dict())
+    M = Taxonomy.from_dict(bench.method_gold.to_dict())
+    leaf_p = {P.nodes[n].name: n for n in P.leaves()}
+    leaf_m = {M.nodes[n].name: n for n in M.leaves()}
+    domains: Dict[str, str] = {}
+    for p in bench.corpus:
+        leaf = leaf_p[bench.pair_of[p.paper_id][0]]
+        domains[p.paper_id] = P.nodes[P.parent(leaf)].name
+    by_pair: Dict[int, List[str]] = {}
+    for p in bench.heldout_papers:
+        s, m = bench.pair_of[p.paper_id]
+        P.assign(p.paper_id, leaf_p[s])
+        M.assign(p.paper_id, leaf_m[m])
+        domains[p.paper_id] = EMERGING_DOMAIN
+        by_pair.setdefault(bench.heldout_pairs.index((s, m)), []).append(p.paper_id)
+    if 0 in by_pair:
+        s, _ = bench.heldout_pairs[0]
+        P.add_node(f"{s} under Sensor Drift", f"{s} when the input sensors drift over time.",
+                   parent=leaf_p[s], papers=by_pair[0])
+    if 1 in by_pair:
+        _, m = bench.heldout_pairs[1]
+        M.add_node(f"Drift-Aware {m}", f"A {m.lower()} variant that adapts its parameters online.",
+                   parent=leaf_m[m], papers=by_pair[1])
+    return P, M, domains
 
 
 def main(argv=None) -> int:
@@ -58,10 +123,14 @@ def main(argv=None) -> int:
     corpus.save_chunks(out / "arxiv_subfields" / "chunks.jsonl.gz")
     full.save(out / "arxiv_subfields_full" / "papers.jsonl.gz", include_chunks=False)
     full.save_chunks(out / "arxiv_subfields_full" / "chunks.jsonl.gz")
-    save_queries(out / "evidence" / "queries.jsonl", bench.evidence_queries)
+    save_queries(out / "evidence" / "queries.jsonl", with_rubrics(bench.evidence_queries))
     save_queries(out / "heldout" / "queries.jsonl", bench.hypothesis_queries)
     bench.problem_gold.save(out / "gold" / "problem_taxonomy.json")
     bench.method_gold.save(out / "gold" / "method_taxonomy.json")
+    ref_p, ref_m, domains = heldout_reference(bench)
+    ref_p.save(out / "heldout_reference" / "problem_taxonomy.json")
+    ref_m.save(out / "heldout_reference" / "method_taxonomy.json")
+    write_json(out / "heldout_reference" / "domains.json", domains)
 
     # TaxoBench-style organization benchmark: one "survey" per problem domain.
     tb = out / "taxobench"

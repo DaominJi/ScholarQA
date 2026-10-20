@@ -40,7 +40,7 @@ from typing import Any, Dict, List
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from scholarpath.data.corpus import write_json  # noqa: E402
-from scholarpath.experiments.qa import DEFAULT_INDEX_ROOT, LINK_PREDICTOR_DIR, csv_list  # noqa: E402
+from scholarpath.experiments.qa import DEFAULT_INDEX_ROOT, LINK_PREDICTOR_DIR, split_csv  # noqa: E402
 from scholarpath.index.semantic_index import SemanticIndex  # noqa: E402
 from scholarpath.llm import sum_usage  # noqa: E402
 from scholarpath.retrieval.link_training import train_link_predictor  # noqa: E402
@@ -60,7 +60,7 @@ def _concepts(spec: str) -> List[str]:
             return [str(x) for x in data]
         except json.JSONDecodeError:
             return [line.strip() for line in text.splitlines() if line.strip()]
-    return csv_list(spec)
+    return split_csv(spec)
 
 
 def _fmt(metrics: Dict[str, Any]) -> str:

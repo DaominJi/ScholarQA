@@ -18,11 +18,19 @@ For the bound-guided search of Section 4.3 the index caches, for every
 concept v and every level (concept / paper / chunk), the embedding center
 x̄_v and radius ρ_v = max ||x_y - x̄_v||_2 of the index nodes below v, so
 that x_a^T x_y <= x_a^T x̄_v + ρ_v (Cauchy-Schwarz) for every y below v.
+
+Token counts come from :func:`scholarpath.text.count_tokens`, i.e. tiktoken
+``cl100k_base`` when it is installed and ~4 characters per token otherwise.
+The counter in use (:func:`tokenizer_name`) is recorded in
+``metadata["tokenizer"]``; loading an index saved under another counter logs
+a warning and recomputes the stored costs. (Retrieval prices its context
+lines, and checks the budget B, with the counter of the running environment.)
 """
 
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
@@ -32,11 +40,19 @@ import numpy as np
 from scholarpath.config import IndexConfig
 from scholarpath.embeddings import Embedder, l2_normalize
 from scholarpath.taxonomy.tree import Taxonomy
+from scholarpath import text as _text
 from scholarpath.text import count_tokens
 from scholarpath.types import Chunk, Paper
 
+log = logging.getLogger(__name__)
+
 CONCEPT, PAPER, CHUNK = "concept", "paper", "chunk"
 LEVELS = (CONCEPT, PAPER, CHUNK)
+
+
+def tokenizer_name() -> str:
+    """The token counter behind :func:`~scholarpath.text.count_tokens` in this environment."""
+    return "tiktoken:cl100k_base" if _text._tiktoken_encoder() is not None else "chars/4"
 
 
 def concept_key(node_id: str) -> str:
@@ -275,6 +291,7 @@ class SemanticIndex:
         index._embed_all(embedder, paper_embeddings)
         index._compute_costs()
         index._compute_balls()
+        index.metadata["tokenizer"] = tokenizer_name()
         return index
 
     def _embed_all(self, embedder: Embedder, paper_embeddings: Optional[Dict[str, np.ndarray]] = None) -> None:
@@ -303,6 +320,7 @@ class SemanticIndex:
         self._refresh_postings()
         self._compute_costs()
         self._compute_balls()
+        self.metadata["tokenizer"] = tokenizer_name()
 
     def _compute_costs(self) -> None:
         for m in self._emb.values():
@@ -370,11 +388,23 @@ class SemanticIndex:
             index.cost = {k: int(v) for k, v in json.loads((d / "costs.json").read_text()).items()}
         if (d / "metadata.json").exists():
             index.metadata = json.loads((d / "metadata.json").read_text())
+        current = tokenizer_name()
+        saved = index.metadata.get("tokenizer")
+        if saved != current:
+            (log.warning if saved else log.info)(
+                "Index %s was saved with token counter %s but this environment counts tokens with %s; "
+                "recomputing its node costs (budgets and context sizes are not comparable across counters)",
+                d, saved or "unknown", current,
+            )
+            index.cost = {}
+            index._compute_costs()
+            index.metadata["tokenizer"] = current
         index._compute_balls()
         return index
 
     def stats(self) -> Dict[str, object]:
         return {
+            "tokenizer": self.metadata.get("tokenizer", tokenizer_name()),
             "papers": len(self.papers),
             "chunks": len(self.chunks),
             "problem": self.problem.stats(),

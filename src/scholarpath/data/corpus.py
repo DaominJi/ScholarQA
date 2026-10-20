@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import math
 import random
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Union
@@ -61,11 +62,32 @@ def read_json(path: PathLike) -> Any:
         return json.load(f)
 
 
+def json_safe(obj: Any) -> Any:
+    """``obj`` with non-finite floats (NaN, +-inf) replaced by ``None``.
+
+    ``json.dump`` would write them as the bare tokens ``NaN`` / ``Infinity``,
+    which are not JSON and break strict parsers (jq, JavaScript); undefined
+    statistics (e.g. an agreement rate over zero items) are written as ``null``.
+    """
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [json_safe(v) for v in obj]
+    return obj
+
+
 def write_json(path: PathLike, obj: Any, indent: Optional[int] = 1) -> None:
+    """Write ``obj`` as strict JSON (non-finite floats become ``null``, see :func:`json_safe`)."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        text = json.dumps(obj, ensure_ascii=False, indent=indent, allow_nan=False)
+    except ValueError:  # NaN / inf somewhere
+        text = json.dumps(json_safe(obj), ensure_ascii=False, indent=indent, allow_nan=False)
     with _open(path, "wt") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=indent)
+        f.write(text)
 
 
 class Corpus:

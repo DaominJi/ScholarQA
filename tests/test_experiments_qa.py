@@ -278,10 +278,42 @@ def qa_runs(world) -> Dict[str, Path]:
         _common(world, "agents") + ["--agents", "simulated", "--limit", "2",
                                     "--benchmarks", "synthetic,taxobench,heldout"]) == 0
     qa_args = _common(world, "rqa") + ["--benchmarks", "synthetic,taxobench,heldout", "--budgets", "2048",
-                                       "--sweep-budgets", "1024,2048", "--limit", "2", "--no-plots",
-                                       "--answers-dir", str(agents_out)] + FAST_GRAPH + FAST_RETRIEVAL
+                                       "--sweep-budgets", "1024,2048", "--limit", "2", "--no-plots"] \
+        + FAST_GRAPH + FAST_RETRIEVAL
+    # The documented two-step flow: budgeted answers first, then the agents' answers next to them
+    # (--answers-dir without --systems only evaluates; it never regenerates the budgeted answers).
     assert load_script("run_qa_eval").main(qa_args) == 0
+    assert load_script("run_qa_eval").main(qa_args + ["--answers-dir", str(agents_out)]) == 0
     return {"agents": agents_out, "qa": world["results"] / "rqa", "qa_args": qa_args}  # type: ignore[dict-item]
+
+
+def test_run_qa_eval_never_clobbers_cached_answers(world, qa_runs, tmp_path):
+    """--answers-dir alone is evaluation-only; a non-resume run refuses to replace another configuration's answers."""
+    import shutil
+
+    out = tmp_path / "rqa"
+    shutil.copytree(qa_runs["qa"] / "answers", out / "answers")
+    caches = sorted((out / "answers").glob("*/*/*.jsonl"))
+    stamps = {p: p.read_bytes() for p in caches}
+    base = [a for a in qa_runs["qa_args"]]
+    base[base.index("--output-dir") + 1] = str(out)
+    other = base + ["--no-query-llm"]  # another configuration (different fingerprint)
+    script = load_script("run_qa_eval")
+    # README follow-up after run_agents.py without the first run's options: evaluation only, nothing regenerated.
+    assert script.main(other + ["--answers-dir", str(qa_runs["agents"])]) == 0
+    assert {p: p.read_bytes() for p in caches} == stamps
+    rows3 = {r["System"] for r in csv.DictReader(open(out / "table3.csv", newline=""))}
+    assert {"ScholarPath", "SimulatedAgent (offline)"} <= rows3
+    # Generation under another configuration without --resume: refused, cache untouched.
+    assert script.main(other + ["--systems", "scholarpath"]) == 2
+    assert {p: p.read_bytes() for p in caches} == stamps
+    with pytest.raises(qa.CacheConflictError):
+        qa.check_cache_conflicts(qa.RecordStore(out / "answers"), [("synthetic", "scholarpath", 2048, "x")])
+    # --force replaces them.
+    assert script.main(other + ["--systems", "scholarpath", "--benchmarks", "synthetic", "--sweep-budgets", "none",
+                                "--force"]) == 0
+    recs = qa.RecordStore.load_file(out / "answers" / "synthetic" / "scholarpath" / "B2048.jsonl")
+    assert recs and all(r.efficiency["calls"] == 1 for r in recs.values())  # --no-query-llm: one call
 
 
 def test_run_agents_outputs(qa_runs):
@@ -453,7 +485,8 @@ def test_build_heldout_benchmark_script(world, tmp_path):
     planted = _plant_emerging_concepts(data, tmp_path / "planted")
     script = load_script("build_heldout_benchmark")
     common = ["--data-dir", str(data), "--output-dir", str(tmp_path / "out")]
-    assert script.main(common + ["build", "--problem-taxonomy", str(tmp_path / "planted" / "P.json"),
+    # --force: the synthetic layout already holds planted held-out queries (build refuses to overwrite them).
+    assert script.main(common + ["build", "--force", "--problem-taxonomy", str(tmp_path / "planted" / "P.json"),
                                  "--method-taxonomy", str(tmp_path / "planted" / "M.json"),
                                  "--domain-map", str(tmp_path / "planted" / "domains.json"),
                                  "--n-new-problem", "1", "--n-new-method", "1"]) == 0
@@ -639,6 +672,34 @@ def test_run_agent_prices_with_the_backbone(tmp_path):
                         fingerprint="b")["q1"].efficiency["cost_usd"] == pytest.approx(0.7)  # regenerated
 
 
+def test_codex_rejecting_the_chat_wire_api_aborts_with_a_clear_message(tmp_path, monkeypatch):
+    """Codex releases after v0.42 reject wire_api="chat": the adapter aborts the run (AgentUnavailableError)."""
+    import sys
+
+    from scholarpath.baselines.agents import AgentConfig, AgentUnavailableError, CodexAgent
+    from scholarpath.baselines.agents.codex import chat_wire_api_rejected, parse_codex_version
+
+    assert parse_codex_version("codex-cli 0.42.0") == (0, 42, 0) and parse_codex_version("dev") is None
+    err = ('Error loading config.toml: `wire_api = "chat"` is no longer supported.\n'
+           'How to fix: set `wire_api = "responses"` in your provider config.')
+    assert chat_wire_api_rejected(err) and not chat_wire_api_rejected("network error")
+    fake = tmp_path / "bin" / "codex"
+    fake.parent.mkdir()
+    fake.write_text(f"#!{sys.executable}\nimport sys\n"
+                    "if sys.argv[1:] == ['--version']:\n    print('codex-cli 0.99.0'); sys.exit(0)\n"
+                    f"sys.stderr.write({err!r}); sys.exit(1)\n")
+    fake.chmod(0o755)
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    (corpus / "manifest.json").write_text("{}")
+    monkeypatch.setenv("SCHOLARPATH_LLM_API_KEY", "k")
+    cfg = AgentConfig(base_url="http://127.0.0.1:9/v1", workdir=str(tmp_path / "work"), meter_with_proxy=False)
+    agent = CodexAgent(corpus, cfg, binary=str(fake), isolation="none", valid_ids=["p1"])
+    with pytest.raises(AgentUnavailableError, match="0.42.0"):
+        agent.answer(Query("q", "question"))
+    assert agent.version == (0, 99, 0)
+
+
 def test_row_order_and_table3_macro():
     assert qa.order_systems(["codex", "agenticscholar", "openscholar", "paperqa2", "simulated"],
                             qa.TABLE34_AGENT_ORDER) == ["paperqa2", "openscholar", "agenticscholar", "codex",
@@ -656,6 +717,142 @@ def test_row_order_and_table3_macro():
                                                  {"Corr": 75.6, "Cite": 70.4, "n": 108.0})}
     row = qa.qa_table_row(evals)
     assert row["macro.Avg"] == pytest.approx(70.7, abs=0.05)
+
+
+def test_missing_answers_score_zero_and_weight_by_query_counts():
+    """Failed / missing answers count as 0 on every Table 3 metric; ScholarQABench weights by query counts."""
+    from scholarpath.config import EvaluationConfig
+    from scholarpath.types import RubricItem
+
+    judges = qa.build_judges(EvaluationConfig())
+    rq = [Query(f"q{i}", f"How is method {i} used?", benchmark="researchqa", gold_papers=["p1"],
+                rubric=[RubricItem(text="Does the response mention p1?")]) for i in range(4)]
+    answer = Answer("q0", "p1 is used [p1].", [AnswerItem("p1 is used", citations=["p1"])])
+    full = qa.evaluate_benchmark("researchqa", {"q0": answer}, rq[:1], judges, papers={})
+    part = qa.evaluate_benchmark("researchqa", {"q0": answer}, rq, judges, papers={})
+    assert part.summary["Cite"] == pytest.approx(full.summary["Cite"] / 4)
+    assert part.summary["Rub"] == pytest.approx(full.summary["Rub"] / 4)
+    assert part.summary["Cite_answered"] == pytest.approx(full.summary["Cite"])
+    assert part.summary["n"] == 4.0 and part.summary["n_missing"] == 3.0 and part.summary["n_unanswered"] == 3.0
+    assert sum(1 for r in part.rows if r.get("missing")) == 3
+    none = qa.evaluate_benchmark("researchqa", {}, rq, judges, papers={})
+    assert none.summary["Rub"] == 0.0 and none.summary["Cite"] == 0.0
+    # ScholarQA-Multi: 1 of 4 answered -> Corr scaled by 1/4, n = 4 (the benchmark's query count).
+    mq = [Query(f"m{i}", f"question {i}", benchmark="scholarqa_multi", reference_answer="ref") for i in range(4)]
+    m_full = qa.evaluate_benchmark("scholarqa_multi", {"m0": Answer("m0", "some answer")}, mq[:1], judges, papers={})
+    m_part = qa.evaluate_benchmark("scholarqa_multi", {"m0": Answer("m0", "some answer")}, mq, judges, papers={})
+    assert m_part.summary["Corr"] == pytest.approx(m_full.summary["Corr"] / 4) and m_part.summary["n"] == 4.0
+    # ScholarQA-CS: doubly annotated questions count once.
+    item = [RubricItem(text="Mentions the method.")]
+    cq = [Query("c0", "same", benchmark="scholarqa_cs", rubric=item),
+          Query("c1", "same", benchmark="scholarqa_cs", rubric=item),
+          Query("c2", "other", benchmark="scholarqa_cs", rubric=item)]
+    cs = qa.evaluate_benchmark("scholarqa_cs", {"c1": Answer("c1", "an answer")}, cq, judges, papers={})
+    assert cs.summary["n"] == 2.0 and cs.summary["n_missing"] == 1.0
+    assert [r["query_id"] for r in cs.rows if r.get("missing")] == ["c2"]
+    # Weights follow the benchmark query counts, not the answered ones.
+    evals = {"scholarqa_cs": qa.BenchmarkEval("scholarqa_cs", "x", 8192, {"Corr": 50.0, "n": 100.0}),
+             "scholarqa_multi": qa.BenchmarkEval("scholarqa_multi", "x", 8192, {"Corr": 80.0, "n": 108.0})}
+    assert qa.qa_table_row(evals)["scholarqabench.Corr"] == pytest.approx((50 * 100 + 80 * 108) / 208)
+    # The "Failed" column appears only when some system failed.
+    assert qa.unanswered_cell([part, m_part]) == (6, 8, "6/8")
+    rows = {"A": {"n_failed": 0}, "B": {"n_failed": 2}}
+    assert qa.FAILED_COLUMN in qa.with_failed_column(qa.table3_spec(["researchqa"]), rows).columns
+    assert qa.FAILED_COLUMN not in qa.with_failed_column(qa.table3_spec(["researchqa"]), {"A": {}}).columns
+
+
+def test_index_embedder_must_match_the_runtime(world):
+    """Query vectors of another embedder (e.g. hashing vs. SPECTER2, both 768-d) are refused."""
+    from scholarpath.config import EmbeddingConfig, ScholarPathConfig
+
+    meta = json.loads((world["index"] / "arxiv_subfields" / "metadata.json").read_text())
+    assert meta["embedding"] == {"backend": "hashing", "dim": 768}
+    env = qa.QAEnvironment.load(world["index"] / "arxiv_subfields", Runtime.from_config(), link_predictor="none")
+    env.retriever("scholarpath")  # same embedder: fine
+    cfg = ScholarPathConfig()
+    cfg.embedding.dim = 128
+    other = qa.QAEnvironment.load(world["index"] / "arxiv_subfields", Runtime.from_config(cfg), link_predictor="none")
+    other.retriever("bm25")  # lexical systems do not embed queries
+    for system in ("scholarpath", "dense", "lightrag"):
+        with pytest.raises(qa.EmbeddingMismatchError, match="--config"):
+            other.retriever(system)
+    hashing = qa.embedding_identity(EmbeddingConfig())
+    specter = qa.embedding_identity(EmbeddingConfig(backend="specter2"))
+    assert specter == {"backend": "specter2", "model": "allenai/specter2_base", "adapter": "allenai/specter2"}
+    assert qa.embedding_mismatches(specter, hashing) == ["backend: index 'specter2' vs. runtime 'hashing'"]
+    # Indexes built before the identity was recorded: build_summary.json {"backend", "model"} still compares.
+    assert qa.embedding_mismatches({"backend": "hashing", "model": "allenai/specter2_base"}, hashing) == []
+
+
+def test_per_query_graph_construction_is_reported_separately(world):
+    """RAPTOR / LightRAG over per-query candidate pools: construction is kept out of Table 5 but recorded."""
+    rt = Runtime.from_config()
+    opts = qa.SystemOptions(graph_global_max_papers=0, graph_candidates=4)
+    env = qa.QAEnvironment.load(world["index"] / "arxiv_subfields", rt, link_predictor="none", options=opts)
+    assert env.per_query_graph
+    q = qa.DataLayout(world["data"]).load_queries("synthetic", limit=1)[0]
+    env.prepare("lightrag")
+    eff = env.run_one("lightrag", q, 2048, fail_fast=True).efficiency
+    assert eff["index_build_calls"] > 0 and eff["index_build_tokens"] > 0
+    assert eff["calls"] == 2  # online: keyword extraction + composition only
+    summary = qa.efficiency_summary([eff])
+    assert summary["Index-build calls"] == eff["index_build_calls"] and summary["Calls"] == 2
+    assert {"Index-build calls", "Index-build cost ($)"} <= {c.key for c in qa.TABLE5_DETAIL.columns}
+    dense = env.run_one("dense", q, 2048, fail_fast=True).efficiency
+    assert dense["index_build_calls"] == 0
+
+
+def test_heldout_script_planted_reference_and_no_overwrite(world, tmp_path):
+    """App. C.1 on the synthetic layout: planted reference, options after the sub-command, no silent overwrite."""
+    import shutil
+
+    data = tmp_path / "data"
+    shutil.copytree(world["data"], data)
+    ref = data / "heldout_reference"
+    planted = load_queries(data / "heldout" / "queries.jsonl")
+    script = load_script("build_heldout_benchmark")
+    build = ["build", "--data-dir", str(data), "--problem-taxonomy", str(ref / "problem_taxonomy.json"),
+             "--method-taxonomy", str(ref / "method_taxonomy.json"), "--domain-map", str(ref / "domains.json"),
+             "--n-new-problem", "1", "--n-new-method", "1", "--output-dir", str(tmp_path / "res")]
+    assert script.main(build) == 2  # the layout already holds (planted) held-out queries
+    assert load_queries(data / "heldout" / "queries.jsonl") == planted
+    # No target: nothing is written, exit status 1.
+    assert script.main(build + ["--force", "--max-extent", "0"]) == 1
+    assert load_queries(data / "heldout" / "queries.jsonl") == planted
+    assert not (data / "heldout" / "papers.jsonl.gz").exists()
+    assert script.main(build + ["--force"]) == 0
+    stats = json.loads((data / "heldout" / "stats.json").read_text())
+    assert stats["targets_per_setting"] == {"new_problem_existing_method": 1, "new_method_existing_problem": 1}
+    reduced = Corpus.load(data / "heldout" / "papers.jsonl.gz")
+    assert not any(pid.startswith("held") for pid in reduced.ids)  # every held-out paper removed
+    assert script.main(["apply", "--data-dir", str(data), "--auto-accept"]) == 0
+    kept = load_queries(data / "heldout" / "queries.jsonl")
+    assert len(kept) == 2 and {q.metadata["setting"] for q in kept} == {"new_problem_existing_method",
+                                                                        "new_method_existing_problem"}
+    assert all(q.metadata["supporting_papers"] for q in kept)
+    (tmp_path / "empty").mkdir()
+    assert script.main(["--data-dir", str(tmp_path), "--out", str(tmp_path / "empty"), "apply"]) == 1
+
+
+def test_table1_rows():
+    ev = [Query(f"r{i}", "t", gold_papers=["a", "b"], unaligned_gold=["c"] * i) for i in range(2)]
+    cs = [Query("c0", "t", gold_papers=["a"])]
+    multi = [Query("m0", "t", gold_papers=["a", "b", "c"])]
+    held = [Query("h0", "t", kind="hypothesis_discovery",
+                  metadata={"setting": "new_problem_existing_method", "supporting_papers": ["x", "y"]}),
+            Query("h1", "t", kind="hypothesis_discovery",
+                  metadata={"setting": "new_method_existing_problem", "supporting_papers": ["x", "y", "z", "w"]})]
+    rows, sections = qa.table1_rows({"researchqa": ev, "scholarqa_cs": cs, "scholarqa_multi": multi,
+                                     "heldout": held},
+                                    {"researchqa": 100, "scholarqa_cs": 100, "scholarqa_multi": 100, "heldout": 90})
+    assert rows["ResearchQA"] == {"Queries": 2, "Corpus": 100, "Gold/Q": 2.5}
+    assert rows["ScholarQABench"]["Queries"] == 2 and rows["ScholarQABench"]["Gold/Q"] == 2.0
+    assert rows["Held-Out Total"] == {"Queries": 2, "Corpus": 90, "Gold/Q": 3.0}
+    assert rows["– New Prob. / Exist. Meth."]["Gold/Q"] == 2.0
+    assert rows["– New Meth. / Exist. Prob."]["Gold/Q"] == 4.0
+    assert [t for t, _ in sections] == ["Evidence Queries", "Hypothesis Queries"]
+    planted = [Query("p0", "t", kind="hypothesis_discovery")]  # no supporting-paper record: Gold/Q undefined
+    assert qa.table1_rows({"heldout": planted}, {"heldout": 5})[0]["Held-Out Total"]["Gold/Q"] is None
 
 
 def test_ask_format_lists_support_paths(world):

@@ -10,6 +10,10 @@
 * :mod:`.taxobench`      -- TaxoBench pooled corpus, gold taxonomies, organization queries
 * :mod:`.chime`          -- CHIME human-corrected hierarchies, study corpus, organization queries
 * :mod:`.download`       -- raw dataset downloads (``scripts/download_data.py``)
+* :mod:`.heldout`        -- held-out hypothesis benchmark (App. C.1; import from the module)
+
+:mod:`.synthetic` and :mod:`.heldout` depend on the taxonomy package and are
+not re-exported here; import them from their modules.
 """
 
 # Corpus I/O first: other packages import these names from ``scholarpath.data``.
@@ -36,7 +40,7 @@ from scholarpath.data.arxiv import (
 from scholarpath.data.chime import ChimeData, build_chime, parse_generated_hierarchy
 from scholarpath.data.download import DATASETS, download_dataset, read_json_records
 from scholarpath.data.fulltext import FulltextExtractor, latex_to_sections, make_sources, s2orc_sections, sections_to_chunks
-from scholarpath.data.researchqa import load_researchqa, researchqa_to_queries
+from scholarpath.data.researchqa import load_researchqa, load_researchqa_hf, researchqa_to_queries
 from scholarpath.data.scholarqabench import EvidenceClassifier, load_scholarqa_cs, load_scholarqa_multi
 from scholarpath.data.taxobench import TaxoBenchData, load_taxobench, merge_gold_taxonomies
 
@@ -52,7 +56,8 @@ __all__ = [
     # full text
     "FulltextExtractor", "latex_to_sections", "make_sources", "s2orc_sections", "sections_to_chunks",
     # benchmarks
-    "ChimeData", "build_chime", "parse_generated_hierarchy", "load_researchqa", "researchqa_to_queries",
+    "ChimeData", "build_chime", "parse_generated_hierarchy", "load_researchqa", "load_researchqa_hf",
+    "researchqa_to_queries",
     "EvidenceClassifier", "load_scholarqa_cs", "load_scholarqa_multi", "TaxoBenchData", "load_taxobench", "merge_gold_taxonomies",
     # downloads
     "DATASETS", "download_dataset", "read_json_records",

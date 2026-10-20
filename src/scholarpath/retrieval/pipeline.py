@@ -18,13 +18,18 @@ Ablations (Table 7)
   (text similarity of concept descriptions) instead of the temporally trained
   predictor; candidates are still scored, by the untrained prior.
 * "w/o bound-guided search": ``config.use_bound_guided_search = False``
-  (exhaustive greedy scan; identical selections, Proposition 7).
+  (unpruned scan that scores every candidate node in scope; identical
+  selections, Proposition 7; :class:`~scholarpath.retrieval.search.ExhaustiveGreedy`
+  is the fully enumerating reference used by the tests).
 * "w/o role-aware granularity": ``config.use_role_aware_granularity = False``.
 * "w/o shared-cost reuse update": ``config.use_shared_cost_update = False``.
 * ``config.use_link_prediction = False`` is a further ablation that drops the
   prior altogether (eta_hat = phi).
 
 ``RetrievalResult.stats["scored_candidates"]`` is the "Scored" column.
+``stats["studied_pair"]`` tells whether the asked pair itself is studied
+(J(u_q, m_q) non-empty; ``None`` for discovery), and ``stats["tokenizer"]``
+names the token counter behind the budget B and the node costs c(x).
 """
 
 from __future__ import annotations
@@ -35,7 +40,7 @@ from typing import Any, Dict, List, Optional, Union
 
 from scholarpath.config import RetrievalConfig
 from scholarpath.embeddings import Embedder
-from scholarpath.index.semantic_index import SemanticIndex
+from scholarpath.index.semantic_index import SemanticIndex, tokenizer_name
 from scholarpath.llm import LLMClient, sum_usage
 from scholarpath.retrieval.compose import ContextRenderer, NodeCostTable, assemble_context, compose_answer
 from scholarpath.retrieval.grounding import Grounding, ground
@@ -134,6 +139,8 @@ class ScholarPathRetriever:
             candidate_ids=candidates,
             candidate_scores={renderer.concept_name(c): self._support(space, result, c) for c in candidates},
             retrieval_llm_calls=sum_usage(meter.diff(before)).calls if meter is not None else 0,
+            studied_pair=space.studied_pair,
+            tokenizer=tokenizer_name(),
         )
         names = [renderer.concept_name(c) for c in candidates][: max(1, self.config.max_hypothesis_candidates)]
         return RetrievalResult(

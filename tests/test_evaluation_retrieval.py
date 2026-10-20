@@ -222,13 +222,16 @@ def test_package_exports_are_lazy_and_complete():
 
     import scholarpath.evaluation as E
     from scholarpath.evaluation import efficiency, hypothesis_metrics, judges, official, qa_metrics, reporting
-    from scholarpath.evaluation import retrieval_metrics
+    from scholarpath.evaluation import organization_metrics, retrieval_metrics, taxonomy_metrics
 
-    for module in (retrieval_metrics, qa_metrics, hypothesis_metrics, judges, efficiency, reporting, official):
-        missing = [n for n in module.__all__ if n not in E.__all__]
+    for module in (retrieval_metrics, qa_metrics, hypothesis_metrics, judges, efficiency, reporting, official,
+                   taxonomy_metrics, organization_metrics):
+        missing = [n for n in module.__all__ if n not in E.__all__ and n not in ("PRF", "f1_score")]
         assert not missing, (module.__name__, missing)
     assert E.flatten_benchmarks is reporting.flatten_benchmarks and E.official_id is official.official_id
     assert E.PRF is qa_metrics.PRF  # name clashes resolve to the QA metrics
+    assert E.TaxonomyScorer is taxonomy_metrics.TaxonomyScorer and E.soft_node_f1 is taxonomy_metrics.soft_node_f1
+    assert "soft_node_f1" in E.__all__ and "adjusted_rand_index" in E.__all__
     with pytest.raises(AttributeError):
         E.no_such_symbol  # noqa: B018
     # Importing one submodule must not import the optional (sklearn-backed) metric modules.

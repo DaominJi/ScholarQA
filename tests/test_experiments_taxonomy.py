@@ -171,10 +171,34 @@ def test_truncate_and_restrict_gold():
     cut = T.truncate_taxonomy(gold, 1)
     assert cut.max_depth == 1 and len(cut.nodes) == 1 + len(gold.children(gold.root_id))
     assert cut.root.papers == gold.root.papers and gold.max_depth == 2
+    assert T.parse_max_depth("none") is None and T.parse_max_depth("0") is None and T.parse_max_depth("4") == 4
     keep = sorted(gold.root.papers)[:10]
     small = T.restrict_taxonomy(gold, keep)
     assert small.root.papers == set(keep)
     assert all(n.papers for nid, n in small.nodes.items())
+
+
+def test_router_rates_ignore_unsplit_leaves():
+    """Table 6: a_v / d_v average over nodes that trained a router, not over leaves left without one."""
+    from scholarpath.taxonomy.result import BuildResult, EpisodeRecord
+
+    def ep(nid: str, term: str, a: float = 0.0, d: float = 0.0, verified: int = 5) -> EpisodeRecord:
+        return EpisodeRecord(node_id=nid, depth=1, n_v=10, n_children=0 if term in T.UNROUTED_TERMINATIONS else 3,
+                             verified=verified, abstention=a, disagreement=d, metadata={"termination": term})
+
+    tax = Taxonomy(facet="problem", root_name="root")
+    res = BuildResult(tax, episodes=[ep("P0", "certified", 0.04, 0.10), ep("P1", "budget", 0.02, 0.06),
+                                     ep("P2", "no_schema"), ep("P3", "no_schema"), ep("P4", "no_split")])
+    rates = T.router_rates(res)
+    assert rates["routed_episodes"] == 2
+    assert rates["abstention"] == pytest.approx(0.03) and rates["disagreement"] == pytest.approx(0.08)
+    ds = T.ConstructionDataset(name="set", benchmark=T.ARXIV, corpus=Corpus([], name="set"), facets=("problem",))
+    row = T.run_record(ds, "problem", T.SCHOLARPATH_METHOD, 0, res)
+    assert row["abstention"] == pytest.approx(0.03) and row["disagreement"] == pytest.approx(0.08)
+    assert row["mean_ratio"] == pytest.approx(0.5)  # eta_v of every episode (unsplit leaves read their seed)
+    # A build without any router reports no a_v / d_v (skipped when averaged), not 0.
+    none = T.router_rates(BuildResult(tax, episodes=[ep("P2", "no_schema")]))
+    assert none["abstention"] is None and none["disagreement"] is None
 
 
 def test_build_cache_memo_disk_and_reuse(tmp_path):
@@ -507,6 +531,7 @@ def test_script_run_taxonomy_experiments(layout, shared_cache, tmp_path):
     assert all(in_unit_interval(r[k]) for r in runs for k in T.METRICS)
     report = json.loads((out / "report.json").read_text())
     assert report["cache"]["built"] == len(runs)  # every (dataset, facet, method) built exactly once
+    assert report["gold_max_depth"] == T.TAXOBENCH_GOLD_MAX_DEPTH == 4  # App. C.2: 4-level merged gold by default
     assert "ScholarPath" in (out / "table9.md").read_text()
     summary = {(r["benchmark"], r["facet"], r["method"]): r for r in read_csv(out / "summary.csv")}
     for bar in read_csv(out / "fig3.csv"):

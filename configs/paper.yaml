@@ -1,10 +1,14 @@
-# Paper setting: DeepSeek-V4.0-Flash through an OpenAI-compatible endpoint and SPECTER2 embeddings.
+# Paper setting: DeepSeek-V4.0-Flash through an OpenAI-compatible endpoint, SPECTER2
+# embeddings, and the real judges of Section 5.3 / App. C.3.
 #
 #   export SCHOLARPATH_LLM_API_KEY=...            # provider API key
 #   export SCHOLARPATH_LLM_BASE_URL=https://api.deepseek.com/v1   # or https://openrouter.ai/api/v1
-#   pip install -e ".[llm,embeddings]"
+#   export SCHOLARPATH_JUDGE_API_KEY=...          # judge endpoint (evaluation scripts only)
+#   export SCHOLARPATH_JUDGE_BASE_URL=...         # e.g. https://openrouter.ai/api/v1
+#   pip install -e ".[llm,embeddings,eval]"
 #
 # Set llm.model to the identifier your provider uses for DeepSeek-V4.0-Flash.
+# All other hyper-parameters are the paper defaults of configs/default.yaml.
 llm:
   provider: openai
   model: deepseek-v4-flash
@@ -19,3 +23,14 @@ embedding:
   query_adapter: allenai/specter2_adhoc_query
   dim: 768
   cache_dir: cache/embeddings
+# Judges (App. C.3): GPT-6.0-Sol / Opus-5.5 / Grok-4.7 for the hypothesis
+# queries, the official ResearchQA (gpt-4.1-mini) and ScholarQA-CS
+# (gpt-4-turbo) judges, Prometheus-2 7B for ScholarQA-Multi, all through the
+# judge endpoint above, and the AttrScore-Flan-T5-XL NLI model of
+# ScholarQABench's citation_correctness_eval.py for statement-level Cite.
+# Judge cost is metered separately and never counts as system cost. To score
+# without judge credentials, pass --set evaluation.judge_provider=mock (the
+# scores are then not comparable with the paper, and the scripts warn).
+evaluation:
+  judge_provider: openai
+  attribution_judge: nli

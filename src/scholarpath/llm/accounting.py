@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import contextlib
 import threading
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from typing import Dict, Iterator, List, Optional
 
 

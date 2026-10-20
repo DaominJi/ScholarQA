@@ -9,17 +9,15 @@
 * :mod:`.efficiency`          -- per-query calls / tokens / cost / latency (Table 5);
 * :mod:`.reporting`           -- per-query JSONL, summary CSVs, Markdown tables, budget sweeps;
 * :mod:`.official`            -- exporters to, and runners of, the official evaluation scripts;
-* :mod:`.taxonomy_metrics`    -- soft node / edge F1 (Section 5.2);
-* :mod:`.organization_metrics` -- ARI, semantic path similarity, category soft F1, assignment F1.
+* :mod:`.taxonomy_metrics`    -- soft node / edge F1 (Section 5.2; :class:`TaxonomyScorer`);
+* :mod:`.organization_metrics` -- ARI, semantic path similarity, category soft F1, assignment F1
+  (TaxoBench / CHIME organization queries, Table 3).
 
 Every symbol is resolved lazily (PEP 562) on first access, so importing this
-package (or one of its submodules) does not import the others. The public
-names of the first seven modules are listed in ``__all__``. A few symbols of
-:mod:`.taxonomy_metrics` and :mod:`.organization_metrics` are re-exported as
-well, but only if their module imports cleanly: they are left out of
-``__all__`` so that ``from scholarpath.evaluation import *`` never depends on
-them, and accessing one whose module fails to import raises
-:class:`AttributeError` naming the import error.
+package (or one of its submodules) does not import the others, and the
+scikit-learn-backed taxonomy / organization metrics are only loaded when used.
+``__all__`` lists the public names of every module; on a name clash (``PRF``,
+``f1_score``) the QA-metrics definition is the package-level one.
 """
 
 from __future__ import annotations
@@ -43,7 +41,7 @@ _LAZY: Dict[str, List[str]] = {
         "f1_score", "format_document", "format_reference", "has_passage_source", "length_score",
         "normalize_5scale", "number_citations", "prometheus_grade", "prometheus_to_100", "remove_citations",
         "render_answer", "render_cs_answer", "rubric_coverage", "rubric_item_types", "scholarqabench_combined",
-        "sentence_splitter", "split_sentences",
+        "sentence_splitter", "split_sentences", "MISSING_POLICIES",
     ],
     "hypothesis_metrics": [
         "CRITERIA", "DiscoveryResult", "ExpectedRecord", "HIT_K", "HypothesisJudgement", "ProposedIdea",
@@ -66,19 +64,24 @@ _LAZY: Dict[str, List[str]] = {
         "write_csv", "write_json", "write_jsonl", "write_run", "write_summary_csv", "write_table",
     ],
     "official": [
-        "OfficialCoverage", "OfficialEvalError", "OfficialPaths", "coverage_from_judgements",
-        "export_citation_eval", "export_prometheus", "export_researchqa_responses", "export_scholarqa_cs",
-        "official_id", "run_citation_eval", "run_compute_coverage", "run_prometheus_eval", "run_rubric_eval",
+        "OFFICIAL_BENCHMARKS", "OfficialCoverage", "OfficialEvalError", "OfficialPaths", "coverage_from_judgements",
+        "export_citation_eval", "export_prometheus", "export_researchqa_data", "export_researchqa_responses",
+        "export_scholarqa_cs",
+        "official_id", "run_citation_eval", "run_compute_coverage", "run_official_evaluation",
+        "run_prometheus_eval", "run_rubric_eval",
     ],
-}
-
-# Section 5.2 / organization metrics live in modules maintained separately; their
-# symbols are re-exported only when the module imports cleanly (see __getattr__).
-_OPTIONAL: Dict[str, List[str]] = {
-    "taxonomy_metrics": ["soft_node_f1", "soft_edge_f1", "taxonomy_scores"],
+    "taxonomy_metrics": [
+        "AGGREGATES", "COMBINERS", "SimilarityTables", "TEXT_MODES", "TaxonomyScorer", "soft_edge_f1",
+        "soft_edge_prf", "soft_node_f1", "soft_node_prf", "taxonomy_scores",
+    ],
     "organization_metrics": [
-        "adjusted_rand_index", "semantic_path_similarity", "category_soft_f1", "assignment_f1",
-        "organization_scores", "ORGANIZATION_METRICS",
+        "ARI_E2E", "ARI_INTERSECTION", "DEFAULT_CATEGORY_THRESHOLD", "MISSING_LABEL", "ORGANIZATION_METRICS",
+        "PUBLIC_RULE", "STRICT_RULE", "TAXOBENCH_EMBEDDING_MODEL", "TAXOBENCH_THRESHOLD", "NodeSimilarity",
+        "PaperAlignment", "PaperMatch", "adjusted_rand_index", "align_categories", "align_papers",
+        "ancestor_chains", "assignment_f1", "assignment_prf", "benchmark_title_similarity", "category_soft_f1",
+        "category_soft_prf", "chain_alignment_cost", "leaf_clustering_scores", "load_taxobench_embedder",
+        "macro_average", "merge_hierarchies", "normalize_benchmark_title", "organization_scores",
+        "paper_attachments", "semantic_path_scores", "semantic_path_similarity", "subtree", "to_taxobench_tree",
     ],
 }
 
@@ -86,33 +89,18 @@ _SYMBOL_TO_MODULE: Dict[str, str] = {}
 for _mod, _names in _LAZY.items():
     for _name in _names:
         _SYMBOL_TO_MODULE.setdefault(_name, _mod)
-_OPTIONAL_TO_MODULE: Dict[str, str] = {n: m for m, names in _OPTIONAL.items() for n in names}
-
-
-def _resolve_optional(name: str) -> Any:
-    module_name = f"{__name__}.{_OPTIONAL_TO_MODULE[name]}"
-    try:
-        module = importlib.import_module(module_name)
-    except Exception as err:  # noqa: BLE001 - an optional module may be missing or broken
-        raise AttributeError(f"{__name__}.{name} is unavailable: {module_name} failed to import ({err!r})") from err
-    if not hasattr(module, name):
-        raise AttributeError(f"{__name__}.{name} is unavailable: {module_name} does not define it")
-    return getattr(module, name)
 
 
 def __getattr__(name: str) -> Any:
-    if name in _SYMBOL_TO_MODULE:
-        value = getattr(importlib.import_module(f"{__name__}.{_SYMBOL_TO_MODULE[name]}"), name)
-    elif name in _OPTIONAL_TO_MODULE:
-        value = _resolve_optional(name)
-    else:
+    if name not in _SYMBOL_TO_MODULE:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(importlib.import_module(f"{__name__}.{_SYMBOL_TO_MODULE[name]}"), name)
     globals()[name] = value
     return value
 
 
 def __dir__() -> List[str]:
-    return sorted(set(globals()) | set(_SYMBOL_TO_MODULE) | set(_OPTIONAL_TO_MODULE))
+    return sorted(set(globals()) | set(_SYMBOL_TO_MODULE))
 
 
 __all__ = sorted(_SYMBOL_TO_MODULE)

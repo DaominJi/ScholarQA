@@ -42,8 +42,9 @@ class OpenAICompatibleLLM(LLMClient):
         self.api_key = api_key or os.environ.get(api_key_env) or os.environ.get("OPENAI_API_KEY")
         if not self.api_key:
             raise RuntimeError(
-                f"No API key found. Set ${api_key_env} (or $OPENAI_API_KEY), "
-                "or use the offline backend with --set llm.provider=mock."
+                f"No API key found for {model!r}. Set ${api_key_env} (or $OPENAI_API_KEY), or use the offline "
+                "mock backend (--set llm.provider=mock for the system LLM, "
+                "--set evaluation.judge_provider=mock for the judges)."
             )
         self.timeout_s = float(timeout_s)
         self.max_retries = int(max_retries)

@@ -6,6 +6,13 @@ run_qa_eval.py (budgeted methods at ``--budget``, default B = 8,192) and
 run_agents.py (unbudgeted agents) into Table 5: LLM calls, tokens (K), cost ($,
 DeepSeek-V4.0-Flash pricing) and end-to-end latency (s) per query. Judge
 calls and offline indexing (RAPTOR / LightRAG ``index_build``) are excluded.
+On corpora larger than ``--graph-global-max-papers`` (arXiv-Subfields),
+RAPTOR and LightRAG build their tree / graph at query time over the top
+``--graph-candidates`` SPECTER2 papers instead of one global offline index
+(a deviation from the paper's globally indexed baselines); that per-query
+construction is billed to ``index_build`` as well and is reported separately
+in the "Index-build" columns of ``table5_detail`` (calls, tokens, cost and
+latency per query) rather than silently dropped.
 The latency of every budgeted system is defined identically (wall time minus
 offline indexing, plus the recorded latency of calls served from the LLM
 response cache), so a warm cache never favours one system; for the cleanest
@@ -37,7 +44,10 @@ with cached ScholarPath answers are summarized):
 
 ``--exhaustive-check`` also re-runs each query with the exhaustive greedy
 scan to verify Proposition 7 (same selected units) and to report the index
-nodes it scores.
+nodes it scores. ``--operator-stats`` re-runs retrieval live with the runtime
+of ``--config``: pass the configuration the indexes were built with (the
+paper's ``configs/paper.yaml``); an index whose recorded embedder differs from
+the runtime's is refused (query vectors would not be comparable).
 
 Outputs (``--output-dir``, default ``results/run_efficiency``)::
 
@@ -87,13 +97,13 @@ from scholarpath.experiments.qa import (  # noqa: E402
     SYSTEMS,
     TABLE5_DETAIL,
     DataLayout,
+    EmbeddingMismatchError,
     EnvironmentCache,
     RecordStore,
     add_data_args,
     add_system_args,
     budget_sections,
     collect_efficiency,
-    csv_list,
     efficiency_summary,
     environment_summary,
     index_store_from_args,
@@ -102,6 +112,7 @@ from scholarpath.experiments.qa import (  # noqa: E402
     order_systems,
     resolve_benchmarks,
     resolve_systems,
+    split_csv,
     summarize_operator_stats,
     system_display,
     system_options_from_args,
@@ -158,7 +169,7 @@ def main(argv=None) -> int:
     options = system_options_from_args(args)
     out: Path = rt.output_dir or Path("results/run_efficiency")
     out.mkdir(parents=True, exist_ok=True)
-    stores = stores_of([Path(p) for p in csv_list(args.inputs)])
+    stores = stores_of([Path(p) for p in split_csv(args.inputs)])
     bench_filter = resolve_benchmarks(args.benchmarks) if args.benchmarks else None
 
     if args.systems is None or args.systems.strip().lower() == "all":
@@ -181,6 +192,14 @@ def main(argv=None) -> int:
         write_table(out / "table5_detail.md", summaries, TABLE5_DETAIL, sections)
         print(markdown_table(summaries, TABLE5, sections))
         print(markdown_table(summaries, TABLE5_DETAIL, sections))
+        per_query_index = {n: v for n, v in summaries.items() if (v.get("Index-build calls") or 0) > 0}
+        if per_query_index:
+            print("Note: " + "; ".join(
+                f"{n} builds its tree / graph at query time ({v['Index-build calls']:.1f} calls, "
+                f"{v['Index-build tokens (K)']:.1f}K tokens, ${v['Index-build cost ($)']:.4f}, "
+                f"{(v.get('Index-build latency (s)') or 0.0):.2f}s per query)" for n, v in per_query_index.items())
+                + " over a per-query candidate pool (large corpora); this work is excluded from Table 5's online "
+                  "columns and listed in the Index-build columns of table5_detail.")
         sp = summaries.get(system_display(SCHOLARPATH))
         if sp and sp.get("Calls") is not None:
             print(f"Note: ScholarPath makes {sp['Calls']:.2f} LLM calls per query, of which "
@@ -198,8 +217,12 @@ def main(argv=None) -> int:
         envs = EnvironmentCache(rt, layout, index_store_from_args(args), options, args.link_predictor)
         for bench in benchmarks:
             queries = layout.load_queries(bench, args.limit)
-            op_rows[bench] = measure_operator_stats(envs.for_benchmark(bench), queries, args.budget,
-                                                    exhaustive=args.exhaustive_check)
+            try:
+                op_rows[bench] = measure_operator_stats(envs.for_benchmark(bench), queries, args.budget,
+                                                        exhaustive=args.exhaustive_check)
+            except EmbeddingMismatchError as err:  # e.g. a paper-setting index without --config configs/paper.yaml
+                log.error("%s", err)
+                return 2
     else:
         for st in stores:
             for bench, system, budget, path in st.entries():

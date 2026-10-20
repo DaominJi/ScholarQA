@@ -2,15 +2,13 @@
 
 from __future__ import annotations
 
-import json
-
 import numpy as np
 import pytest
 
 from scholarpath.config import ScholarPathConfig
 from scholarpath.data.synthetic import make_synthetic_benchmark
 from scholarpath.index import SemanticIndex, concept_key, paper_key
-from scholarpath.llm import CostMeter, LLMRequest, MockLLM, extract_json
+from scholarpath.llm import CostMeter, extract_json
 from scholarpath.prompts.answer import compose_answer_request, parse_answer
 from scholarpath.runtime import Runtime
 from scholarpath.taxonomy.llm_ops import TaxonomyLLM, resolve_new_children

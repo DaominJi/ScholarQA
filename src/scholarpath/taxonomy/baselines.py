@@ -40,9 +40,14 @@ LLM operations and router of ScholarPath, so costs are comparable):
   are created by :func:`~scholarpath.taxonomy.llm_ops.resolve_new_children`
   (at most ``max_children``).
 * A node v is expanded iff depth(v) < ``max_depth``, n_v ≥ ``min_node_size``
-  (and n_v ≥ 2), and, for selection baselines, n_v ≥ 1/η and at least one
-  paper of P_v is read by the LLM. Children of an expanded node are queued
-  breadth-first.
+  (and n_v ≥ 2), P_v is a proper subset of its parent's papers, and, for
+  selection baselines, n_v ≥ 1/η and at least one paper of P_v is read by
+  the LLM. Children of an expanded node are queued breadth-first. A child
+  that received every paper of its parent (with multi-label routing, a
+  catch-all concept can) stays a leaf: expanding it would re-organize the
+  parent's papers and rebuild the parent's subtree under it, level after
+  level, duplicating concepts and inflating the node count, the cost and
+  C_Full.
 * Routers follow Appendix C.3: a two-layer MLP on paper and child-definition
   embeddings, trained on the LLM-labelled papers with a
   ``router.validation_fraction`` stratified validation split; the validation
@@ -414,11 +419,18 @@ class SelectionBuilder:
 
     # --------------------------------------------------------- episodes
     def _can_expand(self, tax: Taxonomy, v: str) -> bool:
-        """Size / depth limits of Sec. 3.1 plus the 'n_v < 1/η' stop rule of Sec. 5.2."""
+        """Size / depth limits of Sec. 3.1 plus the 'n_v < 1/η' stop rule of Sec. 5.2.
+
+        A node holding every paper of its parent is not expanded (it would
+        re-organize the same papers; see the module docstring).
+        """
         cfg = self.config
         node = tax.nodes[v]
         n_v = len(node.papers)
         if node.depth >= cfg.max_depth or n_v < max(2, cfg.min_node_size):
+            return False
+        parent = tax.nodes.get(node.parent) if node.parent is not None else None
+        if parent is not None and node.papers == parent.papers:
             return False
         if not self.is_full and self.eta * n_v < 1.0 - 1e-9:
             return False

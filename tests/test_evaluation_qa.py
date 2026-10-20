@@ -104,13 +104,21 @@ def test_researchqa_end_to_end_with_mock_runtime():
         items = [AnswerItem(f"{q.metadata['method']} is applied to {q.metadata['problem']}.", citations=[p])
                  for p in q.gold_papers[:2]]
         answers[q.query_id] = Answer(q.query_id, "", items=items)
-    ev = Q.evaluate_researchqa(answers, queries + [Query("absent", "x")], rt.llm, papers=bench.corpus)
-    assert ev.missing == ["absent"] and len(ev.rows) == 3
+    absent = Query("absent", "x", gold_papers=["g"], rubric=[RubricItem("Does it cite g?", kind="Citation")])
+    ev = Q.evaluate_researchqa(answers, queries + [absent], rt.llm, papers=bench.corpus, missing="skip")
+    assert ev.missing == ["absent"] and len(ev.rows) == 3 and ev.summary["n_missing"] == 1
     assert ev.summary["Rub"] is not None and 0.0 <= ev.summary["Rub"] <= 100.0
     assert ev.summary["coverage_citation"] == pytest.approx(100.0)  # titles appear in the reference list
     expected_cite = [Q.citation_f1(answers[q.query_id], q).f1 for q in queries]
     assert ev.summary["Cite"] == pytest.approx(100 * sum(expected_cite) / 3)
     assert rt.meter.component("judge").calls == 3 and rt.meter.total().calls == 0
+    # missing="zero": a failed query scores 0 (as in Tables 2 and 4) instead of leaving the denominator.
+    zero = Q.evaluate_researchqa(answers, queries + [absent], rt.llm, papers=bench.corpus, missing="zero")
+    assert zero.missing == ["absent"] and len(zero.rows) == 4 and zero.rows[-1]["missing"]
+    assert zero.summary["n"] == 4 and zero.summary["n_missing"] == 1
+    assert zero.summary["Rub"] == pytest.approx(ev.summary["Rub"] * 3 / 4)
+    assert zero.summary["Cite"] == pytest.approx(100 * sum(expected_cite) / 4)
+    assert rt.meter.component("judge").calls == 6  # no judge call for the failed query
 
 
 # ---------------------------------------------------------------- Cite vs. gold
@@ -358,3 +366,45 @@ def test_prometheus_parsing_grading_and_combination():
     assert combined["Corr"] == pytest.approx((100 * 60 + 108 * 80) / 208)
     assert combined["Cite"] == pytest.approx((100 * 50 + 108 * 70) / 208) and combined["n"] == 208
     assert Q.scholarqabench_combined({"Corr": 60.0, "n": 100}, {"Corr": None, "n": 108})["Corr"] == 60.0
+
+
+# ---------------------------------------------------------------- failed queries
+
+
+def test_failed_queries_can_score_zero_on_scholarqabench():
+    """missing="zero" keeps failed queries in the denominator (skipping them inflates a system's scores)."""
+    rt = Runtime.from_config()
+    rubric = [RubricItem("The answer should mention binding affinity.", weight=1.0)]
+    cs = [Query(f"cs{i}", f"How is graph learning used for task {i}?", benchmark="scholarqa_cs", rubric=rubric)
+          for i in range(2)]
+    ans = {"cs0": Answer("cs0", "Graph neural networks predict binding affinity of ligands [p1].")}
+    judge = lambda passage, claim: 1.0  # noqa: E731 - every citation supports its claim
+    skip = Q.evaluate_scholarqa_cs(ans, cs, rt.llm, attribution_judge=judge)  # official scripts: skipped
+    zero = Q.evaluate_scholarqa_cs(ans, cs, rt.llm, attribution_judge=judge, missing="zero")
+    assert skip.summary["n"] == 1 and skip.summary["n_missing"] == 1 and len(skip.rows) == 1
+    assert zero.summary["n"] == 2 and zero.summary["n_missing"] == 1
+    assert zero.summary["Corr"] == pytest.approx(skip.summary["Corr"] / 2)
+    assert zero.summary["citation_rec"] == pytest.approx(skip.summary["citation_rec"] / 2)
+    assert [r["missing"] for r in zero.rows] == [False, True] and zero.rows[1]["Corr"] == 0.0
+
+    multi = [Query(f"m{i}", "What forms a protein corona?", benchmark="scholarqa_multi",
+                   reference_answer="Lipid nanoparticles adsorb serum proteins forming a corona.") for i in range(2)]
+    ans = {"m0": Answer("m0", "Lipid nanoparticles adsorb serum proteins forming a corona [0].")}
+    skip = Q.evaluate_scholarqa_multi(ans, multi, rt.llm)
+    zero = Q.evaluate_scholarqa_multi(ans, multi, rt.llm, missing="zero")
+    assert skip.summary["Corr"] == pytest.approx(100.0) and zero.summary["Corr"] == pytest.approx(50.0)
+    assert zero.summary["n"] == 2 and zero.summary["n_missing"] == 1 and zero.rows[1]["Corr"] == 0.0
+    with pytest.raises(ValueError):
+        Q.evaluate_scholarqa_multi(ans, multi, rt.llm, missing="drop")
+
+
+def test_scholarqa_cs_alternate_case_of_a_failed_question_is_scored():
+    """As in rubric_eval.py, a question whose first case has no answer is scored through its alternate case."""
+    rt = Runtime.from_config()
+    rubric = [RubricItem("The answer should mention binding affinity.", weight=1.0)]
+    q1 = Query("cs1", "How is graph learning used for drug discovery?", benchmark="scholarqa_cs", rubric=rubric)
+    q2 = Query("cs2", q1.text, benchmark="scholarqa_cs", rubric=rubric)
+    ans = {"cs2": Answer("cs2", "Graph neural networks predict binding affinity of ligands [p1].")}
+    for missing in ("skip", "zero"):
+        ev = Q.evaluate_scholarqa_cs(ans, [q1, q2], rt.llm, missing=missing)
+        assert [r["query_id"] for r in ev.rows] == ["cs2"] and ev.missing == ["cs1"] and ev.summary["n"] == 1

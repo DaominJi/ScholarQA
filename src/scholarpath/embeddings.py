@@ -9,7 +9,8 @@ are provided so that everything runs without model downloads:
 
 All embedders return L2-normalised float32 matrices, so inner products are
 cosine similarities. :class:`CachedEmbedder` adds an on-disk cache keyed by
-text hash.
+text hash. Missing optional dependencies of a backend raise
+:class:`MissingDependencyError` with the install command.
 """
 
 from __future__ import annotations
@@ -17,12 +18,20 @@ from __future__ import annotations
 import hashlib
 import threading
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Protocol, Sequence
+from typing import Dict, List, Optional, Protocol, Sequence
 
 import numpy as np
 
 from scholarpath.config import EmbeddingConfig
 from scholarpath.text import tokenize
+
+
+class MissingDependencyError(ImportError):
+    """An optional dependency of the configured backend is not installed (the message says how to fix it)."""
+
+
+_EMBEDDINGS_HINT = ('pip install -e ".[embeddings]" (torch, transformers, adapters, sentence-transformers), '
+                    "or use the offline hashing embedder (--embedder hashing)")
 
 
 def l2_normalize(x: np.ndarray, axis: int = -1, eps: float = 1e-12) -> np.ndarray:
@@ -96,7 +105,11 @@ class HashingEmbedder:
 
 class SentenceTransformerEmbedder:  # pragma: no cover - needs model download
     def __init__(self, model_name: str, batch_size: int = 32, device: Optional[str] = None):
-        from sentence_transformers import SentenceTransformer
+        try:
+            from sentence_transformers import SentenceTransformer
+        except ImportError as err:
+            raise MissingDependencyError(f"The {model_name} embedder needs sentence-transformers: "
+                                         f"{_EMBEDDINGS_HINT}.") from err
 
         self._model = SentenceTransformer(model_name, device=device)
         self.dim = int(self._model.get_sentence_embedding_dimension())
@@ -128,8 +141,12 @@ class Specter2Embedder:  # pragma: no cover - needs model download
         max_length: int = 512,
         device: Optional[str] = None,
     ):
-        import torch
-        from transformers import AutoTokenizer
+        try:
+            import torch
+            from transformers import AutoTokenizer
+        except ImportError as err:
+            raise MissingDependencyError(f"SPECTER2 embeddings ({model_name}) need torch and transformers "
+                                         f"(missing: {err.name or err}): {_EMBEDDINGS_HINT}.") from err
 
         self._torch = torch
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -243,7 +260,11 @@ class CachedEmbedder:
 
 
 def build_embedder(config: Optional[EmbeddingConfig] = None) -> Embedder:
-    """Instantiate the embedder described by ``config`` (wrapped in a cache)."""
+    """Instantiate the embedder described by ``config`` (wrapped in a cache).
+
+    Raises :class:`MissingDependencyError` (with the install command) when the
+    backend's optional dependencies are missing.
+    """
     config = config or EmbeddingConfig()
     backend = (config.backend or "hashing").lower()
     if backend == "hashing":

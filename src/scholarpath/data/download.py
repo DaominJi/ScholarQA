@@ -41,7 +41,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 log = logging.getLogger(__name__)
 
@@ -300,10 +300,6 @@ def _spec(name: str) -> DatasetSpec:
     return DATASETS[name]
 
 
-def is_downloaded(name: str, root: PathLike = DEFAULT_RAW_ROOT) -> bool:
-    return (Path(root) / _spec(name).target / MARKER).exists()
-
-
 def _write_marker(target: Path, spec: DatasetSpec, extra: Optional[Dict[str, Any]] = None) -> None:
     info = {"dataset": spec.name, "kind": spec.kind, "time": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "revision": spec.revision}
@@ -347,11 +343,6 @@ def download_dataset(
                               f"{type(err).__name__}: {err}. Manual download: {spec.manual}")
     _write_marker(target, spec, extra)
     return DownloadResult(name, "done", str(target), cmds, spec.description)
-
-
-def download_all(names: Optional[Iterable[str]] = None, root: PathLike = DEFAULT_RAW_ROOT, dry_run: bool = False,
-                 force: bool = False, max_shards: Optional[int] = None) -> List[DownloadResult]:
-    return [download_dataset(n, root, dry_run, force, max_shards) for n in (names or DEFAULT_DATASETS)]
 
 
 # ---------------------------------------------------------------------------

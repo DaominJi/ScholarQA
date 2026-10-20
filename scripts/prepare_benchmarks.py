@@ -80,7 +80,10 @@ def main(argv=None) -> int:
     ap.add_argument("--chime-annotations", type=Path, default=None,
                     help="CHIME expert annotation tables (default: <raw>/chime_annotations)")
     ap.add_argument("--chime-gold-studies", choices=["annotated", "assigned", "all"], default="annotated")
-    ap.add_argument("--taxobench-max-depth", type=int, default=None, help="truncate the merged TaxoBench gold")
+    ap.add_argument("--taxobench-max-depth", type=int, default=None,
+                    help="truncate the stored merged TaxoBench gold to N levels below the common root (default: "
+                         "keep all 7; the experiments cut it at evaluation time, run_taxonomy_experiments.py "
+                         "--gold-max-depth 4 by default, as in App. C.2)")
     ap.add_argument("--limit", type=int, default=None, help="process only the first N queries/topics per benchmark")
     ap.add_argument("--verbose", "-v", action="store_true")
     args = ap.parse_args(argv)

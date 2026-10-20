@@ -65,6 +65,16 @@ ScholarQABench (github.com/AkariAsai/ScholarQABench, MIT License):
 
 Units: per-item functions return fractions in [0, 1] (Prometheus: 1-5);
 ``aggregate_*`` / ``evaluate_*`` summaries are in percent (the paper's units).
+
+Failed queries. The ``evaluate_*`` drivers list queries without an answer
+(the system failed or timed out on them) in ``QAEvaluation.missing`` and
+``summary["n_missing"]``. By default (``missing="skip"``) they are left out of
+the means, as the official scripts only score the answers they are given;
+``missing="zero"`` scores them 0 on every metric (Rub, Cite and Corr 0,
+Prometheus 1 = 0 on 0-100), the convention of Recall@B (Table 2), the
+organization metrics and Disc (Table 4), so that a system cannot gain from
+failing on hard queries. The Table 3 runner
+(:func:`scholarpath.experiments.qa.evaluate_benchmark`) folds failures in as 0.
 """
 
 from __future__ import annotations
@@ -1166,7 +1176,26 @@ def scholarqabench_combined(
 class QAEvaluation:
     rows: List[Dict[str, Any]] = field(default_factory=list)
     summary: Dict[str, Optional[float]] = field(default_factory=dict)
-    missing: List[str] = field(default_factory=list)
+    missing: List[str] = field(default_factory=list)  # queries without an answer (failed runs)
+
+
+MISSING_POLICIES = ("zero", "skip")
+
+
+def _check_missing_policy(missing: str) -> bool:
+    """``True`` when missing answers are scored 0 (``"zero"``), ``False`` when skipped."""
+    if missing not in MISSING_POLICIES:
+        raise ValueError(f"missing must be one of {MISSING_POLICIES}, got {missing!r}")
+    return missing == "zero"
+
+
+def _missing_coverage(query: Query) -> CoverageResult:
+    """Coverage of a failed query: every rubric item 'Not at all' (undefined without rubric items)."""
+    items = _rubric_of(query)
+    result = CoverageResult(query_id=query.query_id,
+                            judgements=[RubricJudgement(it.text, None, 0.0, rubric_item_types(it)) for it in items])
+    result.coverage = 0.0 if items else None
+    return result
 
 
 def _map(llm: LLMClient, fn: Callable[[Any], Any], items: Sequence[Any], max_workers: Optional[int]) -> List[Any]:
@@ -1183,23 +1212,39 @@ def evaluate_researchqa(
     on_failure: str = "drop",
     model: Optional[str] = None,
     max_workers: Optional[int] = 8,
+    missing: str = "skip",
 ) -> QAEvaluation:
     """ResearchQA Rub (rubric coverage) and Cite (citation F1 vs. gold papers).
 
-    Queries without an answer are skipped, as in the official script, and
-    listed in ``missing``. ``papers`` (the corpus) also restricts the
-    text-marker fallback of Cite to real paper ids.
+    Queries without an answer are listed in ``missing`` and left out of the
+    means as in the official script (``missing="skip"``, default), or score 0
+    coverage and 0 citation F1 without a judge call (``missing="zero"``).
+    ``papers`` (the corpus) also restricts the text-marker fallback of Cite
+    to real paper ids. (``on_failure`` concerns malformed *judge* outputs.)
     """
+    zero = _check_missing_policy(missing)
     llm = as_judge_llm(judge)
     todo = [q for q in queries if q.query_id in answers]
     ev = QAEvaluation(missing=[q.query_id for q in queries if q.query_id not in answers])
-    coverages = _map(llm, lambda q: rubric_coverage(answers[q.query_id], q, llm, papers=papers,
-                                                   references=references, on_failure=on_failure,
-                                                   model=model), todo, max_workers)
-    cites = [citation_f1(answers[q.query_id], q, valid_ids=papers) for q in todo]
-    for q, cov, cite in zip(todo, coverages, cites):
+    answered = dict(zip((q.query_id for q in todo), _map(
+        llm, lambda q: rubric_coverage(answers[q.query_id], q, llm, papers=papers, references=references,
+                                       on_failure=on_failure, model=model), todo, max_workers)))
+    coverages: List[CoverageResult] = []
+    cites: List[PRF] = []
+    for q in queries:
+        absent = q.query_id not in answers
+        if absent and not zero:
+            continue
+        if absent:
+            cov = _missing_coverage(q)
+            cite = citation_prf([], q.gold_papers, q.num_gold)
+        else:
+            cov = answered[q.query_id]
+            cite = citation_f1(answers[q.query_id], q, valid_ids=papers)
+        coverages.append(cov)
+        cites.append(cite)
         ev.rows.append({
-            "query_id": q.query_id, "benchmark": "researchqa",
+            "query_id": q.query_id, "benchmark": "researchqa", "missing": absent,
             "Rub": _pct(cov.coverage), "coverage_failed": cov.failed,
             "coverage_citation": _pct(_mean(cov.type_scores("citation"))),
             "Cite": 100.0 * cite.f1, "cite_P": 100.0 * cite.precision, "cite_R": 100.0 * cite.recall,
@@ -1222,6 +1267,7 @@ def evaluate_scholarqa_cs(
     references: bool = True,
     model: Optional[str] = None,
     max_workers: Optional[int] = 8,
+    missing: str = "skip",
 ) -> QAEvaluation:
     """ScholarQA-CS Corr (rubric score) and, with an ``attribution_judge``, statement-level Cite.
 
@@ -1231,10 +1277,15 @@ def evaluate_scholarqa_cs(
     ``convert_answer_scholar_cs.py`` (:func:`render_cs_answer`;
     ``references=False`` disables it); passages come from ``passage_fn(answer)``
     or :func:`answer_passages` (``answer.metadata["passages"]``, else ``papers``).
+    Queries without an answer are skipped as in the official script
+    (``missing="skip"``, default) or score Corr 0 and citation precision /
+    recall 0 (``missing="zero"``).
     """
+    zero = _check_missing_policy(missing)
     llm = as_judge_llm(judge)
     seen = set()
     todo: List[Query] = []
+    absent: List[Query] = []
     ev = QAEvaluation()
     for q in queries:
         if q.query_id not in answers:
@@ -1244,22 +1295,31 @@ def evaluate_scholarqa_cs(
             continue
         seen.add(q.text)
         todo.append(q)
+    for q in queries if zero else ():  # one zero per question left without any scored answer
+        if q.query_id in answers or (dedup_questions and q.text in seen):
+            continue
+        seen.add(q.text)
+        absent.append(q)
 
     def lookup(a: Answer) -> Optional[PassageLookup]:
         if passage_fn is not None:
             return passage_fn(a)
         return answer_passages(a, papers) if has_passage_source(a, papers, None) else None
 
-    scores = _map(llm, lambda q: correctness(answers[q.query_id], q, llm, model=model, references=references,
-                                             passage_fn=lookup(answers[q.query_id])), todo, max_workers)
+    scores = list(_map(llm, lambda q: correctness(answers[q.query_id], q, llm, model=model, references=references,
+                                                  passage_fn=lookup(answers[q.query_id])), todo, max_workers))
     attributions: List[Optional[CitationAttribution]] = []
     if attribution_judge is not None:
         for q in todo:
             a = answers[q.query_id]
             attributions.append(answer_citation_attribution(a, lookup(a) or answer_passages(a), attribution_judge))
-    for i, (q, s) in enumerate(zip(todo, scores)):
-        row: Dict[str, Any] = {"query_id": q.query_id, "benchmark": "scholarqa_cs", "Corr": 100.0 * s.score,
-                               "ann_score": 100.0 * s.ann_score}
+    for q in absent:
+        scores.append(CSScore(query_id=q.query_id, score=0.0, ann_score=0.0))
+        if attribution_judge is not None:
+            attributions.append(_missing_attribution(q))
+    for i, (q, s) in enumerate(zip(todo + absent, scores)):
+        row: Dict[str, Any] = {"query_id": q.query_id, "benchmark": "scholarqa_cs", "missing": i >= len(todo),
+                               "Corr": 100.0 * s.score, "ann_score": 100.0 * s.ann_score}
         if attributions and attributions[i] is not None:
             row.update(citation_prec=100.0 * attributions[i].precision, citation_rec=100.0 * attributions[i].recall,
                        splitter=attributions[i].splitter)
@@ -1268,6 +1328,7 @@ def evaluate_scholarqa_cs(
     if attributions:
         cite = aggregate_citation_attribution(attributions)
         ev.summary.update({k: v for k, v in cite.items() if k != "n"})
+    ev.summary["n_missing"] = float(len(ev.missing))
     return ev
 
 
@@ -1282,21 +1343,32 @@ def evaluate_scholarqa_multi(
     aspects: Sequence[str] = PROMETHEUS_ASPECTS,
     model: Optional[str] = None,
     max_workers: Optional[int] = 8,
+    missing: str = "skip",
 ) -> QAEvaluation:
-    """ScholarQA-Multi Corr (Prometheus organization / coverage / relevance, 0-100) and Cite."""
+    """ScholarQA-Multi Corr (Prometheus organization / coverage / relevance, 0-100) and Cite.
+
+    Queries without an answer are skipped as in the official script
+    (``missing="skip"``, default), or get the lowest Prometheus score (1, i.e.
+    0 on 0-100) on every aspect and citation precision / recall 0
+    (``missing="zero"``).
+    """
+    zero = _check_missing_policy(missing)
     llm = as_judge_llm(judge)
     todo = [q for q in queries if q.query_id in answers]
     ev = QAEvaluation(missing=[q.query_id for q in queries if q.query_id not in answers])
-    grades = _map(llm, lambda q: prometheus_grade(answers[q.query_id], q, llm, aspects=aspects, model=model),
-                  todo, max_workers)
+    absent = [q for q in queries if q.query_id not in answers] if zero else []
+    grades = list(_map(llm, lambda q: prometheus_grade(answers[q.query_id], q, llm, aspects=aspects, model=model),
+                       todo, max_workers))
+    grades += [PrometheusResult(query_id=q.query_id, scores={a: 1 for a in aspects}) for q in absent]
     attributions: List[Optional[CitationAttribution]] = []
     if attribution_judge is not None:
         for q in todo:
             a = answers[q.query_id]
             lookup = passage_fn(a) if passage_fn is not None else answer_passages(a, papers)
             attributions.append(answer_citation_attribution(a, lookup, attribution_judge))
-    for i, (q, g) in enumerate(zip(todo, grades)):
-        row: Dict[str, Any] = {"query_id": q.query_id, "benchmark": "scholarqa_multi",
+        attributions += [_missing_attribution(q) for q in absent]
+    for i, (q, g) in enumerate(zip(todo + absent, grades)):
+        row: Dict[str, Any] = {"query_id": q.query_id, "benchmark": "scholarqa_multi", "missing": i >= len(todo),
                                "Corr": prometheus_to_100(g.mean()), **{a: g.scores.get(a) for a in aspects}}
         if attributions and attributions[i] is not None:
             row.update(citation_prec=100.0 * attributions[i].precision, citation_rec=100.0 * attributions[i].recall,
@@ -1306,7 +1378,14 @@ def evaluate_scholarqa_multi(
     if attributions:
         cite = aggregate_citation_attribution(attributions)
         ev.summary.update({k: v for k, v in cite.items() if k != "n"})
+    ev.summary["n_missing"] = float(len(ev.missing))
     return ev
+
+
+def _missing_attribution(query: Query) -> CitationAttribution:
+    """Statement-level citation scores of a failed query (no supported statement, no precise citation)."""
+    return CitationAttribution(recall=0.0, precision=0.0, n_sentences=0, n_citations=0, n_supported=0,
+                               n_cited_papers=0, query_id=query.query_id, splitter="missing")
 
 
 __all__ = [
@@ -1320,6 +1399,7 @@ __all__ = [
     "CitationAttribution",
     "CoverageResult",
     "LLMAttributionJudge",
+    "MISSING_POLICIES",
     "PRF",
     "PROMETHEUS_ASPECTS",
     "PrometheusResult",

@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+requires = ["setuptools>=77.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,6 +7,7 @@ name = "scholarpath"
 version = "0.1.0"
 description = "ScholarPath: multi-granularity semantic indexing and budgeted support-path retrieval for evidence and hypothesis queries over scholarly repositories"
 readme = "README.md"
+license-files = ["THIRD_PARTY_NOTICES.md", "LICENSES/*"]
 requires-python = ">=3.9"
 dependencies = [
     "numpy>=1.24",
@@ -28,9 +29,10 @@ embeddings = [
     "sentence-transformers>=2.7",
 ]
 data = [
-    "requests>=2.31",
-    "datasets>=2.19",
-    "pymupdf>=1.24",
+    "datasets>=2.19",   # Hugging Face downloads (ResearchQA, CHIME annotations)
+    "pandas>=1.5",      # parquet files of ResearchQA / CHIME annotations
+    "pyarrow>=12",
+    "pymupdf>=1.24",    # PDF text extraction (prepare_fulltext.py)
 ]
 eval = [
     "nltk>=3.8",  # statement splitting of the official ScholarQABench citation eval; run nltk.download("punkt")
@@ -44,6 +46,7 @@ agents = [
 ]
 dev = [
     "pytest>=7.4",
+    "ruff>=0.5",        # ruff check src scripts tests
 ]
 
 [tool.setuptools.packages.find]
@@ -56,3 +59,10 @@ include = ["scholarpath*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["F"]  # pyflakes: unused imports / names, undefined names
