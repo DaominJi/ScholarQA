@@ -247,7 +247,9 @@ class NodeWiseBuilder:
         self.config = config or BuilderConfig()
         if papers is None:
             raise ValueError("NodeWiseBuilder needs the paper repository")
-        self.papers: Dict[str, Paper] = papers.papers if isinstance(papers, Corpus) else dict(papers)
+        # A private (shallow) copy: dynamic updates add papers to it without
+        # mutating the caller's dict or Corpus.
+        self.papers: Dict[str, Paper] = dict(papers.papers) if isinstance(papers, Corpus) else dict(papers)
         self._vectors: Dict[str, np.ndarray] = {}
         if paper_vectors:
             for pid, v in paper_vectors.items():
@@ -560,7 +562,6 @@ class NodeWiseBuilder:
         validation; audited papers are held out of training so that their
         disagreements remain an unbiased refinement of the validation rate.
         """
-        cfg = self.config
         child_ids = tax.children(state.node_id)
         signature = (
             tuple((c, tax.nodes[c].text) for c in child_ids),
@@ -573,12 +574,7 @@ class NodeWiseBuilder:
         state.child_ids = child_ids
         state.child_vecs = self.child_matrix(tax, child_ids)
         trainable = {p: lab[0] for p, lab in state.verified.items() if p not in state.audited}
-        train, val = stratified_split(trainable, cfg.router.validation_fraction, seed=cfg.router.seed)
-        cidx = {c: i for i, c in enumerate(child_ids)}
-        router = MLPRouter(cfg.router)
-        if train and child_ids:
-            targets = [{cidx[c] for c in trainable[p] if c in cidx} for p in train]
-            router.fit(self.vectors(train), state.child_vecs, targets)
+        router, train, val = self._fit_router(child_ids, state.child_vecs, trainable)
         state.router, state.train_ids, state.val_ids = router, train, val
         if child_ids:
             probs = router.predict_proba(self.vectors(state.paper_ids), state.child_vecs)
@@ -586,6 +582,66 @@ class NodeWiseBuilder:
         else:
             sets = [set() for _ in state.paper_ids]
         state.routed = {p: tuple(child_ids[i] for i in sorted(s)) for p, s in zip(state.paper_ids, sets)}
+
+    def _fit_router(
+        self, child_ids: Sequence[str], child_vecs: np.ndarray, trainable: Mapping[str, Sequence[str]]
+    ) -> Tuple[MLPRouter, List[str], List[str]]:
+        """Fit f_theta_v on the 80% stratified training split of ``trainable`` (paper -> LLM children)."""
+        cfg = self.config
+        train, val = stratified_split(dict(trainable), cfg.router.validation_fraction, seed=cfg.router.seed)
+        cidx = {c: i for i, c in enumerate(child_ids)}
+        router = MLPRouter(cfg.router)
+        if train and len(child_ids):
+            targets = [{cidx[c] for c in trainable[p] if c in cidx} for p in train]
+            router.fit(self.vectors(train), child_vecs, targets)
+        return router, train, val
+
+    def rebuild_router(self, tax: Taxonomy, nid: str) -> NodeRouter:
+        """Retrain the frozen router of a finished node from its persisted verified labels.
+
+        Zero LLM cost. :meth:`BuildResult.save` does not store routers, so a
+        reloaded taxonomy needs this before :class:`DynamicUpdater` can
+        route arrivals. The router is fit exactly as :meth:`retrain` fits it:
+        the verified, non-audited papers in ``node.metadata[STATE_KEY]``,
+        split 80/20, on the node's current children. The result can differ
+        slightly from the original router, for example when children that
+        ended up empty were dropped. Certificates stay valid anyway. A
+        dynamic update never re-routes existing papers; it uses the router
+        only for arrivals, and Eq. (16) counts every unaudited arrival as an
+        error whatever the router does.
+
+        Raises:
+            ValueError: if the node has no children or no persisted builder
+                state (e.g. a taxonomy built by a baseline).
+            KeyError: if a verified paper is not in the builder's repository.
+        """
+        node = tax.nodes[nid]
+        child_ids = tax.children(nid)
+        meta = node.metadata.get(STATE_KEY) or {}
+        if not child_ids:
+            raise ValueError(f"node {nid!r} has no children; there is no router to rebuild")
+        if "verified" not in meta:
+            raise ValueError(
+                f"node {nid!r} has no persisted builder state (metadata[{STATE_KEY!r}]['verified']); "
+                "its router cannot be rebuilt"
+            )
+        valid = set(child_ids)
+        audited = set(meta.get("audited") or [])
+        trainable: Dict[str, Tuple[str, ...]] = {}
+        for pid, kids in sorted((meta.get("verified") or {}).items()):
+            if pid in audited or pid not in node.papers:
+                continue
+            trainable[pid] = tuple(sorted(c for c in kids if c in valid))
+        unknown = [p for p in trainable if p not in self.papers and p not in self._vectors]
+        if unknown:
+            raise KeyError(
+                f"node {nid!r}: {len(unknown)} verified papers are not in the builder's repository "
+                f"(e.g. {unknown[:3]}); pass the papers the taxonomy was built from"
+            )
+        child_vecs = self.child_matrix(tax, child_ids)
+        router, _, _ = self._fit_router(child_ids, child_vecs, trainable)
+        return NodeRouter(node_id=nid, child_ids=list(child_ids), child_vecs=child_vecs, router=router,
+                          threshold=self.config.router.threshold)
 
     # ========================================================= proxies
     def estimate_loss(self, state: NodeState) -> LossEstimate:
@@ -634,7 +690,14 @@ class NodeWiseBuilder:
         )
 
     # ============================================================ cycles
-    def run_cycles(self, state: NodeState, tax: Taxonomy, ops: TaxonomyLLM, force: bool = False) -> None:
+    def run_cycles(
+        self,
+        state: NodeState,
+        tax: Taxonomy,
+        ops: TaxonomyLLM,
+        force: bool = False,
+        max_cycles: Optional[int] = None,
+    ) -> None:
         """Algorithm 1, lines 4-20: cycles of acquisition, repair and certification.
 
         A cycle runs rounds of Stage 1 (one planned batch, read only while
@@ -644,12 +707,14 @@ class NodeWiseBuilder:
         estimate after repair is <= eps, or the planned batch was predicted to
         reach eps (Eq. 3) -- or when nothing is left to read, or after
         ``max_rounds`` rounds. A failed audit starts the next cycle with a
-        new snapshot index; the node is UNRESOLVED if ``max_cycles`` cycles or
-        the per-node budget are exhausted first.
+        new snapshot index; the node is UNRESOLVED if ``max_cycles`` cycles
+        (default ``config.max_cycles``) or the per-node budget are exhausted
+        first.
         """
         cfg = self.config
         target = int(math.ceil(cfg.fixed_ratio * state.n))
-        for _ in range(cfg.max_cycles):
+        n_cycles = cfg.max_cycles if max_cycles is None else max(0, int(max_cycles))
+        for _ in range(n_cycles):
             state.cycles += 1
             for _ in range(cfg.max_rounds):
                 n_read, forecast_ok = self.acquisition_round(state, tax, ops, force)
@@ -810,12 +875,18 @@ class NodeWiseBuilder:
             and set(state.routed.get(p, ())) != set(state.verified[p][0])
         )
 
-    def stage2_repair(self, state: NodeState, tax: Taxonomy, ops: TaxonomyLLM) -> bool:
-        """Stage 2: audit-guided repair (lines 11-13, Section 3.3). Returns True if anything ran."""
+    def stage2_repair(self, state: NodeState, tax: Taxonomy, ops: TaxonomyLLM, force: bool = False) -> bool:
+        """Stage 2: audit-guided repair (lines 11-13, Section 3.3). Returns True if anything ran.
+
+        DISCOVER and CORRECT each run when their pool reaches
+        :meth:`repair_threshold`. With ``force`` (a dynamic update whose
+        cohort audit exposed drift, Section 3.4 / App. B.3) any non-empty
+        pool triggers its operation.
+        """
         cfg = self.config
         if not cfg.use_targeted_repair:
             return False
-        threshold = self.repair_threshold(state.n)
+        threshold = 0.0 if force else self.repair_threshold(state.n)
         repaired = False
         if cfg.use_discovery:
             pool = self.discovery_pool(state)
@@ -1043,6 +1114,34 @@ class NodeWiseBuilder:
         self.retrain(state, tax)
         self._init_responses(state, tax)
         return state
+
+    def recertify(self, state: NodeState, tax: Taxonomy, ops: TaxonomyLLM) -> None:
+        """Repair and re-certify a resumed node after drift (Section 3.4, App. B.3).
+
+        The cohort audit triggers Stage 2 repair (DISCOVER and CORRECT, forced
+        on every non-empty pool) and then the audit of a new snapshot
+        (Stage 3, continuing j). If that audit fails, the regular cycles of
+        Algorithm 1 continue, with ``max_cycles`` counting this first one.
+        """
+        cfg = self.config
+        if not cfg.use_snapshot_certification:  # ablation: no certificates to maintain
+            self.run_cycles(state, tax, ops, force=True)
+            return
+        state.cycles += 1
+        self.stage2_repair(state, tax, ops, force=True)
+        if self._budget_left(state, ops) <= 0 and state.unread():
+            state.status, state.termination = UNRESOLVED, TERM_BUDGET
+            return
+        outcome = self.stage3_certification(state, tax, ops)
+        if outcome.certified:
+            state.status, state.termination = CERTIFIED, TERM_CERTIFIED
+            state.certificate = outcome
+            return
+        if outcome.stop_reason == BUDGET:
+            state.status, state.termination = UNRESOLVED, TERM_BUDGET
+            return
+        self.run_cycles(state, tax, ops, force=outcome.found_errors or state.known_errors > 0,
+                        max_cycles=cfg.max_cycles - 1)
 
 
 # ---------------------------------------------------------------------------

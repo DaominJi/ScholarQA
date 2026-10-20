@@ -4,16 +4,21 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import json
+import math
 
+import numpy as np
 import pytest
 
 from scholarpath.data.synthetic import make_synthetic_benchmark
+from scholarpath.embeddings import l2_normalize
 from scholarpath.runtime import Runtime
-from scholarpath.taxonomy import CERTIFIED
+from scholarpath.taxonomy import CERTIFIED, Taxonomy
 from scholarpath.taxonomy.builder import STATE_KEY, NodeWiseBuilder
 from scholarpath.taxonomy.dynamic import DynamicUpdater, absorbable_arrivals, updated_bound
+from scholarpath.taxonomy.result import BuildResult, EpisodeRecord
 
-from test_taxonomy_builder import fast_config, single_thread
+from test_taxonomy_builder import check_episodes, fast_config, single_thread
 
 
 @pytest.fixture(scope="module")
@@ -58,6 +63,33 @@ def _duplicates(papers, prefix):
     return [dataclasses.replace(p, paper_id=f"{prefix}{i:04d}", chunks=[]) for i, p in enumerate(papers)]
 
 
+def _check_tree(result, epsilon):
+    """Partition invariant, valid certificates for the current node sizes, consistent episodes."""
+    tax = result.taxonomy
+    for nid, node in tax.nodes.items():
+        if node.children:
+            union = set().union(*(tax.nodes[c].papers for c in node.children))
+            assert node.papers == union | node.residual, nid
+            assert nid in result.routers, nid
+        if node.status == CERTIFIED:
+            assert node.bound <= epsilon + 1e-12
+            assert node.metadata[STATE_KEY]["certificate"]["n_v"] == node.size
+    check_episodes(result)
+
+
+def _slack_certificates(tax, bound=0.02):
+    """Give every certificate slack (as for nodes certified at U_old = 0.02).
+
+    Eq. (16) only depends on (n, U_old). The audit certifies at the first a
+    with U <= eps, so real certificates sit just below eps and a node
+    certified there cannot absorb any arrival.
+    """
+    for node in tax.nodes.values():
+        if node.status == CERTIFIED:
+            node.metadata[STATE_KEY]["certificate"]["bound"] = bound
+            node.bound = bound
+
+
 def test_eq16_arithmetic():
     assert updated_bound(1000, 0.06, 44) <= 0.10 < updated_bound(1000, 0.06, 45)
     assert absorbable_arrivals(1000, 0.06, 0.10) == 44  # example of Section 3.4
@@ -70,12 +102,7 @@ def test_small_arrival_batch_keeps_certificates_at_zero_llm_cost(built):
     builder, result = _fresh_copy(built)
     tax = result.taxonomy
     eps = cfg.builder.epsilon
-    # Give every certificate slack (as for a node certified at U_old = 0.02): Eq. (16) only
-    # depends on (n, U_old), and a node certified exactly at eps cannot absorb any arrival.
-    for node in tax.nodes.values():
-        if node.status == CERTIFIED:
-            node.metadata[STATE_KEY]["certificate"]["bound"] = 0.02
-            node.bound = 0.02
+    _slack_certificates(tax)
     n_old = tax.root.size
     # Arrivals: copies (new ids) of papers that the frozen routers place cleanly.
     clean = [p for pid, p in sorted(bench.corpus.papers.items()) if _clean_route(builder, result, pid)][:3]
@@ -92,6 +119,7 @@ def test_small_arrival_batch_keeps_certificates_at_zero_llm_cost(built):
     assert tax.root.bound == pytest.approx(updated_bound(n_old, 0.02, M)) and tax.root.bound <= eps
     for a in arrivals:
         assert a.paper_id in tax.root.papers and len(tax.paper_nodes(a.paper_id)) >= 2
+    _check_tree(result, eps)
     # Re-adding the same papers is a no-op.
     again = DynamicUpdater(builder, result).add_papers(arrivals)
     assert again.n_new == 0 and len(again.skipped) == M and again.llm_calls == 0
@@ -128,3 +156,83 @@ def test_large_arrival_batch_triggers_audit_and_recertification(built):
     else:
         assert tax.root_id in report.failed
     assert result.metadata["updates"][-1]["n_new"] == len(arrivals)
+    # Episodes run by the update replace the superseded ones in result.episodes.
+    _check_tree(result, eps)
+    for ep in report.episodes:
+        if ep.node_id in tax.nodes:
+            assert any(e is ep for e in result.episodes)
+    if tax.root_id in report.repaired:
+        root_ep = next(e for e in result.episodes if e.node_id == tax.root_id)
+        assert root_ep.metadata["dynamic_update"] and "bound" in root_ep.metadata["trigger"]
+        assert any(e["node_id"] == tax.root_id for e in result.metadata["superseded_episodes"])
+
+
+def test_residual_crossing_discovery_threshold_triggers_real_audit_and_repair(built):
+    """U_new <= eps, but the arrivals grow a residual leaf at or above the discovery threshold:
+    the cohort is audited with real draws, and the errors it confirms trigger DISCOVER (Sec. 3.4)."""
+    cfg, rt, _, _, _ = built
+    builder, result = _fresh_copy(built)
+    tax = result.taxonomy
+    eps = cfg.builder.epsilon
+    _slack_certificates(tax)
+    root, n_old = tax.root, tax.root.size
+    # Arrivals that the frozen root router places in the residual leaf bottom_v.
+    pool = make_synthetic_benchmark(n_papers=400, seed=7).corpus
+    cands = [pool.papers[p] for p in sorted(pool.papers)]
+    vecs = l2_normalize(np.asarray(rt.embedder.encode([p.text for p in cands]), dtype=np.float32))
+    residual_cands = [p for p, r in zip(cands, result.routers[tax.root_id].route(vecs)) if not r]
+    M = max(1, int(math.ceil(builder.repair_threshold(n_old + 8) - len(root.residual))))
+    M = min(M, cfg.builder.audit_min_draws)
+    assert len(residual_cands) >= M
+    arrivals = _duplicates(residual_cands[:M], "res")
+    # Preconditions: the bound alone would keep the certificate; the residual condition fails.
+    assert updated_bound(n_old, 0.02, M) <= eps
+    assert len(root.residual) + M >= builder.repair_threshold(n_old + M)
+    with single_thread():
+        report = DynamicUpdater(builder, result).add_papers(arrivals)
+    assert tax.root_id not in report.kept
+    assert tax.root_id in report.reaudited and tax.root_id in report.repaired
+    assert report.llm_calls > 0 and report.papers_read.get("auditing", 0) >= M
+    assert "discovery" in report.usage  # Stage 2 DISCOVER on the residual pool
+    root_ep = next(e for e in result.episodes if e.node_id == tax.root_id)
+    cohort = root_ep.metadata["cohort_audit"]
+    assert root_ep.metadata["trigger"] == ["residual"]
+    assert cohort["draws"] == M and cohort["errors"] == M  # residual-routed arrivals are errors
+    assert tax.root.size == n_old + M
+    _check_tree(result, eps)
+
+
+def test_update_after_save_and_reload_rebuilds_routers(built, tmp_path):
+    """BuildResult.save drops routers: they are rebuilt from the persisted labels (zero LLM cost)."""
+    cfg, rt, builder0, result0, bench = built
+    eps = cfg.builder.epsilon
+    result0.save(tmp_path / "build")
+    summary = json.loads((tmp_path / "build" / "summary.json").read_text())
+    episodes = [
+        EpisodeRecord(**{k: v for k, v in json.loads(line).items() if k != "ratio"})
+        for line in (tmp_path / "build" / "episodes.jsonl").read_text().splitlines()
+    ]
+    loaded = BuildResult(taxonomy=Taxonomy.load(tmp_path / "build" / "taxonomy.json"), method=result0.method,
+                         episodes=episodes, metadata=summary["metadata"])
+    internal = sorted(nid for nid, node in loaded.taxonomy.nodes.items() if node.children)
+    assert internal and not loaded.routers
+    corpus = bench.corpus
+    n_corpus = len(corpus)
+    builder = NodeWiseBuilder(rt.llm, rt.embedder, cfg.builder, corpus, paper_vectors=builder0.paper_vectors)
+    with pytest.raises(ValueError, match="rebuild_routers"):
+        DynamicUpdater(builder, loaded, rebuild_routers=False)
+    new = make_synthetic_benchmark(n_papers=30, seed=9).corpus
+    arrivals = _duplicates([new.papers[p] for p in sorted(new.papers)], "reload")
+    calls = rt.meter.total().calls
+    updater = DynamicUpdater(builder, loaded)
+    assert rt.meter.total().calls == calls  # rebuilding routers costs no LLM call
+    with single_thread():
+        report = updater.add_papers(arrivals)
+    assert report.rebuilt_routers == internal and set(internal) <= set(loaded.routers)
+    tax = loaded.taxonomy
+    assert tax.root.size == len(result0.taxonomy.root.papers) + len(arrivals)
+    for a in arrivals:
+        assert a.paper_id in tax.root.papers
+    _check_tree(loaded, eps)
+    # The caller's Corpus is not mutated by the update.
+    assert len(corpus) == n_corpus and all(a.paper_id not in corpus for a in arrivals)

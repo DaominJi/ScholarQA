@@ -13,6 +13,8 @@ from scholarpath.runtime import Runtime
 from scholarpath.taxonomy.baselines import (
     COMPONENT_FULL,
     COMPONENT_SELECTION,
+    TERM_NO_SPLIT,
+    TERM_SPLIT,
     SelectionBuilder,
     baseline_config,
     build_dual_baselines,
@@ -25,8 +27,8 @@ from scholarpath.taxonomy.baselines import (
 from scholarpath.taxonomy.selectors import num_to_select
 from scholarpath.taxonomy.tree import LEAF
 
-# A small router trained for enough steps on the small synthetic label sets
-# (and 128-d hashing embeddings) keeps the tests fast and the routing sane.
+# A small router keeps the tests fast; test_default_router_* checks the
+# repository's default RouterConfig (hidden 256) separately.
 ROUTER = RouterConfig(hidden_dim=32, epochs=200, learning_rate=3e-3)
 
 
@@ -122,11 +124,12 @@ def test_every_paper_is_organized(builds, bench, name):
             union = set().union(*(tax.nodes[c].papers for c in node.children))
             assert union | node.residual == node.papers
             assert not (union & node.residual)
-            assert len(node.children) <= cfg.max_children
+            assert 2 <= len(node.children) <= cfg.max_children  # no single-child chains
             assert all(tax.nodes[c].papers for c in node.children)  # empty children pruned
             assert node.depth < cfg.max_depth and node.size >= cfg.min_node_size
         else:
             assert node.status == LEAF
+            assert not node.residual  # the residual leaf only exists below a split
     # Every paper sits in some most-specific concept (possibly the root's residual).
     assert all(tax.deepest_nodes(p) for p in bench.corpus.papers)
 
@@ -143,6 +146,7 @@ def test_episodes_and_routers(builds):
             assert router.child_vecs.shape[0] == len(router.child_ids)
         for e in res.episodes:
             assert e.metadata["selected"] == e.verified
+            assert e.metadata["termination"] == (TERM_SPLIT if e.node_id in internal else TERM_NO_SPLIT)
             if e.node_id in internal:
                 assert e.metadata["routed"] == e.n_v - e.verified
         # A frozen router places new papers into existing children (or the residual).
@@ -189,11 +193,17 @@ def test_node_wise_reads_eta_fraction(builds, name, eta):
 
 
 def test_stop_rule_n_below_inverse_eta(rt, bench, vecs):
-    # With min_node_size disabled, eta = 0.05 stops splitting nodes with n_v < 20.
-    cfg = _config("random", 0.05, min_node_size=2, max_depth=3)
-    res = SelectionBuilder(rt.llm, rt.embedder, cfg, bench.corpus, vecs).build()
-    assert all(e.n_v >= 20 for e in res.episodes)
-    assert all(res.taxonomy.nodes[v].size >= 20 for v in res.taxonomy.internal_nodes())
+    # With min_node_size out of the way, sub-sampling stops exactly when n_v < 1 / eta.
+    def episodes(n_papers: int, selector: str, eta: float):
+        ids = sorted(bench.corpus.papers)[:n_papers]
+        cfg = _config(selector, eta, min_node_size=2, max_depth=1)
+        return SelectionBuilder(rt.llm, rt.embedder, cfg, bench.corpus, vecs).build(paper_ids=ids).episodes
+
+    assert episodes(19, "random", 0.05) == []  # 19 < 1 / 0.05: the root is a leaf, nothing is read
+    assert episodes(18, "kmeans", 0.05) == []
+    assert [e.verified for e in episodes(20, "random", 0.05)] == [1]  # 20 = 1 / 0.05: one paper is read
+    assert [e.verified for e in episodes(18, "random", 0.1)] == [2]  # 18 >= 1 / 0.1
+    assert [e.verified for e in episodes(18, "full", 1.0)] == [18]  # FULL has no such rule
 
 
 def test_one_off_samples_once_at_the_root(builds, bench):
@@ -235,6 +245,71 @@ def test_estimate_full_cost_reproduces_measured_cost(builds):
     other = builds["coverage@0.5"]
     assert estimate_full_cost(other, c_bar) == pytest.approx(c_bar * internal_paper_count(other.taxonomy))
     assert other.metadata["internal_paper_count"] == internal_paper_count(other.taxonomy)
+
+
+def test_default_router_keeps_cost_proportional_to_eta(rt, bench, vecs, builds):
+    # Regression: with the default RouterConfig (60 epochs) the routers of the
+    # small label sets S_v were trained for ~60 steps, over-assigned P_v \ S_v
+    # (Σ n_v 1614 vs 296 for FULL) and pushed C_LLM / C_Full to 0.88 at eta = 0.2.
+    cfg = BaselineBuilderConfig(selector="kmeans", eta=0.2)
+    assert cfg.router == RouterConfig()
+    builder = SelectionBuilder(rt.llm, rt.embedder, cfg, bench.corpus, vecs)
+    res = builder.build("Synthetic Repository")
+    full = builds["full"]
+    assert res.relative_cost(full) < 0.35
+    assert internal_paper_count(res.taxonomy) <= 1.25 * internal_paper_count(full.taxonomy)
+    assert all(e.disagreement <= 0.25 for e in res.episodes)
+    # The floor only raises the epochs of small label sets.
+    steps = builder.min_router_steps
+    assert builder._router_config(30).epochs == steps  # one batch per epoch
+    assert builder._router_config(64 * steps).epochs == cfg.router.epochs
+    unfloored = SelectionBuilder(rt.llm, rt.embedder, cfg, bench.corpus, vecs, min_router_steps=0)
+    assert unfloored._router_config(30) == cfg.router
+
+
+class _OneChildLLM(SelectionBuilder):
+    """The LLM puts every paper it reads into the first proposed child only."""
+
+    def _induce_and_label(self, ctx, v, read):
+        labels = super()._induce_and_label(ctx, v, read)
+        assert len(ctx.tax.children(v)) >= 2
+        first = ctx.tax.children(v)[:1]
+        return {p: list(first) for p in labels}
+
+
+class _NoMatchLLM(SelectionBuilder):
+    """The LLM finds no proposed child matching any paper it reads."""
+
+    def _induce_and_label(self, ctx, v, read):
+        return {p: [] for p in super()._induce_and_label(ctx, v, read)}
+
+
+@pytest.mark.parametrize("selector,eta", [("full", 1.0), ("random", 0.5)])
+def test_single_child_split_becomes_a_leaf(rt, bench, vecs, selector, eta):
+    cfg = _config(selector, eta, max_depth=2)
+    res = _OneChildLLM(rt.llm, rt.embedder, cfg, bench.corpus, vecs).build()
+    tax, root = res.taxonomy, res.episodes[0]
+    assert len(tax) == 1 and tax.root.status == LEAF and not tax.root.residual
+    assert root.metadata["termination"] == TERM_NO_SPLIT and root.metadata["unsplit_children"] == 1
+    assert root.n_children == 0 and res.routers == {} and root.verified > 0
+    # min_split_children=1 keeps the (degenerate) single-child chain.
+    chain = _OneChildLLM(rt.llm, rt.embedder, cfg, bench.corpus, vecs, min_split_children=1).build()
+    only = chain.taxonomy.children(chain.taxonomy.root_id)
+    assert len(only) == 1 and chain.taxonomy.nodes[only[0]].papers == chain.taxonomy.root.papers
+
+
+@pytest.mark.parametrize("selector,eta", [("full", 1.0), ("random", 0.5)])
+def test_failed_split_leaves_no_residual_on_the_leaf(rt, bench, vecs, selector, eta):
+    n = len(bench.corpus.papers)
+    for min_split in (1, 2):
+        res = _NoMatchLLM(rt.llm, rt.embedder, _config(selector, eta), bench.corpus, vecs,
+                          min_split_children=min_split).build()
+        tax, root = res.taxonomy, res.episodes[0]
+        assert len(tax) == 1 and tax.root.status == LEAF
+        assert tax.root.residual == set()  # not P_v: a leaf has no residual leaf
+        assert root.abstention == 0.0 and root.metadata["residual"] == 0
+        assert root.metadata["termination"] == TERM_NO_SPLIT
+        assert root.metadata["unsplit_children"] == 0 and root.metadata["unsplit_residual"] == n
 
 
 # ---------------------------------------------------------------------------

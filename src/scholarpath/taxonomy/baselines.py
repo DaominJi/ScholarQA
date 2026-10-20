@@ -508,7 +508,11 @@ class SelectionBuilder:
         return router, {"router_train": len(train), "router_val": len(val), "disagreement": rate}
 
     def _episode(self, ctx: _Context, v: str, read: List[str]) -> None:
-        """Expand node v: induce its children from ``read``, then assign all of P_v."""
+        """Expand node v: induce its children from ``read``, then assign all of P_v.
+
+        v stays internal only if at least ``min_split_children`` children
+        receive papers; otherwise it becomes a leaf (``termination="no_split"``).
+        """
         tax, node = ctx.tax, ctx.tax.nodes[v]
         P_v = sorted(node.papers)
         reads_before = dict(ctx.ops.papers_read)
@@ -534,8 +538,9 @@ class SelectionBuilder:
         termination = TERM_SPLIT
         unsplit: Dict[str, int] = {}
         if len(used) < self.min_split_children:
-            # Fewer than two non-empty children is no split: discard them (and
-            # the residual they left) and make v a leaf, as ScholarPath does.
+            # Fewer than min_split_children (2) non-empty children is no split:
+            # discard them and the residual they left, and make v a leaf, as
+            # ScholarPath's InitNode does. The LLM cost is still recorded.
             termination = TERM_NO_SPLIT
             unsplit = {"unsplit_children": len(used), "unsplit_residual": len(node.residual)}
             tax.clear_children(v)

@@ -51,10 +51,15 @@ PoolByRegion = Union[Mapping[int, Sequence[str]], Sequence[Sequence[str]]]
 
 
 def discovery_sample_size(pool_size: int, eta_A: float, s_max: int) -> int:
-    """s^disc_v = min{ceil(eta_A |pool|), s_max} (0 for an empty pool)."""
-    if pool_size <= 0:
+    """s^disc_v = min{ceil(eta_A |pool|), s_max} (Sec. 3.3, App. A.2).
+
+    Exactly the formula, clamped at 0: an empty pool, ``eta_A <= 0`` or
+    ``s_max <= 0`` gives 0 (DISCOVER draws nothing); otherwise the ceiling
+    already gives at least one paper.
+    """
+    if pool_size <= 0 or eta_A <= 0 or s_max <= 0:
         return 0
-    return int(max(1, min(math.ceil(float(eta_A) * pool_size), int(s_max))))
+    return int(min(math.ceil(float(eta_A) * pool_size), int(s_max)))
 
 
 def stratified_allocation(sizes: Sequence[int], s: int) -> List[int]:

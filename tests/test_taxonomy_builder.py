@@ -11,10 +11,12 @@ import pytest
 
 from scholarpath.config import RouterConfig, ScholarPathConfig
 from scholarpath.data.synthetic import make_synthetic_benchmark
+from scholarpath.embeddings import l2_normalize
 from scholarpath.llm import BUILD_COMPONENTS
 from scholarpath.runtime import Runtime
 from scholarpath.taxonomy import CERTIFIED, LEAF, OPEN, UNRESOLVED, Taxonomy
 from scholarpath.taxonomy.builder import STATE_KEY, NodeWiseBuilder, build_dual_taxonomies
+from scholarpath.taxonomy.certification import DeltaAllocator
 from scholarpath.taxonomy.repair import (
     correction_targets,
     discovery_draws,
@@ -22,7 +24,7 @@ from scholarpath.taxonomy.repair import (
     relabel_candidates,
     stratified_allocation,
 )
-from scholarpath.taxonomy.response_model import TransferredPrior
+from scholarpath.taxonomy.response_model import RegionDescriptor, TransferredPrior
 
 
 @contextlib.contextmanager
@@ -84,6 +86,17 @@ def _check_invariants(result, epsilon, delta, n_papers):
             node_deltas.append(node.delta)
     assert math.fsum(node_deltas) <= delta
     assert result.metadata["delta_spent"] <= delta
+    check_episodes(result)
+
+
+def check_episodes(result):
+    """At most one (the latest) episode per node of the taxonomy; the summary matches the tree."""
+    tax = result.taxonomy
+    ids = [e.node_id for e in result.episodes]
+    assert len(ids) == len(set(ids)) and set(ids) <= set(tax.nodes)
+    certified = {nid for nid, node in tax.nodes.items() if node.status == CERTIFIED}
+    assert {e.node_id for e in result.episodes if e.certified} == certified
+    assert result.summary()["certified_nodes"] == len(certified)
 
 
 def test_dual_build_end_to_end(dual, bench):
@@ -126,14 +139,34 @@ def test_certified_nodes_persist_state_for_dynamic_updates(dual):
             assert (pid in node.residual) == (not kids)
 
 
-def test_routers_and_save(tmp_path, dual):
-    _, rt, problem, _ = dual
+def _paper_vectors(rt, corpus, ids):
+    """Paper embeddings exactly as the builder computes them (L2-normalised title + abstract)."""
+    return l2_normalize(np.asarray(rt.embedder.encode([corpus[p].text for p in ids]), dtype=np.float32))
+
+
+def test_routers_and_save(tmp_path, dual, bench):
+    _, rt, problem, method = dual
+    checked = 0
+    for result in (problem, method):
+        tax = result.taxonomy
+        for nid, nr in result.routers.items():
+            node = tax.nodes[nid]
+            assert set(nr.child_ids) == set(node.children)
+            ids = sorted(node.papers)
+            routes = nr.route(_paper_vectors(rt, bench.corpus, ids))
+            verified = node.metadata[STATE_KEY]["verified"]
+            agree = 0
+            for pid, route in zip(ids, routes):
+                placed = sorted(c for c in node.children if pid in tax.nodes[c].papers)
+                if pid in verified:  # verified papers keep their LLM labels
+                    agree += set(route) == set(verified[pid])
+                else:  # the frozen router reproduces the stored assignment of every unverified paper
+                    assert sorted(route) == placed and (not route) == (pid in node.residual)
+                    checked += 1
+            if nid == tax.root_id:  # trained on these labels: mostly agrees with them
+                assert agree >= 0.7 * len(verified)
+    assert checked > 0
     tax = problem.taxonomy
-    nr = problem.routers[tax.root_id]
-    ids = sorted(tax.root.papers)[:10]
-    vecs = rt.embedder.encode([pid for pid in ids])
-    routes = nr.route(vecs / np.maximum(np.linalg.norm(vecs, axis=1, keepdims=True), 1e-12))
-    assert len(routes) == 10 and all(set(r) <= set(tax.children(tax.root_id)) for r in routes)
     problem.save(tmp_path / "problem")
     loaded = Taxonomy.load(tmp_path / "problem" / "taxonomy.json")
     assert loaded.to_dict() == tax.to_dict()
@@ -144,6 +177,8 @@ def test_routers_and_save(tmp_path, dual):
 
 # ------------------------------------------------------------------ ablations
 
+# Every ablation of Table 6 runs and keeps the invariants. The effect of use_transferred_prior
+# (only visible with a non-empty history H) is checked by test_transferred_prior_flag_sets_region_priors.
 ABLATIONS = [
     {"use_bayesian_acquisition": False},
     {"use_snapshot_certification": False},
@@ -186,6 +221,49 @@ def test_ablation_flags_run(small_bench, flags):
         assert "discovery" not in result.usage
     if flags.get("use_correction") is False:
         assert "correction" not in result.usage
+
+
+@pytest.mark.parametrize("use_prior", [True, False])
+def test_transferred_prior_flag_sets_region_priors(small_bench, use_prior):
+    """use_transferred_prior=False (Table 6) ignores a non-empty history H; True uses Eq. (14)."""
+    cfg = fast_config(max_depth=1, use_transferred_prior=use_prior)
+    b = cfg.builder
+    prior = TransferredPrior(b.prior_slope_mean, b.prior_slope_var)  # enabled: only the builder flag differs
+    # History of earlier episodes whose regions responded much faster than the fixed prior.
+    rng = np.random.default_rng(0)
+    descs = [RegionDescriptor(depth=0, share=float(rng.uniform(0.1, 0.3)), dispersion=float(rng.uniform(0.3, 0.7)),
+                              child_count=4, papers_read=float(rng.integers(2, 10)),
+                              abstention=float(rng.uniform(0, 0.3)), disagreement=float(rng.uniform(0, 0.3)))
+             for _ in range(12)]
+    prior.update(descs, [[0.6 + 0.01 * k, 0.4] for k in range(12)])
+    calls = []
+    predict = prior.predict
+
+    def spy(h):
+        out = predict(h)
+        calls.append(out)
+        return out
+
+    prior.predict = spy
+    rt = Runtime.from_config(cfg)
+    builder = NodeWiseBuilder(rt.llm, rt.embedder, b, small_bench.corpus, prior=prior)
+    ids = sorted(small_bench.corpus.papers)
+    tax = Taxonomy(facet="problem", root_name="Root", root_definition="", root_papers=ids)
+    allocator = DeltaAllocator(b.delta, b.delta_allocation, len(ids), b.max_depth, b.max_nodes)
+    with single_thread():
+        state = builder.init_node(tax, tax.root_id, builder.make_ops("problem"), allocator)
+    assert state.responses and len(state.responses) == state.regions.G
+    fixed_mean, fixed_cov = prior.fixed_prior()
+    if use_prior:
+        assert len(calls) == len(state.responses)
+        for resp, (mean, _) in zip(state.responses, calls):
+            np.testing.assert_allclose(resp.mean, mean)
+            assert resp.mean.min() > 0.3  # transferred from H, far from the fixed prior mean 0.05
+    else:
+        assert not calls
+        for resp in state.responses:
+            np.testing.assert_allclose(resp.mean, fixed_mean)
+            np.testing.assert_allclose(resp.cov, fixed_cov, atol=1e-9)
 
 
 def test_all_cost_components_when_repair_pools_reach_threshold(small_bench):
@@ -237,6 +315,8 @@ def test_build_on_subset_and_unknown_ids(small_bench):
     res = builder.build("Root", paper_ids=ids, facet="problem")
     assert res.taxonomy.root.papers == set(ids) and res.taxonomy.root.status == LEAF and not res.episodes
     assert rt.meter.total().calls == 0
+    # The builder keeps a private copy of the repository (dynamic updates add papers to it).
+    assert builder.papers is not small_bench.corpus.papers and builder.papers == small_bench.corpus.papers
     with pytest.raises(KeyError):
         builder.build("Root", paper_ids=["nope"])
 
@@ -249,6 +329,9 @@ def test_discovery_draws_proportional_stratified():
     assert discovery_sample_size(0, 0.02, 32) == 0
     assert discovery_sample_size(10, 0.02, 32) == 1
     assert discovery_sample_size(10_000, 0.02, 32) == 32
+    # Exactly min{ceil(eta_A |pool|), s_max}: s_max = 0 or eta_A = 0 switches DISCOVER sampling off.
+    assert discovery_sample_size(50, 0.02, 0) == 0 and discovery_sample_size(50, 0.0, 32) == 0
+    assert discovery_draws({0: ["a", "b", "c"]}, 0.02, 0, rng) == []
     assert stratified_allocation([50, 30, 20], 10) == [5, 3, 2]
     assert stratified_allocation([1, 1, 98], 5) == [1, 1, 5]  # rounding up adds at most G - 1
     pool = {0: [f"a{i}" for i in range(500)], 1: [f"b{i}" for i in range(300)], 2: [f"c{i}" for i in range(200)]}

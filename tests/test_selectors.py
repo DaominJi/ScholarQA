@@ -5,6 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from scholarpath.taxonomy import selectors
 from scholarpath.taxonomy.selectors import (
     SELECTION_METHODS,
     coverage_selection,
@@ -90,8 +91,23 @@ def test_lazy_greedy_matches_plain_greedy():
     X = _unit(rng.standard_normal((300, 16))).astype(np.float32)
     expected = _greedy_bruteforce(X, 40)
     assert select(X, 40, "coverage") == expected
-    # The on-the-fly path (no dense similarity matrix) selects the same rows.
+    # The on-the-fly path (no dense similarity matrix) selects the same rows
+    # here (no float32 near-ties between candidates).
     assert coverage_selection(X, 40, dense_max_rows=0) == expected
+
+
+def test_dense_and_on_the_fly_paths_reach_the_same_objective(monkeypatch):
+    rng = np.random.default_rng(1)
+    X = _unit(np.abs(rng.standard_normal((400, 24)))).astype(np.float32)  # many near-ties
+    monkeypatch.setattr(selectors, "BLOCK_ENTRIES", 24 * 400)  # several similarity blocks
+    K = selectors._dense_similarity(X)
+    np.testing.assert_allclose(K, np.maximum(X @ X.T, 0.0), atol=1e-6)
+    dense = coverage_selection(X, 60)
+    lazy = coverage_selection(X, 60, dense_max_rows=0)
+    assert facility_location(X, dense) == pytest.approx(facility_location(X, lazy), rel=1e-5)
+    # The dense path is sized by memory and covers every node of the paper's datasets.
+    assert selectors.DENSE_MAX_ROWS ** 2 * 4 <= selectors.DENSE_MAX_BYTES
+    assert selectors.DENSE_MAX_ROWS >= 3044  # TaxoBench pool; arXiv sets have 2,000 papers
 
 
 def test_facility_location_values():

@@ -52,12 +52,23 @@ ArrayLike = Union[np.ndarray, Sequence[Sequence[float]]]
 
 SELECTION_METHODS = ("random", "coverage", "kmeans", "diversity")
 
-# Facility location keeps the full n x n similarity matrix in memory up to this
-# many rows (4096^2 float32 = 64 MB); larger inputs recompute similarity
-# columns on the fly from the vectors (same result, more FLOPs).
-DENSE_MAX_ROWS = 4096
+# Facility location keeps the full n x n float32 similarity matrix in memory
+# when it fits in this budget (1 GiB: n <= 16384, which covers the 2,000-paper
+# arXiv sets, the 3,044-paper TaxoBench pool and every node of up to 16K
+# papers). Larger inputs recompute similarity columns on the fly from the
+# vectors: the same objective and greedy rule with O(n d) work per candidate
+# evaluation instead of O(n), so much slower; float32 near-ties between
+# candidates may then resolve differently.
+DENSE_MAX_BYTES = 1 << 30
+DENSE_MAX_ROWS = int(math.isqrt(DENSE_MAX_BYTES // 4))
 # Number of stale candidates re-evaluated together by the lazy greedy loop.
 LAZY_BATCH = 16
+# k-means: Lloyd iterations are capped (with k = ⌈η n_v⌉ up to n_v / 2 the
+# clusters are tiny and Lloyd typically stops after a few iterations; the
+# running time is dominated by the O(n k d) k-means++ seeding). Inputs above
+# KMEANS_MINIBATCH_ROWS rows use mini-batch k-means.
+KMEANS_MAX_ITER = 100
+KMEANS_MINIBATCH_ROWS = 20000
 # Blockwise similarity computations keep each temporary block at about this
 # many float32 entries (2^25 = 128 MB).
 BLOCK_ENTRIES = 1 << 25
@@ -116,6 +127,18 @@ def facility_location(vectors: ArrayLike, selected: Sequence[int]) -> float:
     return total
 
 
+def _dense_similarity(X: np.ndarray) -> np.ndarray:
+    """``max(X X^T, 0)`` as float32, built blockwise in place (peak ≈ n² floats + one block)."""
+    n = X.shape[0]
+    K = np.empty((n, n), dtype=np.float32)
+    step = _block(n)
+    for s in range(0, n, step):
+        block = K[s : s + step]
+        np.matmul(X[s : s + step], X.T, out=block)
+        np.maximum(block, 0.0, out=block)
+    return K
+
+
 def coverage_selection(
     X: np.ndarray,
     k: int,
@@ -126,11 +149,13 @@ def coverage_selection(
     """Lazy greedy maximization of the facility-location objective [88].
 
     Rows are returned in greedy order. ``seed`` is unused (the greedy is
-    deterministic; ties go to the smallest index).
+    deterministic; ties go to the smallest index). Inputs of up to
+    ``dense_max_rows`` rows use a precomputed similarity matrix; larger ones
+    compute similarity columns on demand (see :data:`DENSE_MAX_BYTES`).
     """
     del seed
     n = X.shape[0]
-    K = np.maximum(X @ X.T, 0.0) if n <= dense_max_rows else None
+    K = _dense_similarity(X) if n <= dense_max_rows else None
 
     def sim_cols(cols: np.ndarray) -> np.ndarray:
         """(n, len(cols)) clipped similarities of every row to the given rows."""
@@ -179,10 +204,11 @@ def _kmeans(X: np.ndarray, k: int, seed: int) -> Tuple[np.ndarray, np.ndarray]:
         warnings.simplefilter("ignore", ConvergenceWarning)
         # One k-means++ initialization (scikit-learn's ``n_init="auto"``) keeps the
         # selector affordable for k = ⌈η n_v⌉ in the hundreds.
-        if X.shape[0] > 20000:
-            km = MiniBatchKMeans(n_clusters=k, random_state=seed, n_init=1, batch_size=4096)
+        if X.shape[0] > KMEANS_MINIBATCH_ROWS:
+            km = MiniBatchKMeans(n_clusters=k, random_state=seed, n_init=1, batch_size=4096,
+                                 max_iter=KMEANS_MAX_ITER)
         else:
-            km = KMeans(n_clusters=k, random_state=seed, n_init=1)
+            km = KMeans(n_clusters=k, random_state=seed, n_init=1, max_iter=KMEANS_MAX_ITER)
         labels = km.fit_predict(X)
     return np.asarray(labels, dtype=int), np.asarray(km.cluster_centers_, dtype=np.float32)
 
@@ -227,7 +253,6 @@ def diversity_selection(X: np.ndarray, k: int, seed: int = 0) -> List[int]:
     direction). ``seed`` is unused (deterministic; ties go to the smallest index).
     """
     del seed
-    n = X.shape[0]
     centroid = X.mean(axis=0)
     start = int(np.argmax(X @ centroid)) if float(np.linalg.norm(centroid)) > 0 else 0
     selected = [start]

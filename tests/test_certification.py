@@ -227,3 +227,28 @@ def test_sequential_audit_false_certification_rate_below_delta():
                              abort_factor=10.0, min_draws=1000)
         false_cert += out.certified
     assert false_cert / trials <= delta_v
+
+
+def test_audit_min_certify_draws_forbids_zero_draw_certificate():
+    """Dynamic cohort audits (Sec. 3.4) look at real papers even when U_{v,j,0} <= eps."""
+    pool = [f"p{i}" for i in range(20)]
+    # E_D + R = 4 + 20 over n_v = 400: U_{v,j,0} = 0.06 <= eps, so the default certifies at a = 0.
+    out = audit_snapshot(pool, _judge_for(set()), n_v=400, E_D=4, delta_v=0.01, j=2, epsilon=0.1,
+                         batch_size=3, rng=np.random.default_rng(0))
+    assert out.certified and out.draws == 0 and out.bound == pytest.approx(24 / 400)
+    calls = []
+
+    def judge(batch):
+        calls.append(list(batch))
+        return {p: p in {"p0", "p1", "p2"} for p in batch}
+
+    out = audit_snapshot(pool, judge, n_v=400, E_D=4, delta_v=0.01, j=2, epsilon=0.1,
+                         batch_size=3, rng=np.random.default_rng(0), min_certify_draws=8)
+    assert out.certified and out.draws >= 8 and calls
+    assert out.bound <= 24 / 400 + 1e-12 and len(out.audited) == sum(len(c) for c in calls)
+    assert out.bound == pytest.approx(certificate_bound(400, 4, 20, out.draws, out.errors, 0.01, 2))
+    # min_certify_draws larger than R: the whole cohort is judged (exact loss).
+    out = audit_snapshot(pool[:5], _judge_for({"p0"}), n_v=400, E_D=4, delta_v=0.01, j=2, epsilon=0.1,
+                         batch_size=2, rng=np.random.default_rng(0), min_certify_draws=8)
+    assert out.certified and out.draws == 5 and out.stop_reason == EXHAUSTED
+    assert out.bound == pytest.approx(5 / 400)

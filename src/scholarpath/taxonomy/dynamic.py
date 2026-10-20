@@ -12,18 +12,28 @@ the worst-case bound (Equation 16)
 which counts every unaudited arrival as an error and needs no assumption on
 the new papers. As long as U_new <= eps and the residual leaf bottom_v stays
 below the discovery threshold, the node remains certified and no LLM call is
-made. Otherwise the builder audits the new cohort uniformly without
-replacement -- the old part still contributes at most n U_old errors, so the
-cohort audit certifies (n U_old + K^U) / (n + M) <= eps -- and, if new
-subtopics or routing drift emerge (the cohort audit fails), runs audit-guided
-repair (DISCOVER and CORRECT) and re-certifies a new snapshot as in Section
-3.3. Every audit continues the node's snapshot index, so the step levels
-alpha_{v,j,a} still sum to at most delta_v.
+made. "Once either condition fails, the builder audits the new cohort without
+replacement" (App. B.3). It draws uniformly from the M arrivals and judges at
+least min(M, ``audit_min_draws``) of them before it may certify. The old
+part still contributes at most n U_old errors, so the cohort audit
+certifies (n U_old + K^U) / (n + M) <= eps. New subtopics or routing drift
+emerge when the cohort audit fails, or when the residual leaf crossed the
+discovery threshold and the audit finds errors among the arrivals. Either
+way the builder runs audit-guided repair (Stage 2: DISCOVER and CORRECT)
+and then re-certifies a new snapshot as in Section 3.3. Every audit
+continues the node's snapshot index, so the step levels alpha_{v,j,a}
+still sum to at most delta_v.
 
 Arrivals are processed top-down (BFS): the papers a node routes to a child
 are that child's arrivals. A repair can also move existing papers between
 children; a certified node that loses r of its n papers keeps the valid
 bound n U_old / (n - r) (all errors may remain among the rest).
+
+:class:`BuildResult.save` does not persist the frozen routers. On a reloaded
+result :class:`DynamicUpdater` therefore retrains every missing router from
+the node's persisted verified labels, at zero LLM cost (see
+:meth:`NodeWiseBuilder.rebuild_router`). Existing assignments are never
+re-routed, so the certificates stay valid.
 """
 
 from __future__ import annotations
@@ -78,6 +88,7 @@ class UpdateReport:
     uncertified: List[str] = field(default_factory=list)  # uncertified internal nodes, routed only
     grown_leaves: List[str] = field(default_factory=list)  # leaves now above the size limit
     new_nodes: List[str] = field(default_factory=list)  # children added by DISCOVER
+    rebuilt_routers: List[str] = field(default_factory=list)  # routers retrained from persisted labels
     episodes: List[EpisodeRecord] = field(default_factory=list)
     usage: Dict[str, UsageRecord] = field(default_factory=dict)
     papers_read: Dict[str, int] = field(default_factory=dict)
@@ -103,19 +114,39 @@ class UpdateReport:
 class DynamicUpdater:
     """Keeps a :class:`BuildResult` certified as new papers arrive (Section 3.4).
 
+    Episodes run during an update are merged into ``result.episodes``, which
+    keeps the latest episode of every node in the current taxonomy. These
+    are the re-certification of a drifting node and the episodes of the
+    children DISCOVER creates. Superseded episodes, and episodes of nodes a
+    repair removed, are archived under
+    ``result.metadata["superseded_episodes"]``. With that, ``result.summary()``
+    matches the updated taxonomy.
+
     Args:
-        builder: the :class:`NodeWiseBuilder` (same LLM, embedder and config)
-            that produced ``result``.
-        result: the build result; its taxonomy, node metadata (verified labels,
-            snapshot indices, certificates) and frozen routers are updated in
-            place.
+        builder: a :class:`NodeWiseBuilder` with the same LLM, embedder,
+            config and repository as the one that produced ``result``.
+        result: the build result. Its taxonomy, node metadata (verified
+            labels, snapshot indices, certificates), routers and episodes are
+            updated in place.
+        rebuild_routers: retrain the routers that ``result`` lacks (e.g.
+            after :meth:`BuildResult.save` and a reload) from the persisted
+            verified labels, at zero LLM cost. If False, a missing router
+            raises ``ValueError``.
     """
 
-    def __init__(self, builder: NodeWiseBuilder, result: BuildResult):
+    def __init__(self, builder: NodeWiseBuilder, result: BuildResult, rebuild_routers: bool = True):
         self.builder = builder
         self.result = result
         self.tax: Taxonomy = result.taxonomy
         self.ops = builder.make_ops(self.tax.facet)
+        self.rebuild_routers = bool(rebuild_routers)
+        missing = self._missing_routers()
+        if missing and not self.rebuild_routers:
+            raise ValueError(
+                f"{len(missing)} internal nodes have no frozen router (e.g. {missing[:3]}). "
+                "BuildResult.save does not persist routers; pass rebuild_routers=True to retrain them "
+                "from the persisted verified labels at zero LLM cost"
+            )
         cfg = builder.config
         state = result.metadata.get("allocator")
         if state:
@@ -136,6 +167,10 @@ class DynamicUpdater:
         usage_before = meter.snapshot()
         reads_before = dict(self.ops.papers_read)
         report = UpdateReport()
+        # Before touching the taxonomy: every internal node needs its router.
+        for nid in self._missing_routers():
+            self._rebuild_router(nid)
+            report.rebuilt_routers.append(nid)
         known = self.tax.root.papers
         fresh: List[str] = []
         for p in new_papers:
@@ -177,6 +212,7 @@ class DynamicUpdater:
                         queue.append(c)
                         queued.add(c)
             self.tax.invalidate()
+        self._merge_episodes(report.episodes)
         self.result.metadata["allocator"] = self.allocator.state_dict()
         report.usage = meter.diff(usage_before)
         report.papers_read = {
@@ -198,14 +234,17 @@ class DynamicUpdater:
         meta = node.metadata.setdefault(STATE_KEY, {})
         if departures:
             self._forget(nid, departures)
-        router = self.result.routers.get(nid)
-        if router is None or not tax.children(nid):
+        if not tax.children(nid):
             # A leaf that crossed the size limit with these arrivals (a rebuild of
             # its subtree would now run an episode for it).
             crossed = node.size - len(arrivals) < cfg.min_node_size
             if arrivals and crossed and b.splittable(node) and nid not in report.grown_leaves:
                 report.grown_leaves.append(nid)
             return {}, {}
+        router = self.result.routers.get(nid)
+        if router is None:  # e.g. an internal node created by a caller after the build
+            router = self._rebuild_router(nid)
+            report.rebuilt_routers.append(nid)
         arr = sorted(arrivals)
         routed: Dict[str, Tuple[str, ...]] = {}
         if arr:
@@ -225,29 +264,41 @@ class DynamicUpdater:
         new_residual = {p for p in arr if not routed[p]}
         residual_after = len(node.residual | new_residual)
         threshold = b.repair_threshold(n_old + M)
-        if U_new <= cfg.epsilon and (not new_residual or residual_after < threshold):
+        bound_ok = U_new <= cfg.epsilon
+        # |bottom_v| "stays below the discovery threshold": the arrivals neither push the
+        # residual leaf to the threshold nor grow it while it is already at or above it.
+        residual_ok = not new_residual or residual_after < threshold
+        if bound_ok and residual_ok:
             added, departed = b.apply_assignments(tax, nid, routed)
             self._update_certificate(node, n_old + M, U_new)
             report.kept.append(nid)
             return added, departed
 
-        # Audit the new cohort (continuing the snapshot index j).
+        # Either condition failed: audit the new cohort (continuing the snapshot index j).
         outcome, labels = self._audit_cohort(nid, arr, routed, n_old, U_old)
-        report.reaudited.append(nid)
+        if outcome.draws > 0:
+            report.reaudited.append(nid)
         final = {p: (labels[p][0] if p in labels else routed[p]) for p in arr}
         self._remember(nid, labels)
-        if outcome.certified:
+        # New subtopics or routing drift emerge when the cohort audit fails, or when the
+        # residual leaf crossed the discovery threshold and the audited arrivals contain errors.
+        drift = not outcome.certified or (not residual_ok and outcome.found_errors)
+        if not drift:
             added, departed = b.apply_assignments(tax, nid, final)
             self._update_certificate(node, n_old + M, outcome.bound, outcome)
             report.recertified.append(nid)
             return added, departed
 
-        # Drift: audit-guided repair and re-certification of a new snapshot.
+        # Drift: audit-guided repair (Stage 2) and re-certification of a new snapshot.
         before_children = set(tax.children(nid))
         state = b.resume_node(tax, nid, self.ops)
-        b.run_cycles(state, tax, self.ops, force=True)
+        b.recertify(state, tax, self.ops)
         added, departed, episode = b.finalize(state, tax, self.ops, self.result, record=False)
-        episode.metadata["dynamic_update"] = True
+        episode.metadata.update({
+            "dynamic_update": True,
+            "trigger": [k for k, failed in (("bound", not bound_ok), ("residual", not residual_ok)) if failed],
+            "cohort_audit": outcome.summary(),
+        })
         report.episodes.append(episode)
         report.repaired.append(nid)
         if state.status == CERTIFIED:
@@ -299,10 +350,48 @@ class DynamicUpdater:
             list(cohort), judge, n_old + len(cohort), n_old * U_old, delta_v, j, cfg.epsilon,
             cfg.audit_batch_size, rng, cfg.audit_abort_factor, cfg.audit_min_draws,
             max_draws=cfg.max_llm_papers_per_node,
+            # A cohort audit looks at real papers: it may not certify on U_{v,j,0} = U_new alone.
+            min_certify_draws=max(1, int(cfg.audit_min_draws)),
         )
         meta["next_snapshot"] = j + 1
         meta.setdefault("update_audits", []).append(outcome.summary())
         return outcome, judged
+
+    def _missing_routers(self) -> List[str]:
+        """Internal nodes (with children) that have no frozen router in the result."""
+        return sorted(nid for nid in self.tax.nodes if self.tax.children(nid) and nid not in self.result.routers)
+
+    def _rebuild_router(self, nid: str) -> Any:
+        if not self.rebuild_routers:
+            raise ValueError(f"internal node {nid!r} has no frozen router (rebuild_routers=False)")
+        router = self.builder.rebuild_router(self.tax, nid)
+        self.result.routers[nid] = router
+        self.tax.nodes[nid].metadata.setdefault(STATE_KEY, {})["router_rebuilt"] = True
+        return router
+
+    def _merge_episodes(self, episodes: Sequence[EpisodeRecord]) -> None:
+        """Keep ``result.episodes`` = latest episode of every node of the current taxonomy."""
+        latest = {e.node_id: e for e in episodes if e.node_id in self.tax.nodes}
+        merged: List[EpisodeRecord] = []
+        archived: List[Dict[str, Any]] = []
+        placed: Set[str] = set()
+        for e in self.result.episodes:  # a new episode takes the place of the one it supersedes
+            new = latest.get(e.node_id)
+            keep = e.node_id in self.tax.nodes and e.node_id not in placed
+            if new is not None or not keep:
+                archived.append(e.to_dict())
+            if keep:
+                merged.append(e if new is None else new)
+                placed.add(e.node_id)
+        for e in episodes:
+            if latest.get(e.node_id) is e and e.node_id not in placed:
+                merged.append(e)
+                placed.add(e.node_id)
+            elif latest.get(e.node_id) is not e:
+                archived.append(e.to_dict())
+        self.result.episodes = merged
+        if archived:
+            self.result.metadata.setdefault("superseded_episodes", []).extend(archived)
 
     @staticmethod
     def _update_certificate(node: Any, n: int, bound: float, outcome: Optional[AuditOutcome] = None) -> None:

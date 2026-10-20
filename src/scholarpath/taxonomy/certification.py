@@ -353,6 +353,7 @@ def audit_snapshot(
     abort_factor: float = 1.5,
     min_draws: int = 8,
     max_draws: Optional[int] = None,
+    min_certify_draws: int = 0,
 ) -> AuditOutcome:
     """Audit snapshot j of node v (Algorithm 1, lines 15-20).
 
@@ -369,11 +370,16 @@ def audit_snapshot(
     * when R_{v,j} is exhausted (the exact loss (E_D + y) / n_v is known);
     * when ``max_draws`` papers have been audited (budget cap).
 
+    ``min_certify_draws`` forbids certifying before min(R, min_certify_draws)
+    papers have been judged. The dynamic update (Section 3.4) uses it: once a
+    keep condition fails, "the builder audits the new cohort", so the cohort
+    audit must look at real papers even when U_{v,j,0} <= eps.
+
     The decision rule may depend on everything observed so far: the union
     bound over a (and over snapshots j, by the caller continuing j) keeps the
-    certificate valid at level delta_v. Once certified, the remaining papers
-    of the same (already judged) batch are still folded into (a, y) and the
-    smallest bound is reported.
+    certificate valid at level delta_v. That includes a minimum number of
+    draws. Once certified, the remaining papers of the same (already judged)
+    batch are still folded into (a, y) and the smallest bound is reported.
     """
     if n_v <= 0:
         raise ValueError("n_v must be positive")
@@ -390,9 +396,10 @@ def audit_snapshot(
         return (float(E_D) + k_up) / n_v, k_up, alpha
 
     # a = 0: the bound counts every unverified paper as an error.
+    a_min = min(R, max(0, int(min_certify_draws)))
     out.bound, out.k_upper, out.alpha = bound_at(0, 0)
     out.trace.append((0, 0, out.bound))
-    if out.bound <= epsilon:
+    if out.bound <= epsilon and a_min == 0:
         out.certified, out.stop_reason = True, (EXHAUSTED if R == 0 else CERTIFIED_STOP)
         return out
     if float(E_D) / n_v > epsilon:
@@ -431,7 +438,7 @@ def audit_snapshot(
                         out.stop_reason = EXHAUSTED
                 continue
             out.draws, out.errors, out.bound, out.k_upper, out.alpha = a, y, U, k_up, alpha
-            if U <= epsilon:
+            if U <= epsilon and a >= a_min:
                 out.certified = True
                 out.stop_reason = EXHAUSTED if a == R else CERTIFIED_STOP
         if out.certified:
