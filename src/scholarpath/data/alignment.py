@@ -23,9 +23,10 @@ These are the paper's rules and the default. An optional, **opt-in** fifth
 stage (``fuzzy=True``) matches near-identical titles (typos, punctuation,
 British/American spelling): ``difflib`` ratio ``>= fuzzy_threshold`` (0.92),
 *and* identical version tokens (numbers, roman numerals: "Qwen2" never
-matches "Qwen", nor "... II" its first part), *and* -- when both sides know
-them -- years within ``fuzzy_year_tolerance`` and a shared first-author
-surname. There is deliberately no containment rule: a citation of a paper
+matches "Qwen", nor "... II" its first part), *and* every differing word a
+spelling variant of a word of the other title ("Non-Autoregressive" never
+matches "Semi-Autoregressive"), *and* -- when both sides know them -- years
+within ``fuzzy_year_tolerance`` and a shared first-author surname. There is deliberately no containment rule: a citation of a paper
 missing from the corpus must stay unaligned rather than match a longer
 title that contains it ("Attention is all you need" vs. "Attention Is All
 You Need in Speech Separation"). Fuzzy matches are counted separately
@@ -140,6 +141,9 @@ def parse_doi(text: Optional[str]) -> Optional[str]:
         return None
     s = str(text).strip()
     m = _DOI_RE.search(s)
+    if not m and "%2f" in s.lower():  # percent-encoded slash, e.g. https://doi.org/10.1000%2Fabc
+        s = unquote(s)
+        m = _DOI_RE.search(s)
     if not m:
         return None
     doi = m.group(1)
@@ -240,11 +244,34 @@ def version_tokens(normalized_title: str) -> FrozenSet[str]:
     return frozenset(t for t in normalized_title.split() if t in _ROMAN_NUMERALS or any(c.isdigit() for c in t))
 
 
+def titles_compatible(a: str, b: str, min_token_ratio: float = 0.75) -> bool:
+    """Whether two *normalized* titles can be spelling variants of one title.
+
+    Requires identical :func:`version_tokens` and that every content word
+    occurring in only one title has a spelling variant (``difflib`` ratio
+    ``>= min_token_ratio``) among the words occurring only in the other one:
+    "estimaton"/"estimation" and "optimisation"/"optimization" qualify,
+    "Non-Autoregressive"/"Semi-Autoregressive" do not. Titles that are equal
+    after removing spaces ("multi task" / "multitask") are compatible.
+    """
+    if a.replace(" ", "") == b.replace(" ", ""):
+        return True
+    if version_tokens(a) != version_tokens(b):
+        return False
+    ta, tb = set(a.split()), set(b.split())
+    only_a = {t for t in ta - tb if t not in STOPWORDS}
+    only_b = {t for t in tb - ta if t not in STOPWORDS}
+    for x, others in [(x, only_b) for x in only_a] + [(y, only_a) for y in only_b]:
+        if not any(SequenceMatcher(None, x, y, autojunk=False).ratio() >= min_token_ratio for y in others):
+            return False
+    return True
+
+
 def fuzzy_title_score(a: str, b: str) -> float:
     """``difflib`` similarity ratio of two *normalized* titles (1.0 for identical titles).
 
     Used by the opt-in fuzzy stage of :class:`PaperAligner` together with
-    :func:`version_tokens`; there is no containment shortcut (module docstring).
+    :func:`titles_compatible`; there is no containment shortcut (module docstring).
     """
     if not a or not b:
         return 0.0
@@ -612,20 +639,20 @@ class PaperAligner:
     def _fuzzy(self, ref: Reference) -> Tuple[Optional[str], float, bool]:
         """Best fuzzy title match among the blocked candidates (``quick_ratio`` bounds prune ``difflib``).
 
-        A candidate qualifies if its ratio reaches ``fuzzy_threshold``, its
-        version tokens equal the reference's, and at least one paper with
+        A candidate qualifies if its ratio reaches ``fuzzy_threshold``, it is
+        :func:`titles_compatible` with the reference (same version tokens,
+        differing words are spelling variants), and at least one paper with
         that title passes :meth:`_fuzzy_ok`.
         """
         best: Tuple[float, Optional[str], bool] = (0.0, None, False)
         for key in title_keys(ref.title):
-            versions = version_tokens(key)
             for i in self._fuzzy_candidates(key):
                 cand = self._titles[i]
                 floor = max(self.fuzzy_threshold, best[0])
                 sm = SequenceMatcher(None, key, cand, autojunk=False)
                 if sm.real_quick_ratio() < floor or sm.quick_ratio() < floor:
                     continue
-                if version_tokens(cand) != versions:
+                if not titles_compatible(key, cand):
                     continue
                 ratio = sm.ratio()
                 if ratio < floor or (ratio == best[0] and best[1] is not None):
@@ -775,6 +802,28 @@ def words(text: Optional[str]) -> List[str]:
     """
     folded = unicodedata.normalize("NFKD", text or "").encode("ascii", "ignore").decode("ascii")
     return _WORD_RE.findall(_GLUE_RE.sub(" ", folded).lower())
+
+
+_ALNUM_RE = re.compile(r"[A-Za-z0-9]+")
+
+
+def word_spans(text: str) -> Tuple[List[str], List[Tuple[int, int]]]:
+    """:func:`words` of ``text`` together with the character span of each token in ``text``."""
+    folded: List[str] = []
+    origin: List[int] = []
+    for i, ch in enumerate(text):
+        f = ch if ch.isascii() else unicodedata.normalize("NFKD", ch).encode("ascii", "ignore").decode("ascii")
+        folded.extend(f)
+        origin.extend([i] * len(f))
+    flat = "".join(folded)
+    tokens: List[str] = []
+    spans: List[Tuple[int, int]] = []
+    for m in _ALNUM_RE.finditer(flat):
+        cuts = [m.start()] + [m.start() + g.start() for g in _GLUE_RE.finditer(m.group())] + [m.end()]
+        for a, b in zip(cuts, cuts[1:]):
+            tokens.append(flat[a:b].lower())
+            spans.append((origin[a], origin[b - 1] + 1))
+    return tokens, spans
 
 
 def shingles(tokens: Sequence[str], k: int) -> Set[Tuple[str, ...]]:

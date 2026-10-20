@@ -35,7 +35,9 @@ from scholarpath.data.fulltext import (
     FulltextSource,
     LocalSource,
     S2ORCSource,
+    clean_latex_text,
     clean_sections,
+    expand_simple_macros,
     gcs_pdf_url,
     latex_to_sections,
     make_sources,
@@ -104,6 +106,30 @@ def test_withdrawn_rule():
     assert not is_withdrawn({"comments": "12 pages; extended discussion of withdrawn drugs"})
 
 
+@pytest.mark.parametrize("record", [
+    {"comments": "This article has been withdrawn by arXiv administrators because it is a duplicate"},
+    {"comments": "v3: This submission has been withdrawn"},
+    {"comments": "Withdrawn: a mistake in the proof of Theorem 1"},
+    {"comments": "We have withdrawn this paper"},
+    {"comments": "", "abstract": "The paper is withdrawn by the author because of an error"},
+    {"comments": "", "abstract": "We withdraw this paper since the main theorem is wrong."},
+])
+def test_withdrawn_notices_about_the_paper(record):
+    assert is_withdrawn(record)
+
+
+@pytest.mark.parametrize("record", [
+    {"comments": "v2: an incorrect claim in Section 4 was withdrawn; results unchanged"},
+    {"comments": "Theorem 3 withdrawn due to a gap; main result unaffected"},
+    {"comments": "Withdrawn from ICML 2020; accepted at NeurIPS 2020"},
+    {"comments": "Case report: treatment was withdrawn after 3 weeks"},
+    {"abstract": "Withdrawn behaviour in adolescents is associated with peer rejection."},
+    {"comments": "Supersedes the withdrawn preprint arXiv:1901.00001"},
+])
+def test_partial_or_unrelated_withdrawals_are_kept(record):
+    assert not is_withdrawn(record)
+
+
 def test_iter_papers_primary_any_until():
     prim = {p.paper_id: c for c, p in iter_arxiv_papers(SNAPSHOT)}
     assert set(prim) == {"2101.00001", "2101.00002", "2102.00003", "2103.00004", "math/0601001", "2106.00008",
@@ -152,6 +178,24 @@ def test_uniform_sampler_is_order_independent_and_uniform():
     assert all(55 <= c <= 145 for c in counts.values()), counts  # expectation 100
 
 
+def test_uniform_sampler_edge_cases():
+    empty = UniformSampler(0)
+    empty.offer(Paper("a", "t"))
+    assert len(empty) == 0 and empty.result() == []
+    s = UniformSampler(5)
+    s.offer(Paper("a", "t"))
+    s.offer(Paper("a", "t2"))  # duplicate id (e.g. concatenated snapshots): ignored, no Paper comparison
+    assert [p.title for p in s.result()] == ["t"]
+    full = UniformSampler(2, seed=3)
+    for _ in range(2):  # re-offering every paper does not change the sample
+        for i in range(30):
+            full.offer(Paper(f"p{i}", "t"))
+    once = UniformSampler(2, seed=3)
+    for i in range(30):
+        once.offer(Paper(f"p{i}", "t"))
+    assert [p.paper_id for p in full.result()] == [p.paper_id for p in once.result()] and len(full) == 2
+
+
 def test_build_sets_and_subfields(tmp_path):
     sets = build_arxiv_sets(SNAPSHOT, n_per_set=2, seed=0)
     assert set(sets) == set(ARXIV_SET_CATEGORIES)
@@ -197,6 +241,26 @@ def test_latex_sections_with_inputs_comments_and_floats():
     assert "$\\mathcal{L}" in secs["Method > Model"]  # math kept verbatim
     assert "- Joins: are encoded" in secs["Method > Model"]
     assert all("reviewers" not in b for b in secs.values())  # acknowledgements dropped
+
+
+def test_latex_math_macros_and_run_in_headings():
+    assert clean_latex_text(r"\begin{equation} y = \sum_i x_i \label{eq:1} \end{equation}") == \
+        r"\begin{equation} y = \sum_i x_i  \end{equation}"
+    text = clean_latex_text(r"We have \begin{align*} a &= \text{b} \\ c &= d \end{align*} and \[ e = mc^2 \] "
+                            r"or $$x_1$$ and \( \alpha \) for \$5.")
+    assert r"\begin{align*} a &= \text{b} \\ c &= d \end{align*}" in text and r"\[ e = mc^2 \]" in text
+    assert "$$x_1$$" in text and r"\( \alpha \)" in text and text.endswith("for $5.")
+    assert clean_latex_text(r"\paragraph{Details.} Learning rate 0.1.") == "Details. Learning rate 0.1."
+    assert clean_latex_text(r"\paragraph{Details} Learning rate 0.1.") == "Details. Learning rate 0.1."
+    assert clean_latex_text(r"See \url{https://x.org/a} and \href{https://y.org}{our code}.") == \
+        "See https://x.org/a and our code."
+    assert expand_simple_macros(r"\newcommand{\method}{SysName\xspace}\def\etal{et al.}Use \method{} (Li \etal)") == \
+        "Use SysName (Li et al.)"
+    tex = (r"\documentclass{article}\newcommand{\method}{\textsc{Foo}}\newcommand\R{\mathbb{R}}"
+           r"\newcommand{\vect}[1]{\mathbf{#1}}\title{A Paper}\begin{document}\maketitle"
+           r"\section{Intro}We propose \method{} with $x \in \R$."
+           r"\begin{figure}\caption{An overview of \method{}.}\end{figure}\end{document}")
+    assert latex_to_sections(tex) == [("Intro", "We propose Foo with $x \\in \\mathbb{R}$.\n[Figure] An overview of Foo.")]
 
 
 def test_latex_appendix_after_bibliography_is_kept():

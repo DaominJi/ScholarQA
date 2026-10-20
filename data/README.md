@@ -2,7 +2,7 @@
 
 This directory holds the datasets of the paper (Section 5, Appendix C.1–C.2).
 Raw downloads go to `data/raw/`, preprocessed files to `data/processed/`;
-both are git-ignored. Everything is produced by three commands:
+both are git-ignored. Everything is produced by four commands:
 
 ```bash
 python scripts/download_data.py                 # raw data -> data/raw/<name>/
@@ -56,7 +56,7 @@ prints manual instructions; place the files as below and continue.
 
 Manual alternatives:
 
-* ResearchQA: `python -c "from datasets import load_dataset; load_dataset('realliyifei/ResearchQA', split='test_mini').to_json('data/raw/researchqa/test_mini.json', force_ascii=False)"` (JSON/JSONL exports are accepted).
+* ResearchQA: `python -c "from datasets import load_dataset; load_dataset('realliyifei/ResearchQA', split='test_mini').to_json('data/raw/researchqa/test_mini.jsonl', force_ascii=False)"` (JSON/JSONL exports are accepted).
 * CHIME annotations: CSV / JSONL / parquet exports of the three datasets, or `datasets.save_to_disk` directories, named `chime-<task>*` under `data/raw/chime_annotations/`.
 * arXiv: download the Kaggle dataset in a browser and put `arxiv-metadata-oai-snapshot.json` (or `arxiv.zip`, or a `.gz`) into `data/raw/arxiv/`. (The public GCS copy `gs://arxiv-dataset/metadata-v5/arxiv-metadata-oai.json` is a stale August-2020 snapshot.)
 
@@ -70,7 +70,7 @@ data/raw/
 ├── scholarqabench/data/scholarqa_multi/human_answers.json
 ├── chime/resources/{raw_source_data.csv, raw_generated_hierarchy.csv, data_split.csv}
 ├── chime_annotations/chime-{parent-child-relation,sibling-coherence,claim-category}/...
-├── researchqa/data/test_mini-00000-of-00001.parquet   # or test_mini.json
+├── researchqa/data/test_mini-00000-of-00001.parquet   # or test_mini.json[l] (JSON array or JSON Lines)
 ├── s2orc_v2/<release>/s2orc_v2-*.jsonl.gz      # optional
 └── s2_papers/<release>/papers-*.jsonl.gz       # optional
 ```
@@ -84,9 +84,11 @@ One streaming pass over the snapshot (`scholarpath.data.arxiv`):
 * `paper_id` = `arxiv_id` = identifier without version (old-style ids keep their archive: `math/0601001`);
   title / abstract whitespace-normalised; `categories` split on spaces; **primary category = first entry**
   (App. C.2); authors from `authors_parsed`; `date` = creation date of the first version (RFC 2822 -> ISO), `year`.
-* **Withdrawn papers are excluded**: comments stating the withdrawal ("This paper has been withdrawn by
-  the author", "Withdrawn due to ...") or an abstract that *starts with* a withdrawal notice
-  (`scholarpath.data.arxiv.is_withdrawn`).
+* **Withdrawn papers are excluded** (`scholarpath.data.arxiv.is_withdrawn`; the paper does not define the
+  rule): comments or abstract containing a notice whose subject is the paper itself ("This paper has been
+  withdrawn by the author", "withdrawn by arXiv administrators", "We withdraw this paper"), or starting with
+  a bare notice ("Withdrawn", "Withdrawn due to ..."). Partial or unrelated withdrawals ("Theorem 3
+  withdrawn due to a gap", "Withdrawn from ICML 2020; accepted at NeurIPS") do not exclude a paper.
 * **arXiv sets**: 2,000 papers per category sampled uniformly with a fixed seed (`--seed`, default 0).
   Sampling is bottom-k by a seeded hash of the paper id, i.e. a uniform sample without replacement that does
   not depend on the order of the snapshot.
@@ -123,7 +125,8 @@ papers without full text keep only their abstract.
   aligned to arXiv-Subfields.
 * **ScholarQA-CS**: one query per unique question (the first of the 10 double-annotated cases, as the official
   scorer; the other case is kept in `metadata["alternate_cases"]`), full `metric_config` kept for
-  `scripts/rubric_eval.py`; rubric = `other_properties` (weights, evidence quotes).
+  `scripts/rubric_eval.py`; rubric = `other_properties` (weights, evidence quotes). Gold papers are
+  reconstructed from the evidence quotes (see Caveats).
 * **ScholarQA-Multi**: one query per expert answer (`reference_answer`), gold = the `ctxs` citations
   (citation markers in the answers are **0-based**).
 * **TaxoBench**: pooled corpus de-duplicated by normalized title (ids `tb-<sha1>`), per-survey gold trees
@@ -154,13 +157,30 @@ Load them with `scholarpath.data.Corpus.load(...)`, `load_queries(...)` and
 
 ## 6. Corpus alignment and coverage (App. C.2)
 
-Gold citations are aligned to the target corpus by `scholarpath.data.alignment.PaperAligner`:
-arXiv id (from ids / URLs / `10.48550/arXiv.*` DOIs, version stripped) -> Semantic Scholar paperId or
-CorpusId (`--s2-papers` attaches them to arXiv papers from the S2AG `papers` dataset) -> DOI ->
-normalized title -> fuzzy title (`difflib` ratio >= 0.92, TaxoBench's default threshold, or containment of
-one title in the other with ratio >= 0.6), with token blocking so that it scales to 148K papers.
+Gold citations are aligned to the target corpus by `scholarpath.data.alignment.PaperAligner`, following
+App. C.2 ("by arXiv ID, Semantic Scholar ID, or normalized title"): arXiv id (from ids / URLs /
+`10.48550/arXiv.*` DOIs, version stripped) -> Semantic Scholar paperId or CorpusId (`--s2-papers` attaches
+them to arXiv papers from the S2AG `papers` dataset) -> DOI / PMID -> exact normalized title (plus a
+LaTeX-math-unwrapped variant, so `$k$-means` equals `k-means`).
 **Unaligned citations stay in the query's denominator** (`Query.unaligned_gold`, counted by
 `Query.num_gold`), so Recall@B / NDCG@B reflect end-to-end corpus coverage.
+
+`--fuzzy` enables an opt-in near-duplicate title stage for typos and spelling variants (`difflib` ratio >=
+`--fuzzy-threshold` 0.92, identical version tokens such as numbers and roman numerals, every differing word a
+spelling variant of a word of the other title, years within 2 and a shared first-author surname when known;
+no containment rule, so "Attention is all you need" never matches "Attention Is All You Need in Speech
+Separation", nor "Qwen2 Technical Report" "Qwen Technical Report"). Its matches are reported separately
+(`by_method.fuzzy_title`). It is off by default because App. C.2 aligns by identifiers and normalized title
+only, and any fuzzy rule risks aligning a citation of a paper missing from the corpus to a different paper.
+
+ResearchQA and ScholarQABench need the alignment corpus; `prepare_benchmarks.py` stops if it is missing
+unless `--allow-unaligned` is given. `coverage_report.json` is updated per benchmark, so benchmarks can be
+prepared in separate runs. An end-to-end run on the test fixtures:
+
+```bash
+python scripts/prepare_arxiv.py --snapshot tests/fixtures/arxiv/arxiv-metadata-sample.json --out /tmp/bench --n-per-set 2
+python scripts/prepare_benchmarks.py --raw tests/fixtures --out /tmp/bench --corpus /tmp/bench/arxiv_subfields/papers.jsonl.gz
+```
 
 | Benchmark | Paper (App. C.2) |
 |---|---|
@@ -186,11 +206,17 @@ one title in the other with ratio >= 0.6), with token blocking so that it scales
   used (465 hierarchies, 2,306 categorized studies; the raw join has 2,439 study rows / 2,438 distinct
   studies), and outputs are marked `corrected: false`.
 * **ScholarQA-CS gold papers.** The release has no citation list; its expert-cited papers are the sources of
-  the rubric evidence quotes. Quotes matching citations of the Ai2 ScholarQA ("Nora") answers map to their
-  S2 CorpusIds, quotes from other LLM answers are not gold sources, and the remaining quotes are attributed to
-  the arXiv-Subfields paper containing them (abstracts and chunks); unattributed quotes stay in the
-  denominator as `quote:<hash>`. This is a reconstruction; the paper's 2,454 count is not reproducible from
-  the release alone (our reconstruction yields 1,435 CS + 524 Multi distinct gold entries).
+  the rubric evidence quotes. Quotes are matched to the system answers shown to the annotators by word
+  5-gram shingle overlap (>= 50%; words glued by lost markdown line breaks are split): quotes of Ai2
+  ScholarQA ("Nora") citation snippets or of Nora answer text map to the S2 CorpusIds of the cited papers,
+  quotes from Perplexity / GPT / Claude answers are not gold sources, and the remaining (paper) quotes are
+  attributed to the arXiv-Subfields paper containing them (abstracts and chunks), one gold entry per paper.
+  Unattributed quotes stay in the denominator, pooled per rubric item by default
+  (`--cs-unattributed item`; `quote` counts each quote). On the release (110 cases -> 100 queries) the
+  shingle classifier finds 1,163 paper quotes, 528 LLM-answer quotes, 41 Nora-snippet quotes and 168
+  Nora-answer quotes. Without the arXiv-Subfields corpus this gives 544 CS gold entries (1,346 with
+  `quote`), plus 524 distinct Multi citations, against the paper's 2,454; the paper's count is not
+  reproducible from the release alone.
 * **ResearchQA gold set.** The released records only carry the citations of `Citation`-type rubric items
   (about 0.6 per query), fewer than the 14.6 gold papers per query of Table 1, which come from the
   survey sections; supply them with `--researchqa-extra-gold` (`{"id", "references": [...]}` JSON lines)

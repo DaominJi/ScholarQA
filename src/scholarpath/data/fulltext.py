@@ -51,7 +51,7 @@ import time
 import urllib.error
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Set, Tuple, Union
 
 from scholarpath.data.alignment import parse_arxiv_id, parse_s2_corpus_id, split_arxiv_version
 from scholarpath.data.corpus import read_jsonl
@@ -178,6 +178,10 @@ _LATEX_INPUT_RE = re.compile(r"\\(?:input|include|subfile)\s*\{([^}]+)\}")
 _DROP_ENVS = ("thebibliography", "tikzpicture", "comment", "filecontents", "lstlisting", "verbatim",
               "algorithmic", "pgfpicture")
 _FLOAT_ENVS = ("figure", "figure*", "table", "table*", "wrapfigure", "wraptable", "algorithm", "algorithm*")
+_FRONT_MATTER_CMDS = ("title", "author", "date", "thanks", "affiliation", "affil", "institute", "address", "email",
+                      "keywords", "ccsdesc", "acmConference", "acmYear", "acmDOI", "acmISBN", "copyrightyear",
+                      "setcopyright", "orcid", "icmltitle", "icmlauthor", "icmlaffiliation", "icmlcorrespondingauthor",
+                      "icmlkeywords")
 _UNWRAP_CMDS = ("emph", "textbf", "textit", "texttt", "textsc", "textsf", "textrm", "underline", "mbox",
                 "textnormal", "textmd", "textup", "uline", "hl", "text")
 
@@ -237,9 +241,10 @@ def _remove_env(tex: str, env: str, keep_captions: bool = False) -> str:
     return pattern.sub(repl, tex)
 
 
-def _unwrap_command(tex: str, cmd: str, fmt: str = "{}") -> str:
-    """Replace ``\\cmd[opt]{arg}`` by ``fmt.format(arg)`` (balanced braces)."""
+def _unwrap_command(tex: str, cmd: str, fmt: Union[str, Callable[[str], str]] = "{}") -> str:
+    """Replace ``\\cmd[opt]{arg}`` by ``fmt(arg)`` / ``fmt.format(arg)`` (balanced braces)."""
     pat = re.compile(r"\\" + re.escape(cmd) + r"\*?\s*(?:\[[^\]]*\])?\s*\{")
+    render = fmt if callable(fmt) else fmt.format
     out = []
     pos = 0
     while True:
@@ -250,37 +255,113 @@ def _unwrap_command(tex: str, cmd: str, fmt: str = "{}") -> str:
         start = m.end() - 1
         end = _matching_brace(tex, start)
         out.append(tex[pos:m.start()])
-        out.append(fmt.format(tex[start + 1:end]))
+        out.append(render(tex[start + 1:end]))
         pos = end + 1
     return "".join(out)
 
 
+def _run_in_heading(title: str) -> str:
+    """``\\paragraph{Details.}`` -> ``"Details. "`` (a period is added only if the title has no final punctuation)."""
+    title = title.strip()
+    return "\n" + title + ("" if not title or title[-1] in ".!?:;" else ".") + " "
+
+
+_MACRO_DEF_RE = re.compile(r"\\(?:(?:re)?newcommand|providecommand)\*?\s*\{?\s*\\([A-Za-z]+)\s*\}?\s*(\[\d\])?\s*(?:\[[^\]]*\]\s*)?\{"
+                           r"|\\def\s*\\([A-Za-z]+)\s*(#\d)?\s*\{")
+
+
+def expand_simple_macros(tex: str, max_rounds: int = 3) -> str:
+    """Expand argument-less user macros (``\\newcommand{\\method}{SysName\\xspace}``, ``\\def\\method{...}``).
+
+    Definitions are removed from ``tex``; every use ``\\method``, ``\\method{}``
+    is replaced by the macro body (``\\xspace`` dropped), repeated up to
+    ``max_rounds`` times for macros defined through other macros. Macros
+    with arguments are removed but not expanded.
+    """
+    macros: Dict[str, str] = {}
+    out: List[str] = []
+    pos = 0
+    for m in _MACRO_DEF_RE.finditer(tex):
+        if m.start() < pos:  # inside a previous definition's body
+            continue
+        start = m.end() - 1
+        end = _matching_brace(tex, start)
+        name = m.group(1) or m.group(3)
+        has_args = bool(m.group(2) or m.group(4))
+        if not has_args:
+            macros[name] = re.sub(r"\\xspace\b\s*", "", tex[start + 1:end]).strip()
+        out.append(tex[pos:m.start()])
+        pos = end + 1
+    out.append(tex[pos:])
+    tex = "".join(out)
+    if not macros:
+        return tex
+    use_re = re.compile(r"\\(" + "|".join(sorted(map(re.escape, macros), key=len, reverse=True)) + r")(?![A-Za-z])(?:\s*\{\})?")
+    for _ in range(max_rounds):
+        new = use_re.sub(lambda u: macros[u.group(1)], tex)
+        if new == tex:
+            break
+        tex = new
+    return tex
+
+
+_DISPLAY_MATH_ENVS = r"(?:equation|align|alignat|gather|multline|eqnarray|flalign|displaymath|math|dmath)\*?"
+_MATH_RE = re.compile(
+    r"\\begin\{(" + _DISPLAY_MATH_ENVS + r")\}.*?\\end\{\1\}"  # display environments
+    r"|\$\$.*?\$\$|\\\[.*?\\\]|\\\(.*?\\\)"  # $$...$$, \[...\], \(...\)
+    r"|(?<!\\)\$(?:[^$\\]|\\.)+?\$",  # $...$ (escaped \$ is not a delimiter)
+    re.S,
+)
+
+
 def clean_latex_text(tex: str) -> str:
-    """Light LaTeX -> text conversion for section bodies (math is kept verbatim)."""
+    """Light LaTeX -> text conversion for section bodies.
+
+    Floats are replaced by their captions, citations / references by
+    ``[cite]`` / ``[ref]``, formatting commands are unwrapped and remaining
+    argument-less commands dropped. Math -- inline (``$...$``, ``\\(...\\)``)
+    and display (``\\[...\\]``, ``$$...$$``, ``equation``/``align``/... environments)
+    -- is protected from this clean-up and kept verbatim (``\\label`` removed).
+    """
     for env in _DROP_ENVS:
         tex = _remove_env(tex, env)
     for env in _FLOAT_ENVS:
         tex = _remove_env(tex, env, keep_captions=True)
+    tex = re.sub(r"\\(?:label|bibliographystyle|bibliography|vspace|hspace|includegraphics)\*?\s*(?:\[[^\]]*\])?\s*\{[^}]*\}", "", tex)
+    tex = re.sub(r"\\(?:nonumber|notag)\b\s*", "", tex)
+    # Protect math: placeholders survive the clean-up below and are restored at the end.
+    math: List[str] = []
+
+    def protect(m: "re.Match[str]") -> str:
+        math.append(m.group(0).strip())
+        block = m.group(0).startswith(("\\begin", "$$", "\\["))
+        return ("\n" if block else "") + f"\x00{len(math) - 1}\x00" + ("\n" if block else "")
+
+    tex = _MATH_RE.sub(protect, tex)
     tex = re.sub(r"\\(?:cite[a-zA-Z]*|nocite)\*?\s*(?:\[[^\]]*\]\s*)*\{[^}]*\}", "[cite]", tex)
     tex = re.sub(r"\\(?:eqref|ref|autoref|cref|Cref|pageref|vref)\s*\{[^}]*\}", "[ref]", tex)
-    tex = re.sub(r"\\(?:label|bibliographystyle|bibliography|vspace|hspace|includegraphics)\*?\s*(?:\[[^\]]*\])?\s*\{[^}]*\}", "", tex)
+    for cmd in _FRONT_MATTER_CMDS:
+        tex = _unwrap_command(tex, cmd, "")
+    tex = re.sub(r"\\href\s*\{[^}]*\}\s*(?=\{)", "", tex)  # \href{url}{text} -> text
+    tex = re.sub(r"\\(?:textcolor|colorbox)\s*\{[^}]*\}\s*(?=\{)|\\color\s*\{[^}]*\}", "", tex)
     tex = _unwrap_command(tex, "footnote", " ({})")
     for cmd in _UNWRAP_CMDS:
         tex = _unwrap_command(tex, cmd)
-    tex = _unwrap_command(tex, "paragraph", "\n{}. ")
+    tex = _unwrap_command(tex, "paragraph", _run_in_heading)
     tex = re.sub(r"\\item\s*(?:\[([^\]]*)\])?", lambda m: "\n- " + (m.group(1) + ": " if m.group(1) else ""), tex)
     tex = re.sub(r"\\(?:begin|end)\{[^}]*\}(?:\[[^\]]*\])?", "\n", tex)
     tex = re.sub(r"\\\\(?:\[[^\]]*\])?", "\n", tex)
     tex = tex.replace("~", " ").replace("\\&", "&").replace("\\%", "%").replace("\\_", "_").replace("\\#", "#")
-    # Drop remaining argument-less commands outside math (\noindent, \centering, \maketitle, ...).
-    parts = re.split(r"(\$\$.*?\$\$|\$[^$]*\$|\\\(.*?\\\)|\\\[.*?\\\])", tex, flags=re.S)
-    for i in range(0, len(parts), 2):
-        parts[i] = re.sub(r"\\[A-Za-z]+\*?(?![A-Za-z{])\s*", " ", parts[i])
-        parts[i] = parts[i].replace("{", "").replace("}", "")  # grouping braces, e.g. "{\bf x}"
-    tex = "".join(parts)
+    tex = tex.replace("\\$", "$")
+    # Drop remaining argument-less commands (\noindent, \centering, \maketitle, ...) and grouping braces.
+    tex = re.sub(r"\\[A-Za-z]+\*?(?![A-Za-z{])\s*", " ", tex)
+    # Other commands with an argument keep the argument (\url{...}); an undefined macro \method{} vanishes.
+    tex = re.sub(r"\\[A-Za-z]+\*?(?:\[[^\]]*\])?\s*(?=\{)", " ", tex)
+    tex = tex.replace("{", "").replace("}", "")  # grouping braces, e.g. "{\bf x}"
     tex = re.sub(r"[ \t]+", " ", tex)
     tex = re.sub(r" *\n *", "\n", tex)
-    return re.sub(r"\n{3,}", "\n\n", tex).strip()
+    tex = re.sub(r"\n{3,}", "\n\n", tex).strip()
+    return re.sub(r"\x00(\d+)\x00", lambda m: math[int(m.group(1))], tex)
 
 
 def latex_to_sections(tex: str, files: Optional[Mapping[str, str]] = None) -> List[Section]:
@@ -294,6 +375,7 @@ def latex_to_sections(tex: str, files: Optional[Mapping[str, str]] = None) -> Li
     tex = strip_latex_comments(tex)
     if files:
         tex = resolve_latex_inputs(tex, files)
+    tex = expand_simple_macros(tex)
     m = re.search(r"\\begin\{document\}", tex)
     if m:
         tex = tex[m.end():]

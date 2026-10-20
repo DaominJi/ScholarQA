@@ -18,19 +18,32 @@ quotes in ``metadata["evidence"]``.
 
 ScholarQA-CS has no explicit citation list; its *expert-cited papers* are
 the sources of the rubric evidence quotes. We reconstruct them per quote
-(:func:`classify_evidence`), using the system answers the annotators worked
-from (``output_snippets.jsonl``) when available:
+(:class:`EvidenceClassifier`), using the system answers the annotators worked
+from (``output_snippets.jsonl``) when available. Quotes and answers are
+compared by word 5-gram shingles (:func:`~scholarpath.data.alignment.words`
+splits words glued by a lost markdown line break, e.g. ``"### Emphasizing
+Foundational ConceptsOne of ..."``), so a quote is recognised wherever it
+starts and however it was copied:
 
-* a quote matching a snippet of a citation in the Ai2 ScholarQA ("Nora")
-  answer -> that citation's Semantic Scholar ``corpus_id``;
-* a quote found in the Nora answer text -> the citations marked next to it
-  (``(k, Author et al., YYYY)``);
-* a quote found in another system's answer (Perplexity, GPT, Claude) is
-  model-generated text, not a paper, and is not a gold source;
+* a quote overlapping a snippet of a citation in the Ai2 ScholarQA ("Nora")
+  answer (overlap coefficient ``>= min_fraction``) -> that citation's
+  Semantic Scholar ``corpus_id``;
+* a quote whose shingles are covered ``>= min_fraction`` by the Nora answer
+  text -> the citations marked inside and right after the matched span
+  (``(k, Author et al., YYYY)`` markers, or inline ``<Paper corpusId=...>``
+  tags in newer answers; Nora's ``(LLM MEMORY, YYYY)`` statements cite no paper);
+* a quote covered ``>= min_fraction`` by another system's answer
+  (Perplexity, GPT, Claude) is model-generated text, not a paper, and is
+  not a gold source;
 * any other quote is a verbatim excerpt of a paper the expert read; it is
   attributed to the arXiv-Subfields paper whose text contains it
-  (:class:`~scholarpath.data.alignment.QuoteAttributor`) or, failing that,
-  kept as an unaligned gold entry ``quote:<hash>``.
+  (:class:`~scholarpath.data.alignment.QuoteAttributor`). Quotes attributed
+  to the same paper count once. Unattributed quotes cannot be told apart by
+  source, so by default the unattributed quotes of one rubric item are
+  pooled into a single unaligned gold entry ``quote:<hash>``
+  (``unattributed="item"``; ``"quote"`` counts every quote). Pooling avoids
+  counting several excerpts of one absent paper several times, at the cost
+  of under-counting items that quote several absent papers.
 
 **ScholarQA-Multi** (``data/scholarqa_multi/human_answers.json``): 108
 questions with expert answers (``output``) and their citations (``ctxs``:
@@ -48,7 +61,7 @@ import re
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple, Union
 
 from scholarpath.data.alignment import (
     CoverageStats,
@@ -57,6 +70,9 @@ from scholarpath.data.alignment import (
     Reference,
     quote_key,
     resolve_references,
+    shingles,
+    word_spans,
+    words,
 )
 from scholarpath.data.corpus import read_jsonl
 from scholarpath.types import EVIDENCE, Query, RubricItem
@@ -73,8 +89,14 @@ MULTI_FILE = "data/scholarqa_multi/human_answers.json"
 PAPER_STATS = {"cs_queries": 100, "multi_queries": 108, "expert_cited": 2454, "aligned": 2375, "coverage": 0.968}
 
 NORA = "Nora"  # Ai2 ScholarQA system answers (structured, with S2 corpus ids)
-_MARKER_RE = re.compile(r"\(\d+,\s[^()]*?\d{4}[a-z]?\)")
+# Nora citation markers: "(k, Author et al., YYYY)" or, in newer answers, an inline tag
+# '<Paper corpusId="267740476" paperTitle="(115, Taylor et al., 2024)" isShortName></Paper>'.
+_CITE = r"(?:<Paper\b[^>]*>(?:\s*</Paper>)?|\(\d+,\s[^()]*?\d{4}[a-z]?\))"
+_CITE_RE = re.compile(_CITE)
+_TRAILING_CITES_RE = re.compile(r"[\s.;,]*((?:" + _CITE + r"[\s;,]*)+)")
+_TAG_CORPUS_ID_RE = re.compile(r'corpusId="(\d+)"')
 _WORDS_RE = re.compile(r"[a-z0-9]+")
+UNATTRIBUTED_MODES = ("item", "quote")
 
 
 def _resolve(root: PathLike, rel: str) -> Path:
@@ -109,7 +131,7 @@ def read_cs_cases(path: PathLike) -> List[Dict[str, Any]]:
 class SourceAnswers:
     """System answers shown to the annotators of one question (``output_snippets.jsonl``)."""
 
-    texts: Dict[str, str] = field(default_factory=dict)  # system -> normalized answer text
+    texts: Dict[str, str] = field(default_factory=dict)  # system -> answer text (Nora sections joined)
     nora_sections: List[str] = field(default_factory=list)  # raw Nora section texts (with markers)
     nora_citations: Dict[str, Dict[str, Any]] = field(default_factory=dict)  # marker id -> citation
 
@@ -122,31 +144,34 @@ def read_cs_sources(path: PathLike) -> Dict[str, SourceAnswers]:
         for src in row.get("sources") or []:
             name, ans = str(src.get("name", "")), src.get("answer_txt")
             if isinstance(ans, str):
-                sa.texts[name] = (sa.texts.get(name, "") + " " + _norm(ans)).strip()
+                sa.texts[name] = (sa.texts.get(name, "") + "\n\n" + ans).strip()
                 continue
             parts = []
             for sec in ans or []:
                 text = str(sec.get("text", ""))
-                parts.append(f"{sec.get('title', '')} {sec.get('tldr', '')} {text}")
+                parts.append(f"{sec.get('title', '')}\n{sec.get('tldr', '')}\n{text}")
                 if name == NORA:
                     sa.nora_sections.append(text)
                     for cit in sec.get("citations") or []:
                         sa.nora_citations.setdefault(str(cit.get("id", "")), cit)
-            sa.texts[name] = (sa.texts.get(name, "") + " " + _norm(" ".join(parts))).strip()
+            sa.texts[name] = (sa.texts.get(name, "") + "\n\n" + "\n\n".join(parts)).strip()
     return out
 
 
 @dataclass
 class EvidenceSource:
-    """Where one rubric evidence quote comes from (see :func:`classify_evidence`)."""
+    """Where one rubric evidence quote comes from (see :class:`EvidenceClassifier`)."""
 
     quote: str
     origin: str  # nora_citation | nora_answer | llm_answer | paper_quote | paper_quote_attributed
     references: List[Reference] = field(default_factory=list)
     system: Optional[str] = None
+    score: float = 0.0  # shingle overlap with the matched source
+    gold_key: Optional[str] = None  # gold entry the quote contributes to (paper quotes)
 
     def to_dict(self) -> Dict[str, Any]:
         return {"key": quote_key(self.quote), "origin": self.origin, "system": self.system,
+                "score": round(self.score, 3), "gold_key": self.gold_key,
                 "references": [r.to_dict() for r in self.references]}
 
 
@@ -154,56 +179,132 @@ def _nora_ref(cit: Mapping[str, Any]) -> Reference:
     return Reference(s2_corpus_id=cit.get("corpus_id"), source="nora_citation")
 
 
-def classify_evidence(quote: str, sources: Optional[SourceAnswers], min_words: int = 6) -> EvidenceSource:
-    """Classify an evidence quote by its origin (module docstring)."""
-    nq = _norm(quote)
-    if sources is None or len(nq.split()) < min_words:
-        return EvidenceSource(quote, "paper_quote")
-    for cit in sources.nora_citations.values():
-        for snip in cit.get("snippets") or []:
-            ns = _norm(snip)
-            if len(ns.split()) >= min_words and (ns in nq or nq in ns):
-                return EvidenceSource(quote, "nora_citation", [_nora_ref(cit)], NORA)
-    probe = " ".join(nq.split()[:12])
-    if NORA in sources.texts and probe in sources.texts[NORA]:
-        refs = []
-        flat_q = " ".join(quote.split())
-        head = flat_q[:40]
-        body = flat_q.rstrip(" .;:")
+class EvidenceClassifier:
+    """Classify the rubric evidence quotes of one question by their origin (module docstring).
+
+    Parameters
+    ----------
+    sources:
+        The system answers of the question (``None``: every quote is a paper quote).
+    shingle:
+        Word n-gram size of the shingles.
+    min_fraction:
+        Minimum share of a quote's shingles found in a system answer (or
+        overlap coefficient with a Nora citation snippet) for the quote to be
+        assigned to that source.
+    min_words:
+        Quotes (and snippets) with fewer words are not matched.
+    """
+
+    def __init__(self, sources: Optional[SourceAnswers], shingle: int = 5, min_fraction: float = 0.5,
+                 min_words: int = 6):
+        self.k = int(shingle)
+        self.min_fraction = float(min_fraction)
+        self.min_words = max(int(min_words), self.k)
+        self.sources = sources
+        self.systems: Dict[str, Set[Tuple[str, ...]]] = {}
+        self.snippets: List[Tuple[Mapping[str, Any], Set[Tuple[str, ...]]]] = []
+        self.sections: List[Tuple[str, List[str], List[Tuple[int, int]]]] = []
+        if sources is None:
+            return
+        self.systems = {name: shingles(words(text), self.k) for name, text in sources.texts.items()}
+        for cit in sources.nora_citations.values():
+            for snip in cit.get("snippets") or []:
+                toks = words(str(snip))
+                if len(toks) >= self.min_words:
+                    self.snippets.append((cit, shingles(toks, self.k)))
         for sec in sources.nora_sections:
-            flat = " ".join(sec.split())
-            pos = flat.find(head)
-            if pos < 0:
+            tokens, spans = word_spans(sec)
+            self.sections.append((sec, tokens, spans))
+
+    def classify(self, quote: str) -> EvidenceSource:
+        tokens = words(quote)
+        if self.sources is None or len(tokens) < self.min_words:
+            return EvidenceSource(quote, "paper_quote")
+        grams = shingles(tokens, self.k)
+        # 1. A snippet of a Nora citation (paper text shown with the Nora answer).
+        best_cit, best = None, 0.0
+        for cit, sg in self.snippets:
+            score = len(grams & sg) / min(len(grams), len(sg))
+            if score > best:
+                best_cit, best = cit, score
+        if best_cit is not None and best >= self.min_fraction:
+            return EvidenceSource(quote, "nora_citation", [_nora_ref(best_cit)], NORA, best)
+        # 2. Text of a system answer (ties prefer Nora, whose citations identify papers).
+        scores = {name: len(grams & sg) / len(grams) for name, sg in self.systems.items()}
+        if scores:
+            system = max(scores, key=lambda n: (scores[n], n == NORA, n))
+            if scores[system] >= self.min_fraction:
+                if system == NORA:
+                    return EvidenceSource(quote, "nora_answer", self._nora_markers(grams), NORA, scores[system])
+                return EvidenceSource(quote, "llm_answer", [], system, scores[system])
+        return EvidenceSource(quote, "paper_quote")
+
+    def _nora_markers(self, grams: Set[Tuple[str, ...]]) -> List[Reference]:
+        """Citations marked inside the matched span of the Nora answer and directly after it."""
+        k = self.k
+        best: Tuple[int, Optional[str], int, int] = (0, None, 0, 0)
+        for raw, tokens, spans in self.sections:
+            pos = [i for i in range(len(tokens) - k + 1) if tuple(tokens[i:i + k]) in grams]
+            if not pos:
                 continue
-            # Markers inside the quoted span and those directly following it (Nora cites at sentence end).
-            end = pos + len(body)
-            markers = _MARKER_RE.findall(flat[pos:end])
-            trailing = re.match(r"[\s.;,]*((?:\(\d+,\s[^()]*?\d{4}[a-z]?\)[\s;,]*)+)", flat[end:])
-            if trailing:
-                markers += _MARKER_RE.findall(trailing.group(1))
-            for marker in markers:
-                cit = sources.nora_citations.get(marker)
-                if cit is not None and cit.get("corpus_id"):
-                    refs.append(_nora_ref(cit))
-            break
-        return EvidenceSource(quote, "nora_answer", refs, NORA)
-    for system, text in sources.texts.items():
-        if system != NORA and probe in text:
-            return EvidenceSource(quote, "llm_answer", [], system)
-    return EvidenceSource(quote, "paper_quote")
+            # Densest run of matched positions (gaps <= k) = the copied span.
+            runs: List[List[int]] = [[pos[0]]]
+            for i in pos[1:]:
+                if i - runs[-1][-1] <= k:
+                    runs[-1].append(i)
+                else:
+                    runs.append([i])
+            run = max(runs, key=len)
+            if len(run) > best[0]:
+                best = (len(run), raw, spans[run[0]][0], spans[run[-1] + k - 1][1])
+        _, raw, start, end = best
+        if raw is None:
+            return []
+        inside = [m for m in _CITE_RE.finditer(raw) if m.start() < end and m.end() > start]
+        cites = [m.group() for m in inside]
+        trailing = _TRAILING_CITES_RE.match(raw, max([end] + [m.end() for m in inside]))
+        if trailing:
+            cites += _CITE_RE.findall(trailing.group(1))
+        refs: Dict[str, Reference] = {}
+        for cite in cites:
+            ref = self._cite_reference(cite)
+            if ref is not None:
+                refs.setdefault(ref.key, ref)
+        return list(refs.values())
+
+    def _cite_reference(self, cite: str) -> Optional[Reference]:
+        """Reference of one Nora marker (``corpusId`` of an inline tag, else the citation list entry)."""
+        if cite.startswith("<"):
+            m = _TAG_CORPUS_ID_RE.search(cite)
+            return Reference(s2_corpus_id=m.group(1), source="nora_citation") if m else None
+        cit = self.sources.nora_citations.get(cite) if self.sources is not None else None
+        return _nora_ref(cit) if cit is not None and cit.get("corpus_id") else None
+
+
+def classify_evidence(quote: str, sources: Optional[SourceAnswers], min_fraction: float = 0.5,
+                      min_words: int = 6) -> EvidenceSource:
+    """Classify one evidence quote (convenience wrapper around :class:`EvidenceClassifier`)."""
+    return EvidenceClassifier(sources, min_fraction=min_fraction, min_words=min_words).classify(quote)
 
 
 def cs_case_to_query(case: Mapping[str, Any], sources: Optional[SourceAnswers] = None,
                      aligner: Optional[PaperAligner] = None,
-                     attributor: Optional[QuoteAttributor] = None) -> Tuple[Query, CoverageStats, Counter]:
+                     attributor: Optional[QuoteAttributor] = None,
+                     unattributed: str = "item",
+                     classifier: Optional[EvidenceClassifier] = None) -> Tuple[Query, CoverageStats, Counter]:
     """Convert one ScholarQA-CS case; returns the query, its gold coverage and evidence-origin counts.
 
     Gold entries: corpus papers of the Nora citations behind evidence quotes
-    (aligned by S2 corpus id) and of the attributed paper quotes; unaligned
-    entries are the unmatched citations (``s2corpus:<id>``) and the
-    unattributed paper quotes (``quote:<hash>``). Quotes taken from LLM
-    answers are not gold sources.
+    (aligned by S2 corpus id) and of the attributed paper quotes (one entry
+    per paper); unaligned entries are the unmatched citations
+    (``s2corpus:<id>``) and the unattributed paper quotes, pooled per rubric
+    item (``unattributed="item"``) or one per quote (``"quote"``). Quotes
+    taken from LLM answers are not gold sources.
     """
+    if unattributed not in UNATTRIBUTED_MODES:
+        raise ValueError(f"unattributed must be one of {UNATTRIBUTED_MODES}, got {unattributed!r}")
+    classifier = classifier if classifier is not None else EvidenceClassifier(sources)
     cfg = case["metric_config"].get("config", {})
     props = cfg.get("other_properties") or []
     rubric, evidence = [], []
@@ -215,23 +316,33 @@ def cs_case_to_query(case: Mapping[str, Any], sources: Optional[SourceAnswers] =
     origins: Counter = Counter()
     refs: List[Reference] = []
     attributed: Dict[str, None] = {}
-    unattributed: Dict[str, None] = {}
+    unattributed_keys: Dict[str, None] = {}
     classified: List[EvidenceSource] = []
-    for quote in dict.fromkeys(q for ev in evidence for q in ev):
-        src = classify_evidence(quote, sources)
-        if src.origin == "paper_quote":
-            pid = attributor.attribution(quote)[0] if attributor is not None else None
-            if pid is not None:
-                src.origin = "paper_quote_attributed"
-                attributed[pid] = None
-            else:
-                unattributed[quote_key(quote)] = None
-        origins[src.origin] += 1
-        classified.append(src)
-        refs.extend(src.references)
+    seen: Set[str] = set()
+    for item_quotes in evidence:
+        item_key: Optional[str] = None
+        for quote in item_quotes:
+            qk = quote_key(quote)
+            if qk in seen:  # the same quote supporting several items
+                continue
+            seen.add(qk)
+            src = classifier.classify(quote)
+            if src.origin == "paper_quote":
+                pid, frac = attributor.attribution(quote) if attributor is not None else (None, 0.0)
+                if pid is not None:
+                    src.origin, src.score, src.gold_key = "paper_quote_attributed", frac, pid
+                    attributed[pid] = None
+                else:
+                    if unattributed == "quote" or item_key is None:
+                        item_key = qk
+                    src.gold_key = item_key
+                    unattributed_keys[item_key] = None
+            origins[src.origin] += 1
+            classified.append(src)
+            refs.extend(src.references)
     res = resolve_references(refs, aligner)
     gold = list(dict.fromkeys(list(res.gold_papers) + list(attributed)))
-    unaligned = list(res.unaligned_gold) + list(unattributed)
+    unaligned = list(res.unaligned_gold) + list(unattributed_keys)
     stats = CoverageStats(total=len(gold) + len(unaligned), aligned=len(gold), by_method=dict(res.stats.by_method))
     extra = len(gold) - len(res.gold_papers)
     if extra:
@@ -253,6 +364,7 @@ def cs_case_to_query(case: Mapping[str, Any], sources: Optional[SourceAnswers] =
             "evidence": evidence,
             "evidence_sources": [s.to_dict() for s in classified],
             "gold_source": "evidence_quotes",
+            "unattributed_pooling": unattributed,
         },
     )
     return query, stats, origins
@@ -283,13 +395,16 @@ def load_scholarqa_cs(
     attributor: Optional[QuoteAttributor] = None,
     dedupe: bool = True,
     limit: Optional[int] = None,
+    unattributed: str = "item",
+    min_fraction: float = 0.5,
 ) -> Tuple[List[Query], CoverageStats, Dict[str, int]]:
     """ScholarQA-CS queries (one per unique question when ``dedupe``).
 
     ``path`` is the ScholarQABench root or ``test_configs_snippets.json``;
     ``sources_path`` the root or ``output_snippets.jsonl`` (defaults to the
-    same root when present). Returns queries, gold coverage and counts of
-    evidence-quote origins.
+    same root when present). ``unattributed`` and ``min_fraction`` are
+    passed to :func:`cs_case_to_query` / :class:`EvidenceClassifier`.
+    Returns queries, gold coverage and counts of evidence-quote origins.
     """
     cases = read_cs_cases(path)
     if sources_path is None and Path(path).is_dir():
@@ -305,7 +420,9 @@ def load_scholarqa_cs(
     stats = CoverageStats()
     origins: Counter = Counter()
     for case, others in groups:
-        q, st, org = cs_case_to_query(case, sources.get(_norm(case["initial_prompt"])), aligner, attributor)
+        classifier = EvidenceClassifier(sources.get(_norm(case["initial_prompt"])), min_fraction=min_fraction)
+        q, st, org = cs_case_to_query(case, aligner=aligner, attributor=attributor, unattributed=unattributed,
+                                      classifier=classifier)
         q.metadata["alternate_cases"] = [{"case_id": o.get("case_id"), "annotator": o.get("annotator"),
                                           "agreement": o.get("agreement"), "metric_config": o["metric_config"]}
                                          for o in others]

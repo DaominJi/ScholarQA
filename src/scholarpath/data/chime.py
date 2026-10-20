@@ -63,7 +63,6 @@ paper's 2,146, which counts the studies of the annotated hierarchies only.
 from __future__ import annotations
 
 import csv
-import json
 import logging
 import re
 import sys
@@ -71,7 +70,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Set, Tuple, Union
 
-from scholarpath.data.corpus import Corpus, read_jsonl, save_queries, write_json
+from scholarpath.data.corpus import Corpus, save_queries, write_json
+from scholarpath.data.download import read_json_records
 from scholarpath.taxonomy.tree import Taxonomy
 from scholarpath.types import EVIDENCE, Paper, Query
 
@@ -311,13 +311,9 @@ def read_table(path: PathLike) -> List[Dict[str, Any]]:
         csv.field_size_limit(min(sys.maxsize, 2 ** 31 - 1))
         with open(path, newline="", encoding="utf-8") as f:
             return [dict(r) for r in csv.DictReader(f, delimiter="\t" if suffix == ".tsv" else ",")]
-    if suffix in (".jsonl", ".jsonl.gz"):
-        return list(read_jsonl(path))
-    if suffix == ".json":
-        data = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(data, dict):
-            data = data.get("data") or data.get("rows") or list(data.values())
-        return list(data)
+    if suffix in (".json", ".jsonl", ".json.gz", ".jsonl.gz"):
+        # JSON array or JSON Lines whatever the extension (`Dataset.to_json` writes JSON Lines to *.json).
+        return [dict(r) for r in read_json_records(path)]
     if suffix == ".parquet":
         try:
             import pandas as pd

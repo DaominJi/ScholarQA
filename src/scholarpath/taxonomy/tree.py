@@ -243,6 +243,34 @@ class Taxonomy:
     def bfs(self) -> List[str]:
         return list(self.descendants(self.root_id, include_self=True))
 
+    def preorder(self, node_id: Optional[str] = None) -> List[str]:
+        """Depth-first pre-order traversal (children in insertion order)."""
+        out: List[str] = []
+        stack = [node_id or self.root_id]
+        while stack:
+            nid = stack.pop()
+            out.append(nid)
+            stack.extend(reversed(self.nodes[nid].children))
+        return out
+
+    def direct_papers(self, node_id: str) -> Set[str]:
+        """Papers attached directly at ``node_id`` (in its extent but in no child)."""
+        n = self.nodes[node_id]
+        if not n.children:
+            return set(n.papers)
+        below: Set[str] = set()
+        for c in n.children:
+            below |= self.nodes[c].papers
+        return n.papers - below
+
+    def attachments(self) -> Dict[str, List[str]]:
+        """paper -> nodes where it is directly attached (pre-order)."""
+        out: Dict[str, List[str]] = {}
+        for nid in self.preorder():
+            for p in sorted(self.direct_papers(nid)):
+                out.setdefault(p, []).append(nid)
+        return out
+
     def distance(self, a: str, b: str) -> int:
         """Number of edges on the tree path between ``a`` and ``b``."""
         pa = self.ancestors(a, include_self=True)

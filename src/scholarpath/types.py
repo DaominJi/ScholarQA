@@ -103,7 +103,8 @@ QUERY_KINDS = (EVIDENCE, HYPOTHESIS_DISCOVERY, HYPOTHESIS_ASSESSMENT)
 class RubricItem:
     text: str
     weight: float = 1.0
-    kind: str = "content"  # content | citation | ...
+    kind: str = "content"  # content | citation | ... (ResearchQA: comma-joined official type list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

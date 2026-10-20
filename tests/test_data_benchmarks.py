@@ -52,10 +52,12 @@ def test_researchqa_queries_rubrics_and_gold(aligner):
     assert q.gold_papers == ["2101.00001", "2101.00002"]
     assert q.unaligned_gold == ["doi:10.1145/5555.6666", "title:access path selection in a relational database management system"]
     assert q.num_gold == 4
-    # citation_metadata missing -> title parsed from the rubric text (balanced parentheses) -> fuzzy containment
-    assert queries[1].gold_papers == ["math/0601001"] and queries[1].metadata["date"] == "2019-11-20"
+    # citation_metadata missing -> title parsed from the rubric text (balanced parentheses). It only *contains*
+    # the corpus title "Convex Relaxations of Scheduling Problems", so it stays unaligned (App. C.2 rule).
+    assert queries[1].gold_papers == [] and queries[1].metadata["date"] == "2019-11-20"
+    assert queries[1].unaligned_gold == ["title:convex relaxations of scheduling problems an lp view"]
     assert queries[2].num_gold == 0 and queries[2].metadata["date"] == "2022-01-01"
-    assert (cov.total, cov.aligned) == (5, 3)
+    assert (cov.total, cov.aligned) == (5, 2)
     assert researchqa.rubric_item_count(queries) == 10
 
 
@@ -103,6 +105,66 @@ def test_scholarqa_cs_dedup_rubric_and_evidence_origins(subfields, aligner):
     assert origins["llm_answer"] == 1 and cov.total == 6 and cov.aligned == 2
     configs = scholarqabench.cs_test_configs(queries, include_alternates=True)
     assert len(configs) == 3 and configs[0]["initial_prompt"] == q1.text
+
+
+def _cs_sources() -> scholarqabench.SourceAnswers:
+    nora = ("- Learned estimators replace histograms in many systems (1, Kipf et al., 2019).\n\n"
+            "- Sampling-based estimators remain strong baselines for correlated data <Paper corpusId=\"777\" "
+            "paperTitle=\"(2, Leis et al., 2015)\" isShortName></Paper>.\n\n"
+            "- Nora states something without any citation at all in this sentence here.")
+    return scholarqabench.SourceAnswers(
+        texts={
+            "GPT": "## Overview\n### Emphasizing Foundational Concepts\nOne of the key thoughts in teaching "
+                   "computer science is to start from the foundations before moving to applications.",
+            "Nora": nora,
+        },
+        nora_sections=[nora],
+        nora_citations={"(1, Kipf et al., 2019)": {"id": "(1, Kipf et al., 2019)", "corpus_id": 53221591,
+                                                  "snippets": ["Query-driven estimators learn a regression from "
+                                                               "featurized predicates to observed cardinalities."]},
+                        "(2, Leis et al., 2015)": {"id": "(2, Leis et al., 2015)", "corpus_id": 777, "snippets": []}},
+    )
+
+
+def test_cs_evidence_classifier_shingles():
+    clf = scholarqabench.EvidenceClassifier(_cs_sources())
+    # Heading glued to the paragraph, quote starting mid-heading: still recognised as GPT text (regression).
+    glued = clf.classify("Emphasizing Foundational ConceptsOne of the key thoughts in teaching computer science "
+                         "is to start from the foundations")
+    assert (glued.origin, glued.system) == ("llm_answer", "GPT") and glued.score >= 0.5
+    # A quote ending right before a marker gets that citation (the closing parenthesis lies outside the span).
+    kipf = clf.classify("Learned estimators replace histograms in many systems")
+    assert kipf.origin == "nora_answer" and [r.s2_corpus_id for r in kipf.references] == ["53221591"]
+    # Newer Nora answers cite with inline <Paper corpusId=...> tags.
+    leis = clf.classify("Sampling-based estimators remain strong baselines for correlated data")
+    assert leis.origin == "nora_answer" and [r.s2_corpus_id for r in leis.references] == ["777"]
+    uncited = clf.classify("Nora states something without any citation at all in this sentence")
+    assert uncited.origin == "nora_answer" and uncited.references == []
+    snippet = clf.classify("estimators learn a regression from featurized predicates to observed cardinalities")
+    assert snippet.origin == "nora_citation" and snippet.references[0].s2_corpus_id == "53221591"
+    paper = clf.classify("A completely different sentence copied from some paper that no system answer contains.")
+    assert paper.origin == "paper_quote"
+    assert scholarqabench.classify_evidence(glued.quote, _cs_sources()).origin == "llm_answer"
+
+
+def test_cs_unattributed_quotes_pooled_per_rubric_item():
+    case = {"case_id": "c1", "initial_prompt": "Q?", "metric_config": {"name": "m", "config": {"other_properties": [
+        {"name": "most_important_item_0", "criterion": "A", "weight": 0.3,
+         "evidence": ["First verbatim excerpt of an absent paper about learned indexes and their training cost.",
+                      "Second verbatim excerpt of the same absent paper describing the evaluation on real data."]},
+        {"name": "nice_to_have_item_0", "criterion": "B", "weight": 0.3,
+         "evidence": ["Third excerpt from yet another absent paper that discusses cardinality estimation errors.",
+                      "First verbatim excerpt of an absent paper about learned indexes and their training cost."]},
+    ]}}}
+    q_item, st_item, org = scholarqabench.cs_case_to_query(case)
+    assert len(q_item.unaligned_gold) == 2 and st_item.total == 2  # one entry per rubric item
+    assert org == {"paper_quote": 3}  # the repeated quote is classified once
+    keys = [e["gold_key"] for e in q_item.metadata["evidence_sources"]]
+    assert keys[0] == keys[1] != keys[2] and q_item.metadata["unattributed_pooling"] == "item"
+    q_quote, st_quote, _ = scholarqabench.cs_case_to_query(case, unattributed="quote")
+    assert len(q_quote.unaligned_gold) == 3 and st_quote.total == 3
+    with pytest.raises(ValueError):
+        scholarqabench.cs_case_to_query(case, unattributed="paper")
 
 
 def test_scholarqa_cs_without_sources_or_dedupe():
@@ -336,10 +398,43 @@ def test_prepare_benchmarks_script(tmp_path):
     assert rc == 0
     report = json.loads((out / "coverage_report.json").read_text())
     assert set(report) == {"researchqa", "scholarqabench", "taxobench", "chime"}
-    assert report["researchqa"]["coverage"]["aligned"] == 3
+    assert report["researchqa"]["coverage"]["aligned"] == 2
+    assert "fuzzy_title" not in report["researchqa"]["alignment"]["methods"]  # App. C.2 rule by default
     assert report["scholarqabench"]["queries"] == {"cs": 2, "multi": 2}
     assert report["taxobench"]["coverage"]["coverage"] == 1.0 and report["chime"]["corrected"]
     for rel in ("researchqa/queries.jsonl", "scholarqabench/cs.jsonl", "scholarqabench/multi.jsonl",
                 "taxobench/gold_taxonomy.json", "taxobench/papers.jsonl.gz", "chime/queries.jsonl",
                 "chime/papers.jsonl.gz", "chime/gold/CD900001.json"):
         assert (out / rel).exists(), rel
+
+    # A later partial run updates its own entry and keeps the others.
+    assert prepare_benchmarks.main(["--raw", str(FIX), "--out", str(out), "--only", "taxobench", "--limit", "1"]) == 0
+    report2 = json.loads((out / "coverage_report.json").read_text())
+    assert set(report2) == set(report) and report2["taxobench"]["surveys"] == 1
+    assert report2["researchqa"] == report["researchqa"]
+    # Without the alignment corpus, ResearchQA / ScholarQABench are refused unless explicitly allowed.
+    missing = ["--raw", str(FIX), "--out", str(tmp_path / "p2"), "--only", "researchqa",
+               "--corpus", str(tmp_path / "missing.jsonl.gz")]
+    assert prepare_benchmarks.main(missing) == 2 and not (tmp_path / "p2" / "researchqa").exists()
+    assert prepare_benchmarks.main(missing + ["--allow-unaligned"]) == 0
+    report3 = json.loads((tmp_path / "p2" / "coverage_report.json").read_text())
+    assert report3["researchqa"]["coverage"]["aligned"] == 0 and report3["researchqa"]["alignment"]["corpus"] is None
+
+
+def test_json_lines_exports_with_json_extension(tmp_path):
+    """`Dataset.to_json` (the documented manual fallback) writes JSON Lines, also to *.json files."""
+    records = json.loads((FIX / "researchqa" / "test_mini.json").read_text(encoding="utf-8"))
+    export = tmp_path / "researchqa" / "test_mini.json"
+    export.parent.mkdir()
+    export.write_text("".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
+    assert download.read_json_records(export) == records
+    assert [r["id"] for r in researchqa.read_researchqa(export)] == [r["id"] for r in records]
+    assert len(researchqa.read_researchqa(tmp_path / "researchqa")) == len(records)  # directory discovery
+    table = tmp_path / "chime-claim-category.json"
+    table.write_text('{"review_pmid": "1", "agg_label": 1}\n{"review_pmid": "2", "agg_label": 0}\n')
+    assert [r["review_pmid"] for r in chime.read_table(table)] == ["1", "2"]
+    (tmp_path / "wrapped.json").write_text(json.dumps({"data": [{"a": 1}]}))
+    assert download.read_json_records(tmp_path / "wrapped.json") == [{"a": 1}]
+    (tmp_path / "bad.json").write_text("{not json")
+    with pytest.raises(ValueError):
+        download.read_json_records(tmp_path / "bad.json")

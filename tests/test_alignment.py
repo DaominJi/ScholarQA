@@ -19,7 +19,12 @@ from scholarpath.data.alignment import (
     parse_s2_id,
     resolve_references,
     split_arxiv_version,
+    surname,
     title_key,
+    titles_compatible,
+    version_tokens,
+    word_spans,
+    words,
 )
 from scholarpath.data.corpus import Corpus, write_jsonl
 from scholarpath.data.synthetic import make_synthetic_benchmark
@@ -61,6 +66,22 @@ def test_other_identifier_parsers():
     assert parse_doi("https://doi.org/10.1103/PhysRevD.76.013009.") == "10.1103/physrevd.76.013009"
     assert parse_doi("doi:10.1145/1234.5678)") == "10.1145/1234.5678"
     assert parse_doi("no doi here") is None
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("https://link.springer.com/content/pdf/10.1007/s10994-020-05000-1.pdf", "10.1007/s10994-020-05000-1"),
+    ("https://www.biorxiv.org/content/10.1101/2020.01.01.123456v1.full", "10.1101/2020.01.01.123456"),
+    ("https://www.medrxiv.org/content/10.1101/2021.02.03.21251000v2.full.pdf", "10.1101/2021.02.03.21251000"),
+    ("https://onlinelibrary.wiley.com/doi/full/10.1002/anie.201912345?af=R", "10.1002/anie.201912345"),
+    ("https://www.tandfonline.com/doi/full/10.1080/12345678.2019.1234567#abstract", "10.1080/12345678.2019.1234567"),
+    ("https://www.frontiersin.org/articles/10.3389/fnins.2020.00001/full", "10.3389/fnins.2020.00001"),
+    ("https://journals.plos.org/plosone/article?id=10.1371/journal.pone.0123456&type=printable",
+     "10.1371/journal.pone.0123456"),
+    ("https://doi.org/10.1000%2Fabc", "10.1000/abc"),
+    ("10.1145/3318464.3389700", "10.1145/3318464.3389700"),
+])
+def test_parse_doi_strips_url_parts(text, expected):
+    assert parse_doi(text) == expected
     assert parse_s2_id(f"https://www.semanticscholar.org/paper/{SHA}") == SHA
     assert parse_s2_id(f"https://www.semanticscholar.org/paper/Some-Title/{SHA}") == SHA
     assert parse_s2_id(SHA.upper()) == SHA
@@ -86,12 +107,31 @@ def test_reference_parses_urls_and_keys():
 def test_title_keys_and_fuzzy_score():
     assert title_key("Fast $k$-means with $\\alpha$-divergences") == "fast k means with alpha divergences"
     assert fuzzy_title_score("graph neural networks", "graph neural networks") == 1.0
-    # containment with enough tokens -> 1.0; short titles never match by containment
-    assert fuzzy_title_score("convex relaxations of scheduling problems",
-                             "convex relaxations of scheduling problems an lp view") == 1.0
-    assert fuzzy_title_score("attention", "attention is all you need") < 0.92
+    # no containment shortcut: a title contained in a longer one is just a ratio
+    assert fuzzy_title_score("attention is all you need", "attention is all you need in speech separation") < 0.92
     assert 0.92 <= fuzzy_title_score("learned cardinality estimation for join queries",
                                      "learned cardinality estimaton for join queries") < 1.0
+    assert version_tokens("qwen2 technical report") == {"qwen2"}
+    assert version_tokens("textbooks are all you need ii phi 1 5 technical report") == {"ii", "1", "5"}
+    assert version_tokens("x ray imaging of a v shaped part i") == set()
+    assert titles_compatible("learned cardinality estimaton for join queries",
+                             "learned cardinality estimation for join queries")
+    assert titles_compatible("multi task learning", "multitask learning")
+    assert titles_compatible("convex optimisation methods", "convex optimization methods")
+    assert not titles_compatible("non autoregressive neural machine translation",
+                                 "semi autoregressive neural machine translation")
+    assert not titles_compatible("qwen2 technical report", "qwen technical report")
+    assert [surname(n) for n in ("Smith, John", "John Smith", "J. Smith", "Kroiß", None)] == \
+        ["smith", "smith", "smith", "kroi", None]
+
+
+def test_words_split_glued_markdown_and_track_spans():
+    text = "### Emphasizing Foundational ConceptsOne of the key ideas: ManyTypes4Py, café"
+    assert words(text) == ["emphasizing", "foundational", "concepts", "one", "of", "the", "key", "ideas",
+                           "many", "types4py", "cafe"]
+    tokens, spans = word_spans(text)
+    assert tokens == words(text)
+    assert [text[a:b] for a, b in spans][2:4] == ["Concepts", "One"] and text[slice(*spans[-1])] == "café"
 
 
 @pytest.fixture()
@@ -110,35 +150,60 @@ def corpus():
 
 
 def test_aligner_cascade(corpus):
-    al = PaperAligner(corpus)
+    al = PaperAligner(corpus)  # the paper's rule: identifiers and exact normalized title only
     cases = [
         (Reference(url="https://arxiv.org/pdf/2101.00001v2"), "2101.00001", "arxiv"),
         (Reference(arxiv_id="math/0601001v3"), "math/0601001", "arxiv"),
         (Reference(url=f"https://www.semanticscholar.org/paper/{SHA}"), "2101.00002", "s2"),
         (Reference(s2_corpus_id=53221591), "2101.00002", "s2_corpus"),
         (Reference(doi="10.1145/1234567.1234568"), "2101.00001", "doi"),
+        (Reference(url="https://dl.acm.org/doi/pdf/10.1145/1234567.1234568?download=true"), "2101.00001", "doi"),
         (Reference(title="index tuning with reinforcement-learning"), "2101.00002", "title"),
         (Reference(title="Fast k-means clustering"), "1801.00003", "title"),  # LaTeX math unwrapped
-        (Reference(title="Learned cardinality estimaton for join queries"), "2101.00001", "fuzzy_title"),
-        (Reference(title="Convex Relaxations of Scheduling Problems (an LP view)"), "math/0601001", "fuzzy_title"),
+        (Reference(title="Learned cardinality estimaton for join queries"), None, None),  # typo: no fuzzy by default
+        (Reference(title="Convex Relaxations of Scheduling Problems (an LP view)"), None, None),
         (Reference(title="Access Path Selection in a Relational Database Management System"), None, None),
     ]
     for ref, pid, method in cases:
         m = al.align(ref)
         assert (m.paper_id, m.method) == (pid, method), ref
+    assert al.describe()["methods"] == ["arxiv", "s2", "s2_corpus", "doi", "pmid", "title"]
 
 
-def test_aligner_ambiguity_year_and_options(corpus):
-    al = PaperAligner(corpus)
-    m = al.align(Reference(title="A survey", year=2020))
-    assert m.paper_id == "2001.00005" and m.ambiguous
-    m = al.align(Reference(title="A survey"))
-    assert m.paper_id == "1901.00004" and m.ambiguous  # deterministic: smallest id
-    strict = PaperAligner(corpus, year_tolerance=1)
-    assert strict.align(Reference(title="Index Tuning with Reinforcement Learning", year=2010)).paper_id is None
-    nofuzzy = PaperAligner(corpus, fuzzy=False)
-    assert nofuzzy.align(Reference(title="Learned cardinality estimaton for join queries")).paper_id is None
-    assert len(al) == len(corpus)
+def test_opt_in_fuzzy_stage(corpus):
+    al = PaperAligner(corpus, fuzzy=True)
+    assert "fuzzy_title" in al.describe()["methods"]
+    m = al.align(Reference(title="Learned cardinality estimaton for join queries"))
+    assert (m.paper_id, m.method) == ("2101.00001", "fuzzy_title") and 0.92 <= m.score < 1.0
+    # containment never aligns: the longer title is a different (absent) paper
+    assert al.align(Reference(title="Convex Relaxations of Scheduling Problems (an LP view)")).paper_id is None
+    # year and first-author disagreement reject a fuzzy match (exact titles are unaffected)
+    assert al.align(Reference(title="Learned cardinality estimaton for join queries", year=2010)).paper_id is None
+    assert al.align(Reference(title="Learned cardinality estimaton for join queries", year=2022)).paper_id == "2101.00001"
+    authored = PaperAligner([Paper("p1", "Learned Cardinality Estimation for Join Queries", authors=["Alice Smith"])],
+                            fuzzy=True)
+    typo = "Learned cardinality estimaton for join queries"
+    assert authored.align(Reference(title=typo, first_author="Smith, A.")).paper_id == "p1"
+    assert authored.align(Reference(title=typo, first_author="Bob Jones")).paper_id is None
+
+
+def test_fuzzy_never_aligns_absent_papers_to_versions_or_extensions():
+    """Regression: citations of papers missing from the corpus must stay unaligned (App. C.2 denominator)."""
+    present = ["Qwen Technical Report", "Textbooks Are All You Need II: phi-1.5 technical report",
+               "Baichuan-Omni-1.5 Technical Report", "Attention Is All You Need in Speech Separation",
+               "Neural networks for time series", "CMMLU: Measuring massive multitask language understanding in Chinese",
+               "Llama 2: Open Foundation and Fine-Tuned Chat Models", "Semi-Autoregressive Neural Machine Translation"]
+    corpus = Corpus([Paper(f"p{i}", t) for i, t in enumerate(present)])
+    absent = ["Qwen2 Technical Report", "Textbooks Are All You Need", "Baichuan-Omni Technical Report",
+              "Attention is all you need", "Neural networks for time series forecasting",
+              "Measuring Massive Multitask Language Understanding", "Llama 3: Open Foundation and Fine-Tuned Chat Models",
+              "Non-Autoregressive Neural Machine Translation"]
+    for fuzzy in (False, True):
+        al = PaperAligner(corpus, fuzzy=fuzzy)
+        matches, stats = al.align_many(Reference(title=t) for t in absent)
+        assert [m.paper_id for m in matches] == [None] * len(absent), fuzzy
+        assert stats.coverage == 0.0
+        assert al.align(Reference(title="Qwen technical report.")).paper_id == "p0"  # exact normalized title
 
 
 def test_resolve_dedupes_and_counts_coverage(corpus):
@@ -173,7 +238,7 @@ def test_coverage_stats_merge_and_format():
 
 def test_aligner_on_synthetic_corpus_scales_with_blocking():
     bench = make_synthetic_benchmark(n_papers=200, seed=3)
-    al = PaperAligner(bench.corpus)
+    al = PaperAligner(bench.corpus, fuzzy=True)
     papers = list(bench.corpus)[:40]
     refs = [Reference(title=p.title.lower().replace(" and ", " & ")) for p in papers]
     matches, stats = al.align_many(refs)

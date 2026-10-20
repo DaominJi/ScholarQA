@@ -34,10 +34,10 @@ from scholarpath.data.arxiv import (
     write_arxiv_corpora,
 )
 from scholarpath.data.chime import ChimeData, build_chime, parse_generated_hierarchy
-from scholarpath.data.download import DATASETS, download_dataset
+from scholarpath.data.download import DATASETS, download_dataset, read_json_records
 from scholarpath.data.fulltext import FulltextExtractor, latex_to_sections, make_sources, s2orc_sections, sections_to_chunks
 from scholarpath.data.researchqa import load_researchqa, researchqa_to_queries
-from scholarpath.data.scholarqabench import load_scholarqa_cs, load_scholarqa_multi
+from scholarpath.data.scholarqabench import EvidenceClassifier, load_scholarqa_cs, load_scholarqa_multi
 from scholarpath.data.taxobench import TaxoBenchData, load_taxobench, merge_gold_taxonomies
 
 __all__ = [
@@ -53,7 +53,7 @@ __all__ = [
     "FulltextExtractor", "latex_to_sections", "make_sources", "s2orc_sections", "sections_to_chunks",
     # benchmarks
     "ChimeData", "build_chime", "parse_generated_hierarchy", "load_researchqa", "researchqa_to_queries",
-    "load_scholarqa_cs", "load_scholarqa_multi", "TaxoBenchData", "load_taxobench", "merge_gold_taxonomies",
+    "EvidenceClassifier", "load_scholarqa_cs", "load_scholarqa_multi", "TaxoBenchData", "load_taxobench", "merge_gold_taxonomies",
     # downloads
-    "DATASETS", "download_dataset",
+    "DATASETS", "download_dataset", "read_json_records",
 ]

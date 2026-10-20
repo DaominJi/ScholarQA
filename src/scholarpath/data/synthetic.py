@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import random
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Sequence, Tuple
 
 from scholarpath.data.corpus import Corpus
 from scholarpath.taxonomy.tree import Taxonomy

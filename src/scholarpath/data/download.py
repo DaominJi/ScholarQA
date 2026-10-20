@@ -22,11 +22,13 @@ next run unless ``force=True``. Every downloader only needs the standard
 library (git, the kaggle CLI or ``kagglehub``, and ``huggingface_hub`` are
 used when available); on failure a :class:`DownloadError` explains how to
 fetch the files manually -- every loader in :mod:`scholarpath.data` also
-accepts pre-downloaded local files.
+accepts pre-downloaded local files (:func:`read_json_records` reads the JSON
+or JSON Lines exports written by the manual instructions).
 """
 
 from __future__ import annotations
 
+import gzip
 import json
 import logging
 import os
@@ -54,6 +56,44 @@ S2_API = "https://api.semanticscholar.org/datasets/v1"
 
 class DownloadError(RuntimeError):
     """A download failed; the message says how to obtain the data manually."""
+
+
+def read_json_records(path: PathLike) -> List[Any]:
+    """Records of a JSON document or a JSON Lines file, whatever its extension (``.gz`` accepted).
+
+    ``datasets.Dataset.to_json`` -- the manual fallback for Hugging Face
+    downloads -- writes JSON Lines by default, even to ``*.json`` files, so
+    the format is sniffed rather than taken from the extension. A JSON array
+    is returned as is; an object holding the records under ``"data"`` or
+    ``"rows"`` is unwrapped, an object of objects (records keyed by id)
+    yields its values, and any other object is a single record.
+    """
+    path = Path(path)
+    opener = gzip.open if path.suffix == ".gz" else open
+    with opener(path, "rt", encoding="utf-8") as f:  # type: ignore[operator]
+        text = f.read()
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as err:
+        if "Extra data" not in err.msg:
+            raise ValueError(f"{path}: invalid JSON ({err})") from err
+        records = []
+        for lineno, line in enumerate(text.splitlines(), 1):
+            if line.strip():
+                try:
+                    records.append(json.loads(line))
+                except json.JSONDecodeError as line_err:
+                    raise ValueError(f"{path}:{lineno}: invalid JSON Lines record ({line_err})") from line_err
+        return records
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        for key in ("data", "rows"):
+            if isinstance(data.get(key), list):
+                return data[key]
+        if data and all(isinstance(v, dict) for v in data.values()):
+            return list(data.values())
+    return [data]
 
 
 # ---------------------------------------------------------------------------
@@ -178,7 +218,7 @@ DATASETS: Dict[str, DatasetSpec] = {
         "researchqa", "hf", "ResearchQA test_mini split (776 queries, 5,824 rubric items)", "researchqa",
         hf_repos=("realliyifei/ResearchQA",), hf_files=("data/test_mini-00000-of-00001.parquet",),
         manual=("python -c \"from datasets import load_dataset; load_dataset('realliyifei/ResearchQA', "
-                "split='test_mini').to_json('data/raw/researchqa/test_mini.json', force_ascii=False)\"  -- or "
+                "split='test_mini').to_json('data/raw/researchqa/test_mini.jsonl', force_ascii=False)\"  -- or "
                 "download data/test_mini-00000-of-00001.parquet from https://huggingface.co/datasets/realliyifei/ResearchQA"),
     ),
     "researchqa_repo": DatasetSpec(

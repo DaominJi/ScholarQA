@@ -18,7 +18,6 @@ Full-text chunks may also live in a separate ``chunks.jsonl(.gz)`` file
 from __future__ import annotations
 
 import gzip
-import io
 import json
 import random
 from pathlib import Path

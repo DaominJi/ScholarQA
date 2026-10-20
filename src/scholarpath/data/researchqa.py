@@ -43,7 +43,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 from scholarpath.data.alignment import CoverageStats, PaperAligner, Reference, resolve_references
-from scholarpath.data.corpus import read_jsonl
+from scholarpath.data.download import read_json_records
 from scholarpath.types import EVIDENCE, Query, RubricItem
 
 log = logging.getLogger(__name__)
@@ -74,10 +74,11 @@ def _to_plain(value: Any) -> Any:
 
 
 def read_researchqa(path: PathLike) -> List[Dict[str, Any]]:
-    """Read ResearchQA records from a JSON array, JSONL, parquet file, or a directory holding one.
+    """Read ResearchQA records from a parquet file, a JSON array / JSON Lines file, or a directory holding one.
 
-    A directory is searched for ``test_mini`` files first
-    (``data/test_mini-*.parquet``, ``test_mini.json[l]``).
+    A directory is searched for ``test_mini`` files (``data/test_mini-*.parquet``,
+    ``test_mini.json[l]``). JSON files may hold JSON Lines (the default output
+    of ``datasets.Dataset.to_json``) -- see :func:`~scholarpath.data.download.read_json_records`.
     """
     path = Path(path)
     if path.is_dir():
@@ -94,11 +95,9 @@ def read_researchqa(path: PathLike) -> List[Dict[str, Any]]:
             raise ImportError("Reading the ResearchQA parquet needs pandas + pyarrow (pip install pandas pyarrow), "
                               "or export the split to JSON") from err
         records = [_to_plain(r) for r in pd.read_parquet(path).to_dict(orient="records")]
-    elif suffix == ".jsonl" or path.name.endswith(".jsonl.gz"):
-        records = list(read_jsonl(path))
     else:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        records = data if isinstance(data, list) else data.get("data", [])
+        # JSON array or JSON Lines, whatever the extension: `Dataset.to_json` writes JSON Lines to *.json.
+        records = [_to_plain(r) for r in read_json_records(path)]
     for r in records:
         if "query" not in r or "rubric" not in r:
             raise ValueError(f"Not a ResearchQA record: {str(r)[:200]}")
@@ -257,9 +256,7 @@ def load_researchqa(path: PathLike, aligner: Optional[PaperAligner] = None, limi
     ``{"id": ..., "references": [{title, url, arxiv_id, doi, ...}, ...]}`` section citations."""
     extra: Dict[str, List[Dict[str, Any]]] = {}
     if extra_gold_path is not None:
-        p = Path(extra_gold_path)
-        rows = list(read_jsonl(p)) if p.suffix in (".jsonl", ".gz") else json.loads(p.read_text(encoding="utf-8"))
-        for r in rows:
+        for r in read_json_records(extra_gold_path):
             extra.setdefault(str(r["id"]), []).extend(r.get("references") or [])
     return researchqa_to_queries(read_researchqa(path), aligner, extra or None, limit)
 

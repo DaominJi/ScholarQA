@@ -29,14 +29,21 @@ Conversion to :class:`~scholarpath.types.Paper`:
 * ``date`` = creation date of the first version (RFC 2822 -> ISO), ``year``
   its year; ``doi`` the first DOI listed.
 
-**Withdrawn papers** (:func:`is_withdrawn`): arXiv replaces a withdrawn
-paper by a new version whose *comments* state the withdrawal (e.g. "This
-paper has been withdrawn by the author", "Withdrawn due to an error") and
-whose *abstract* is often replaced by the same notice. A record is
-withdrawn when its comments match :data:`WITHDRAWN_COMMENT_RE` or its
-abstract *starts with* a withdrawal notice (:data:`WITHDRAWN_ABSTRACT_RE`).
-Abstracts merely mentioning the word (e.g. "drugs withdrawn from the
-market") are not affected.
+**Withdrawn papers** (:func:`is_withdrawn`; the paper does not define the
+rule): arXiv replaces a withdrawn paper by a new version whose *comments*
+state the withdrawal ("This paper has been withdrawn by the author due to a
+crucial error", "Withdrawn", "Withdrawn due to ...") and whose *abstract* is
+often replaced by the same notice. A record is withdrawn when its comments
+or its abstract contain a notice whose subject is the paper itself
+(:data:`WITHDRAWN_NOTICE_RE`: "this/the paper|article|submission|... has
+been|is|was withdrawn", "withdrawn by the author(s)/arXiv admin", "the
+authors have withdrawn this paper", "we withdraw this paper"), or *start*
+with a bare withdrawal notice (:data:`WITHDRAWN_LEADING_RE`: "Withdrawn",
+"Withdrawn." / "Withdrawn: ...", "Withdrawn by/due to/because ...").
+Partial or unrelated withdrawals are not affected: "an incorrect claim in
+Section 4 was withdrawn", "Theorem 3 withdrawn due to a gap", "Withdrawn
+from ICML 2020; accepted at NeurIPS 2020", "treatment was withdrawn after 3
+weeks", "drugs withdrawn from the market".
 
 All builders stream the snapshot once and keep only what they return in
 memory; :func:`write_arxiv_corpora` streams the arXiv-Subfields corpus
@@ -57,7 +64,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import IO, Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import IO, Any, Dict, Iterator, List, Mapping, Optional, Sequence, Set, Tuple, Union
 
 from scholarpath.data.alignment import parse_arxiv_id, parse_doi, split_arxiv_version
 from scholarpath.data.corpus import Corpus
@@ -88,21 +95,24 @@ PAPER_SUBFIELDS_SIZE = 148_400
 KAGGLE_DATASET = "Cornell-University/arxiv"
 SNAPSHOT_NAME = "arxiv-metadata-oai-snapshot.json"
 
-WITHDRAWN_COMMENT_RE = re.compile(
-    r"(?:\b(?:has|have)\s+been\s+withdrawn\b|\b(?:is|was|being)\s+withdrawn\b|\bwithdrawn\s+by\b"
-    r"|^\W*withdrawn\b|\b(?:paper|article|submission|manuscript|preprint)\s+(?:is\s+)?withdrawn\b"
-    r"|\bwithdrawn\s+(?:due|because|for|as|since|pending)\b|\bwithdrawal\s+(?:of\s+(?:this|the)\s+)?"
-    r"(?:paper|article|submission|manuscript|preprint)\b|\bwithdraw(?:n|s)?\s+this\s+(?:paper|article|submission))",
+_PAPER_NOUN = r"(?:paper|article|submission|manuscript|preprint|work|version|note|report|e-?print)"
+_WITHDRAW_VERB = r"(?:withdraw(?:s|n)?|(?:would\s+like|wish(?:es)?|wants?|(?:has|have)\s+decided|decided)\s+to\s+withdraw)"
+#: Withdrawal notices whose subject is the paper itself (matched anywhere in comments or abstract).
+WITHDRAWN_NOTICE_RE = re.compile(
+    r"\b(?:this|the|our|my)\s+" + _PAPER_NOUN + r"\s+(?:has\s+been|have\s+been|is|was|is\s+being|will\s+be)\s+"
+    r"(?:permanently\s+|formally\s+|now\s+)?withdrawn\b"
+    r"|\bwithdrawn\s+by\s+(?:the\s+)?(?:authors?|submitter|arxiv(?:\s+admin(?:istrators?|istration)?)?|admins?)\b"
+    r"|\b(?:the\s+)?(?:authors?|submitter)\s+(?:(?:has|have)\s+withdrawn|" + _WITHDRAW_VERB + r")\s+"
+    r"(?:this|the|their|his|her|our)\s+" + _PAPER_NOUN + r"\b"
+    r"|\b(?:we|i)\s+(?:(?:have\s+)?withdrawn|" + _WITHDRAW_VERB + r")\s+(?:this|the|our|my)\s+" + _PAPER_NOUN + r"\b"
+    r"|^\W*(?:paper|article|submission|manuscript|preprint)\s+(?:has\s+been\s+|is\s+)?withdrawn\b",
     re.IGNORECASE,
 )
-WITHDRAWN_ABSTRACT_RE = re.compile(
-    r"^\W*(?:withdrawn\b|this\s+(?:paper|article|manuscript|submission|preprint|work|version)\s+"
-    r"(?:has\s+been|have\s+been|is|was|is\s+being)\s+(?:permanently\s+)?withdrawn\b|"
-    r"(?:paper|article|submission)\s+(?:has\s+been\s+)?withdrawn\b|the\s+authors?\s+(?:has|have)\s+withdrawn\b)",
+#: A bare withdrawal notice at the start of the comments or abstract ("Withdrawn", "Withdrawn due to ...").
+WITHDRAWN_LEADING_RE = re.compile(
+    r"^\W*withdrawn(?:\W*$|\s*[.:;,(\-]|\s+(?:by|due|because|since|as|for|pending|owing)\b)",
     re.IGNORECASE,
 )
-
-
 # ---------------------------------------------------------------------------
 # Reading the snapshot
 # ---------------------------------------------------------------------------
@@ -169,11 +179,10 @@ def normalize_whitespace(text: Optional[str]) -> str:
 
 def is_withdrawn(record: Mapping[str, Any]) -> bool:
     """Whether a snapshot record is a withdrawn paper (see module docstring for the rule)."""
-    comments = normalize_whitespace(record.get("comments"))
-    if comments and WITHDRAWN_COMMENT_RE.search(comments):
-        return True
-    abstract = normalize_whitespace(record.get("abstract"))
-    return bool(abstract and WITHDRAWN_ABSTRACT_RE.match(abstract))
+    for text in (normalize_whitespace(record.get("comments")), normalize_whitespace(record.get("abstract"))):
+        if text and (WITHDRAWN_LEADING_RE.match(text) or WITHDRAWN_NOTICE_RE.search(text)):
+            return True
+    return False
 
 
 def first_version_date(record: Mapping[str, Any]) -> Optional[str]:
@@ -373,14 +382,21 @@ class UniformSampler:
         self.n = int(n)
         self.seed = int(seed)
         self._heap: List[Tuple[int, str, Paper]] = []  # max-heap via negated keys
+        self._ids: Set[str] = set()  # ids currently in the sample
 
     def offer(self, paper: Paper) -> None:
+        """Offer one paper; papers already in the sample (same id) are ignored."""
+        if self.n <= 0 or paper.paper_id in self._ids:
+            return
         key = sample_key(paper.paper_id, self.seed)
         item = (-key, paper.paper_id, paper)
         if len(self._heap) < self.n:
             heapq.heappush(self._heap, item)
-        elif -self._heap[0][0] > key:
-            heapq.heapreplace(self._heap, item)
+            self._ids.add(paper.paper_id)
+        elif (key, paper.paper_id) < (-self._heap[0][0], self._heap[0][1]):
+            _, evicted, _ = heapq.heapreplace(self._heap, item)
+            self._ids.discard(evicted)
+            self._ids.add(paper.paper_id)
 
     def __len__(self) -> int:
         return len(self._heap)

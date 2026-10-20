@@ -77,9 +77,8 @@ def normalize_title(title: str) -> str:
     """
     if not title:
         return ""
-    t = unicodedata.normalize("NFKD", title)
-    t = "".join(ch for ch in t if not unicodedata.combining(ch))
-    t = re.sub(r"\$[^$]*\$", " ", t)  # inline math
+    t = unicodedata.normalize("NFKD", title).encode("ascii", "ignore").decode("ascii")
+    t = re.sub(r"\$([^$]*)\$", r" \1 ", t)  # keep inline-math content ("Fast $k$-means" -> "fast k means")
     t = re.sub(r"\\[a-zA-Z]+\{([^}]*)\}", r"\1", t)  # \emph{x} -> x
     t = re.sub(r"[{}\\]", " ", t)
     t = t.lower()
