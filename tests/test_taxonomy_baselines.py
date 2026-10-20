@@ -161,23 +161,36 @@ def test_episodes_and_routers(builds):
 # ---------------------------------------------------------------------------
 
 
+def _passes(e) -> int:
+    """LLM passes over the read papers of an episode: the propose pass always, the
+    labelling/routing pass only when the proposal gave a schema to route with
+    (a node whose proposal yields no usable child becomes a leaf after one pass)."""
+    no_schema = e.metadata.get("termination") == "no_split" and e.metadata.get("unsplit_children", 0) == 0
+    return 1 if no_schema else 2
+
+
 def test_full_reads_every_paper_twice_per_level(builds, bench):
     res = builds["full"]
     n = len(bench.corpus.papers)
     root = res.episodes[0]
     assert root.node_id == res.taxonomy.root_id and root.n_v == n
     assert root.papers_read == {COMPONENT_FULL: 2 * n}  # propose pass + routing pass
+    passes = _passes
+
+    assert any(passes(e) == 2 for e in res.episodes[1:]) or len(res.episodes) == 1
     for e in res.episodes:
-        assert e.papers_read == {COMPONENT_FULL: 2 * e.n_v}
+        assert e.papers_read == {COMPONENT_FULL: passes(e) * e.n_v}
         assert e.verified == e.n_v and e.metadata["routed"] == 0
-    assert res.papers_read[COMPONENT_FULL] == 2 * sum(e.n_v for e in res.episodes)
-    # Per level, the internal nodes of FULL read their whole extents twice.
+        if e.metadata.get("termination") == "split":
+            assert passes(e) == 2
+    assert res.papers_read[COMPONENT_FULL] == sum(passes(e) * e.n_v for e in res.episodes)
+    # Per level, the split nodes of FULL read their whole extents twice.
     by_depth = {}
     for e in res.episodes:
         by_depth.setdefault(e.depth, [0, 0])
         by_depth[e.depth][0] += e.papers_read[COMPONENT_FULL]
-        by_depth[e.depth][1] += e.n_v
-    assert all(reads == 2 * size for reads, size in by_depth.values())
+        by_depth[e.depth][1] += passes(e) * e.n_v
+    assert all(reads == expected for reads, expected in by_depth.values())
 
 
 @pytest.mark.parametrize("name,eta", [("coverage@0.5", 0.5), ("random@0.1", 0.1), ("kmeans@0.2", 0.2)])
@@ -186,10 +199,11 @@ def test_node_wise_reads_eta_fraction(builds, name, eta):
     total_n = sum(e.n_v for e in res.episodes)
     for e in res.episodes:
         assert e.verified == num_to_select(e.n_v, eta)  # ceil(eta * n_v) papers selected at v
-        assert e.papers_read == {COMPONENT_SELECTION: 2 * e.verified}
+        assert e.papers_read == {COMPONENT_SELECTION: _passes(e) * e.verified}
         assert e.n_v * eta >= 1.0 - 1e-9  # sub-sampling stops when n_v < 1 / eta
-    reads = res.papers_read[COMPONENT_SELECTION] / 2
+    reads = sum(e.verified for e in res.episodes)  # distinct selections over all nodes
     assert eta * total_n <= reads <= eta * total_n + len(res.episodes)
+    assert res.papers_read[COMPONENT_SELECTION] == sum(_passes(e) * e.verified for e in res.episodes)
 
 
 def test_stop_rule_n_below_inverse_eta(rt, bench, vecs):
@@ -218,7 +232,7 @@ def test_one_off_samples_once_at_the_root(builds, bench):
     for e in res.episodes[1:]:
         parent = by_id[tax.parent(e.node_id)]
         assert e.verified <= min(parent.verified, e.n_v)
-        assert e.papers_read == {COMPONENT_SELECTION: 2 * e.verified}
+        assert e.papers_read == {COMPONENT_SELECTION: _passes(e) * e.verified}
     # Node-wise re-sampling reads more papers than the fixed root sample.
     assert res.metadata["distinct_papers_read"] < builds["kmeans@0.2"].metadata["distinct_papers_read"]
 

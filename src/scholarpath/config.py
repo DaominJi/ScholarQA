@@ -100,10 +100,14 @@ class RouterConfig:
     """Lightweight router f_theta_v (Section 3.1, Appendix C.3)."""
 
     hidden_dim: int = 256
-    learning_rate: float = 1e-3
+    learning_rate: float = 3e-3
     weight_decay: float = 1e-2
     epochs: int = 60
-    batch_size: int = 64
+    min_steps: int = 250  # small label sets still get enough AdamW updates
+    max_steps: Optional[int] = 6000
+    patience: int = 3  # early stop when the epoch loss stops improving (0 disables)
+    tolerance: float = 1e-3
+    batch_size: int = 32
     validation_fraction: float = 0.2
     threshold: float = 0.5
     negatives_per_positive: int = 3

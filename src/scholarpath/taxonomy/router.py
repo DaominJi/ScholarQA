@@ -100,6 +100,7 @@ class MLPRouter:
         self.params: Optional[_Params] = None
         self.fitted = False
         self.prior_logit = 0.0
+        self.train_steps = 0
 
     # ----------------------------------------------------------- features
     def _feat(self, P: np.ndarray, C: np.ndarray) -> np.ndarray:
@@ -154,46 +155,98 @@ class MLPRouter:
         if sample_weight is not None:
             w = w * np.asarray(sample_weight, dtype=np.float32)[ii]
         with _single_blas_thread():
-            self._adamw(X, y, w, rng)
+            self.train_steps = self._adamw(X, y, w, rng)
         self.fitted = True
         return self
 
-    def _adamw(self, X: np.ndarray, y: np.ndarray, w: np.ndarray, rng: np.random.Generator) -> None:
+    def _loss(self, X: np.ndarray, y: np.ndarray, w: np.ndarray) -> float:
+        prob = np.clip(_sigmoid(self._forward(X)[2]), 1e-7, 1 - 1e-7)
+        return float(-(w * (y * np.log(prob) + (1 - y) * np.log(1 - prob))).sum() / max(1.0, float(w.sum())))
+
+    def _adamw(self, X: np.ndarray, y: np.ndarray, w: np.ndarray, rng: np.random.Generator) -> int:
+        """Mini-batch AdamW (decoupled weight decay) on the weighted BCE loss.
+
+        Runs ``epochs`` epochs but at least ``min_steps`` optimizer steps (small
+        label sets would otherwise get only a handful of updates) and at most
+        ``max_steps``; stops early once the epoch loss stops improving.
+        Returns the number of optimizer steps taken.
+        """
         cfg = self.config
         p = self.params
         names = ("W1", "b1", "W2", "b2")
         m = {k: np.zeros_like(getattr(p, k)) for k in names}
         v = {k: np.zeros_like(getattr(p, k)) for k in names}
         b1_, b2_, eps = 0.9, 0.999, 1e-8
+        lr, wd = float(cfg.learning_rate), float(cfg.weight_decay)
         step = 0
         N = X.shape[0]
         bs = max(1, min(cfg.batch_size, N))
-        for _ in range(cfg.epochs):
+        steps_per_epoch = int(math.ceil(N / bs))
+        epochs = max(int(cfg.epochs), int(math.ceil(int(getattr(cfg, "min_steps", 0)) / steps_per_epoch)))
+        max_steps = getattr(cfg, "max_steps", None)
+        if max_steps:
+            epochs = min(epochs, max(1, int(math.ceil(int(max_steps) / steps_per_epoch))))
+        patience = int(getattr(cfg, "patience", 0) or 0)
+        tol = float(getattr(cfg, "tolerance", 1e-4))
+        min_epochs = int(math.ceil(int(getattr(cfg, "min_steps", 0)) / steps_per_epoch))
+        best, stale = float("inf"), 0
+        for epoch in range(epochs):
             order = rng.permutation(N)
             for s in range(0, N, bs):
                 idx = order[s : s + bs]
                 xb, yb, wb = X[idx], y[idx], w[idx]
                 h_pre, h, logit = self._forward(xb)
                 prob = _sigmoid(logit)
-                g_logit = (wb * (prob - yb) / max(1.0, wb.sum()))[:, None]  # dL/dlogit
-                grads = {
-                    "W2": h.T @ g_logit,
-                    "b2": g_logit.sum(axis=0),
-                }
+                g_logit = (wb * (prob - yb) / max(1.0, float(wb.sum())))[:, None].astype(np.float32)
                 g_h = (g_logit @ p.W2.T) * _gelu_grad(h_pre)
-                grads["W1"] = xb.T @ g_h
-                grads["b1"] = g_h.sum(axis=0)
+                grads = {"W2": h.T @ g_logit, "b2": g_logit.sum(axis=0), "W1": xb.T @ g_h, "b1": g_h.sum(axis=0)}
                 step += 1
+                c1 = 1.0 - b1_ ** step
+                c2 = 1.0 - b2_ ** step
                 for k in names:
                     param = getattr(p, k)
-                    g = grads[k].astype(np.float32).reshape(param.shape)
-                    m[k] = b1_ * m[k] + (1 - b1_) * g
-                    v[k] = b2_ * v[k] + (1 - b2_) * g * g
-                    mh = m[k] / (1 - b1_ ** step)
-                    vh = v[k] / (1 - b2_ ** step)
-                    if k.startswith("W"):
-                        param *= 1.0 - cfg.learning_rate * cfg.weight_decay  # decoupled decay
-                    param -= cfg.learning_rate * mh / (np.sqrt(vh) + eps)
+                    g = grads[k].reshape(param.shape)
+                    mk, vk = m[k], v[k]
+                    mk *= b1_
+                    mk += (1 - b1_) * g
+                    vk *= b2_
+                    vk += (1 - b2_) * (g * g)
+                    if k.startswith("W") and wd:
+                        param *= 1.0 - lr * wd  # decoupled decay
+                    param -= (lr / c1) * mk / (np.sqrt(vk / c2) + eps)
+            if patience and epoch + 1 >= min_epochs:
+                loss = self._loss(X, y, w)
+                if loss < best - tol:
+                    best, stale = loss, 0
+                else:
+                    stale += 1
+                    if stale >= patience:
+                        break
+        return step
+
+    # ---------------------------------------------------------------- io
+    def state_dict(self) -> Dict[str, np.ndarray]:
+        """Arrays + metadata needed to restore the router (see :meth:`from_state`)."""
+        if self.params is None:
+            return {"fitted": np.array(0)}
+        return {
+            "fitted": np.array(int(self.fitted)),
+            "W1": self.params.W1, "b1": self.params.b1, "W2": self.params.W2, "b2": self.params.b2,
+            "prior_logit": np.array(self.prior_logit),
+            "features": np.array(self.features),
+        }
+
+    @classmethod
+    def from_state(cls, state: Dict[str, np.ndarray], config: Optional[RouterConfig] = None) -> "MLPRouter":
+        r = cls(config, features=str(state.get("features", "concat_product")))
+        if int(state.get("fitted", 0)) and "W1" in state:
+            r.params = _Params(
+                W1=np.asarray(state["W1"], dtype=np.float32), b1=np.asarray(state["b1"], dtype=np.float32),
+                W2=np.asarray(state["W2"], dtype=np.float32), b2=np.asarray(state["b2"], dtype=np.float32),
+            )
+            r.prior_logit = float(state.get("prior_logit", 0.0))
+            r.fitted = True
+        return r
 
     # ------------------------------------------------------------ predict
     def predict_proba(self, paper_vecs: np.ndarray, child_vecs: np.ndarray) -> np.ndarray:

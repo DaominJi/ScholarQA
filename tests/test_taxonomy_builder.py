@@ -266,10 +266,16 @@ def test_transferred_prior_flag_sets_region_priors(small_bench, use_prior):
             np.testing.assert_allclose(resp.cov, fixed_cov, atol=1e-9)
 
 
-def test_all_cost_components_when_repair_pools_reach_threshold(small_bench):
-    """A weak router leaves disagreements and residual papers: DISCOVER and CORRECT both run (Eq. 15)."""
+def test_all_cost_components_when_repair_pools_reach_threshold():
+    """A weak router leaves disagreements and residual papers: DISCOVER and CORRECT both run (Eq. 15).
+
+    The node is large enough (400 papers) that repair does not end up verifying
+    every paper, so a Stage-3 audit draws from a non-empty unverified set.
+    """
+    small_bench = make_synthetic_benchmark(n_papers=400, seed=3)
     cfg = fast_config(max_depth=1, repair_pool_floor=1, repair_pool_fraction=0.0, max_cycles=3)
-    cfg.builder.router = RouterConfig(epochs=3, hidden_dim=16, learning_rate=1e-2, batch_size=32)
+    cfg.builder.router = RouterConfig(epochs=3, hidden_dim=16, learning_rate=1e-2, batch_size=32,
+                                      min_steps=0, patience=0)  # deliberately under-trained
     rt = Runtime.from_config(cfg)
     builder = NodeWiseBuilder(rt.llm, rt.embedder, cfg.builder, small_bench.corpus)
     with single_thread():

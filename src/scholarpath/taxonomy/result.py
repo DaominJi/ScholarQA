@@ -24,6 +24,19 @@ class NodeRouter:
     router: MLPRouter
     threshold: float = 0.5
 
+    def to_state(self) -> Dict[str, Any]:
+        state: Dict[str, Any] = {f"router.{k}": v for k, v in self.router.state_dict().items()}
+        state["child_vecs"] = np.asarray(self.child_vecs, dtype=np.float32)
+        return state
+
+    @classmethod
+    def from_state(
+        cls, node_id: str, child_ids: List[str], threshold: float, state: Dict[str, Any], config=None
+    ) -> "NodeRouter":
+        rstate = {k[len("router."):]: v for k, v in state.items() if k.startswith("router.")}
+        return cls(node_id, list(child_ids), np.asarray(state["child_vecs"], dtype=np.float32),
+                   MLPRouter.from_state(rstate, config), float(threshold))
+
     def route(self, paper_vecs: np.ndarray) -> List[List[str]]:
         """Child ids per paper; an empty list means the residual leaf."""
         if not self.child_ids:
@@ -136,3 +149,52 @@ class BuildResult:
         with open(d / "episodes.jsonl", "w", encoding="utf-8") as f:
             for e in self.episodes:
                 f.write(json.dumps(e.to_dict(), default=str) + "\n")
+        if self.routers:
+            arrays: Dict[str, np.ndarray] = {}
+            meta: Dict[str, Any] = {}
+            for nid, r in self.routers.items():
+                meta[nid] = {"child_ids": list(r.child_ids), "threshold": r.threshold}
+                for k, v in r.to_state().items():
+                    arrays[f"{nid}::{k}"] = np.asarray(v)
+            np.savez_compressed(d / "routers.npz", **arrays)
+            (d / "routers.json").write_text(json.dumps(meta, indent=1), encoding="utf-8")
+
+    @classmethod
+    def load(cls, directory: Union[str, Path], router_config=None) -> "BuildResult":
+        """Restore a result written by :meth:`save` (taxonomy, usage, episodes, routers)."""
+        d = Path(directory)
+        tax = Taxonomy.load(d / "taxonomy.json")
+        summary = json.loads((d / "summary.json").read_text(encoding="utf-8")) if (d / "summary.json").exists() else {}
+        usage: Dict[str, UsageRecord] = {}
+        if (d / "usage.json").exists():
+            for k, v in json.loads((d / "usage.json").read_text(encoding="utf-8")).items():
+                v = {f: v[f] for f in UsageRecord.__dataclass_fields__ if f in v}
+                usage[k] = UsageRecord(**v)
+        episodes: List[EpisodeRecord] = []
+        if (d / "episodes.jsonl").exists():
+            fields = set(EpisodeRecord.__dataclass_fields__)
+            for line in (d / "episodes.jsonl").read_text(encoding="utf-8").splitlines():
+                if line.strip():
+                    rec = json.loads(line)
+                    episodes.append(EpisodeRecord(**{k: v for k, v in rec.items() if k in fields}))
+        routers: Dict[str, NodeRouter] = {}
+        if (d / "routers.json").exists() and (d / "routers.npz").exists():
+            meta = json.loads((d / "routers.json").read_text(encoding="utf-8"))
+            with np.load(d / "routers.npz", allow_pickle=False) as z:
+                grouped: Dict[str, Dict[str, Any]] = {}
+                for key in z.files:
+                    nid, _, name = key.partition("::")
+                    grouped.setdefault(nid, {})[name] = z[key]
+            for nid, info in meta.items():
+                if nid in grouped:
+                    routers[nid] = NodeRouter.from_state(nid, info["child_ids"], info["threshold"], grouped[nid], router_config)
+        return cls(
+            taxonomy=tax,
+            method=summary.get("method", "unknown"),
+            usage=usage,
+            papers_read=dict(summary.get("papers_read", {}) or {}),
+            episodes=episodes,
+            runtime_s=float(summary.get("runtime_s", 0.0) or 0.0),
+            routers=routers,
+            metadata=dict(summary.get("metadata", {}) or {}),
+        )

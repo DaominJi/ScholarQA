@@ -293,29 +293,34 @@ def _cover_terms(
 
 
 def _mock_propose(payload: Dict[str, Any], request: LLMRequest) -> Dict[str, Any]:
+    """Propose children by greedy term coverage; refinement batches add children
+    only for sub-topics the existing children miss (papers they cannot match)."""
     node = payload.get("node", {})
     papers = payload.get("papers", [])
     existing = payload.get("existing", [])
+    facet = payload.get("facet", "topic")
     lo, hi = int(payload.get("min_children", 2)), int(payload.get("max_children", 8))
     banned = _banned(node)
     exclude = set()
     for c in existing:
         exclude |= _child_terms(c)
-    target = max(lo, min(hi, int(round(math.sqrt(max(1, len(papers)) / 1.5))))) - len(existing)
-    facet = payload.get("facet", "topic")
-    terms = _cover_terms(papers, banned, max(0, target), exclude, facet) if target > 0 else []
     children = [dict(c) for c in existing]
+    if existing:
+        unmatched = [p for p in papers if not _match(_paper_tokens(p, banned, facet), children)]
+        room = max(0, hi - len(children))
+        terms = _cover_terms(unmatched, banned, room, exclude, facet) if (room and len(unmatched) >= 2) else []
+    else:
+        target = max(lo, min(hi, int(round(math.sqrt(max(1, len(papers)) / 1.5)))))
+        terms = _cover_terms(papers, banned, target, exclude, facet)
     for i, t in enumerate(terms, 1):
         children.append({
             "key": f"N{i}",
             "name": t.title(),
-            "definition": f"Papers whose {payload.get('facet', 'topic')} centers on {t}.",
+            "definition": f"Papers whose {facet} centers on {t}.",
             "terms": [t],
         })
-    if len(children) < lo:
-        for i in range(len(children), lo):
-            children.append({"key": f"N{len(terms) + i + 1}", "name": f"Other {i + 1}",
-                             "definition": "Remaining papers.", "terms": [f"__other{i}"]})
+    # Fewer than min_children distinctive sub-topics: return what exists (the
+    # builders treat a schema with < 2 usable children as a leaf).
     labels = [{"paper_id": p["id"], "children": _match(_paper_tokens(p, banned, facet), children)} for p in papers]
     out_children = [{"key": c["key"], "name": c["name"], "definition": c.get("definition", "")} for c in children]
     return {"children": out_children, "labels": labels}
