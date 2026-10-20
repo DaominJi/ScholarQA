@@ -18,4 +18,5 @@ tmp/
 data/raw/
 data/processed/
 data/fulltext/
+data/synthetic/
 !data/README.md
