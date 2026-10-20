@@ -41,6 +41,18 @@ def _gelu_grad(x: np.ndarray) -> np.ndarray:
     return 0.5 * (1 + t) + 0.5 * x * dt
 
 
+def _single_blas_thread():
+    """Context manager capping BLAS threads at 1 (tiny matmuls are far slower multi-threaded)."""
+    try:
+        from threadpoolctl import threadpool_limits
+
+        return threadpool_limits(1, "blas")
+    except Exception:  # pragma: no cover - threadpoolctl ships with scikit-learn
+        import contextlib
+
+        return contextlib.nullcontext()
+
+
 def _sigmoid(x: np.ndarray) -> np.ndarray:
     return 1.0 / (1.0 + np.exp(-np.clip(x, -40, 40)))
 
@@ -141,7 +153,8 @@ class MLPRouter:
         w = np.where(y > 0.5, 0.5 / max(pos_rate, 1e-3), 0.5 / max(1 - pos_rate, 1e-3)).astype(np.float32)
         if sample_weight is not None:
             w = w * np.asarray(sample_weight, dtype=np.float32)[ii]
-        self._adamw(X, y, w, rng)
+        with _single_blas_thread():
+            self._adamw(X, y, w, rng)
         self.fitted = True
         return self
 
@@ -192,9 +205,10 @@ class MLPRouter:
             sims = paper_vecs @ child_vecs.T
             return _sigmoid(8.0 * (sims - sims.mean()))
         out = np.zeros((n, C), dtype=np.float32)
-        for c in range(C):
-            X = self._feat(paper_vecs, np.repeat(child_vecs[c : c + 1], n, axis=0))
-            out[:, c] = _sigmoid(self._forward(X)[2])
+        with _single_blas_thread():
+            for c in range(C):
+                X = self._feat(paper_vecs, np.repeat(child_vecs[c : c + 1], n, axis=0))
+                out[:, c] = _sigmoid(self._forward(X)[2])
         return out
 
     def assign(self, probs: np.ndarray, threshold: Optional[float] = None) -> List[Set[int]]:

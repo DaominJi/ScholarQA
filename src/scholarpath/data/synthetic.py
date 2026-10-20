@@ -201,7 +201,7 @@ def make_synthetic_benchmark(
             benchmark="synthetic-heldout",
             gold_papers=[],
             reference_answer=m,
-            metadata={"setting": "new_method_existing_problem", "known_endpoint": s,
+            metadata={"setting": "new_problem_existing_method", "known_endpoint": s,
                       "heldout_counterpart": m, "rationale": f"{m} can model {sub_kw[s][0]} structure."},
         ))
     return SyntheticBenchmark(

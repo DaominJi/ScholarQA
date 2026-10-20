@@ -91,6 +91,10 @@ class LinkPredictor:
         self.prepared_for = id(index)
         return self
 
+    def has(self, node_id: str) -> bool:
+        """Whether ``node_id`` (a concept or a registered query-local anchor) is encoded."""
+        return node_id in self._z
+
     def z(self, node_id: str) -> np.ndarray:
         return self._z[node_id]
 
