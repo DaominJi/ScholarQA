@@ -248,6 +248,31 @@ class IndexConfig:
 
 
 @dataclass
+class EvaluationConfig:
+    """LLM judges and official evaluation scripts (Section 5.3, App. C.3).
+
+    Judge calls are billed to the "judge" component of a *separate* meter and
+    never count towards system cost.
+    """
+
+    # Hypothesis judges (Table 4): three state-of-the-art LLMs, scores averaged.
+    judge_models: Tuple[str, ...] = ("gpt-6.0-sol", "opus-5.5", "grok-4.7")
+    judge_provider: str = "mock"  # "openai" for real judges (OpenAI-compatible endpoint)
+    judge_base_url: Optional[str] = None  # falls back to $SCHOLARPATH_JUDGE_BASE_URL
+    judge_api_key_env: str = "SCHOLARPATH_JUDGE_API_KEY"
+    judge_cache_dir: Optional[str] = "cache/judge"
+    # Official benchmark judges.
+    researchqa_judge_model: str = "gpt-4.1-mini"
+    scholarqa_cs_judge_model: str = "gpt-4-turbo"
+    prometheus_model: str = "prometheus-eval/prometheus-7b-v2.0"
+    attribution_judge: str = "llm"  # "llm" | "nli" (osunlp/attrscore-flan-t5-xl)
+    discovery_k: int = 10  # Hit@10
+    # Official checkouts (optional; enable scripts/run_official_eval-style runs).
+    researchqa_dir: Optional[str] = None
+    scholarqabench_dir: Optional[str] = None
+
+
+@dataclass
 class ScholarPathConfig:
     llm: LLMConfig = field(default_factory=LLMConfig)
     embedding: EmbeddingConfig = field(default_factory=EmbeddingConfig)
@@ -256,6 +281,7 @@ class ScholarPathConfig:
     retrieval: RetrievalConfig = field(default_factory=RetrievalConfig)
     link_prediction: LinkPredictionConfig = field(default_factory=LinkPredictionConfig)
     index: IndexConfig = field(default_factory=IndexConfig)
+    evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
     seed: int = 0
 
     # ------------------------------------------------------------------ io

@@ -18,6 +18,7 @@ from __future__ import annotations
 import hashlib
 import importlib
 import json
+import logging
 import pkgutil
 import threading
 from typing import Any, Callable, Dict, Optional
@@ -25,6 +26,8 @@ from typing import Any, Callable, Dict, Optional
 from scholarpath.llm.accounting import CostMeter
 from scholarpath.llm.base import LLMClient, LLMRequest, LLMResponse
 from scholarpath.text import count_tokens
+
+log = logging.getLogger(__name__)
 
 MockHandler = Callable[[Dict[str, Any], LLMRequest], Any]
 
@@ -47,7 +50,11 @@ def _load_handlers() -> None:
         import scholarpath.prompts as prompts_pkg
 
         for mod in pkgutil.iter_modules(prompts_pkg.__path__):
-            module = importlib.import_module(f"scholarpath.prompts.{mod.name}")
+            try:
+                module = importlib.import_module(f"scholarpath.prompts.{mod.name}")
+            except Exception as err:  # a broken prompt module must not disable all mocks
+                log.warning("MockLLM: skipping prompt module %s (%s)", mod.name, err)
+                continue
             for task, handler in getattr(module, "MOCK_HANDLERS", {}).items():
                 _HANDLERS.setdefault(task, handler)
         _LOADED = True

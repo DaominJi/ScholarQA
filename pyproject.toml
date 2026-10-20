@@ -32,6 +32,9 @@ data = [
     "datasets>=2.19",
     "pymupdf>=1.24",
 ]
+eval = [
+    "nltk>=3.8",  # statement splitting of the official ScholarQABench citation eval; run nltk.download("punkt")
+]
 agents = [
     "paper-qa>=5.0",
 ]

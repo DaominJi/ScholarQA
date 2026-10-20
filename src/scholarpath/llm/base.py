@@ -147,8 +147,14 @@ class LLMClient:
         )
         return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
-    def complete(self, request: LLMRequest, _salt: str = "") -> LLMResponse:
-        """Run one request (cache-aware) and bill it to the cost meter."""
+    def complete(self, request: LLMRequest, _salt: str = "", cache_salt: Optional[str] = None) -> LLMResponse:
+        """Run one request (cache-aware) and bill it to the cost meter.
+
+        ``cache_salt`` (public) changes the cache key, e.g. to re-sample a
+        malformed judge output instead of replaying the cached one.
+        """
+        if cache_salt is not None:
+            _salt = f"{_salt}|{cache_salt}"
         component = request.component or self.meter.current_component
         key = self._cache_key(request, _salt) if self.cache is not None else None
         if key is not None:
