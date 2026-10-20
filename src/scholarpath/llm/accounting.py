@@ -35,7 +35,8 @@ class UsageRecord:
     input_tokens: int = 0
     output_tokens: int = 0
     cost_usd: float = 0.0
-    latency_s: float = 0.0
+    latency_s: float = 0.0  # recorded latency of all calls (cached calls replay their original latency)
+    cached_latency_s: float = 0.0  # part of latency_s replayed from the response cache
 
     def add(self, other: "UsageRecord") -> None:
         self.calls += other.calls
@@ -44,6 +45,7 @@ class UsageRecord:
         self.output_tokens += other.output_tokens
         self.cost_usd += other.cost_usd
         self.latency_s += other.latency_s
+        self.cached_latency_s += other.cached_latency_s
 
     @property
     def total_tokens(self) -> int:
@@ -111,6 +113,8 @@ class CostMeter:
             rec.output_tokens += int(output_tokens)
             rec.cost_usd += cost
             rec.latency_s += float(latency_s)
+            if cached:
+                rec.cached_latency_s += float(latency_s)
         return cost
 
     # ------------------------------------------------------------- queries
@@ -148,6 +152,7 @@ class CostMeter:
                 output_tokens=int(d["output_tokens"] - b.get("output_tokens", 0)),
                 cost_usd=float(d["cost_usd"] - b.get("cost_usd", 0.0)),
                 latency_s=float(d["latency_s"] - b.get("latency_s", 0.0)),
+                cached_latency_s=float(d.get("cached_latency_s", 0.0) - b.get("cached_latency_s", 0.0)),
             )
         return {k: v for k, v in out.items() if v.calls > 0}
 

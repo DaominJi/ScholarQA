@@ -35,6 +35,10 @@ data = [
 eval = [
     "nltk>=3.8",  # statement splitting of the official ScholarQABench citation eval; run nltk.download("punkt")
 ]
+baselines = [
+    "umap-learn>=0.5",  # RAPTOR dimensionality reduction (PCA fallback otherwise)
+    "networkx>=3.1",    # LightRAG knowledge-graph export
+]
 agents = [
     "paper-qa>=5.0",
 ]

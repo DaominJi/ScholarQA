@@ -228,6 +228,13 @@ class SemanticIndex:
         m = self._emb[PAPER]
         return [parse_key(k)[1] for k in m.ids], m.mat
 
+    def level_matrix(self, level: str) -> Tuple[List[str], np.ndarray]:
+        """(keys, embedding matrix) of every index node of one level (bulk access)."""
+        m = self._emb.get(level)
+        if m is None:
+            return [], np.zeros((0, self.dim), dtype=np.float32)
+        return list(m.ids), m.mat
+
     def chunks_of(self, paper_id: str) -> List[str]:
         return self.paper_chunks.get(paper_id, [])
 

@@ -217,7 +217,9 @@ class LLMClient:
                 return extract_json(resp.text, expect=expect), resp
             except JSONParseError as err:
                 last_err = err
-        raise JSONParseError(f"[{request.task}] {last_err}") from last_err
+        raise JSONParseError(
+            f"[{request.task}] {last_err}", raw_text=last_resp.text if last_resp is not None else None
+        ) from last_err
 
     def map(
         self,

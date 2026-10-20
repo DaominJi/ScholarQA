@@ -10,7 +10,11 @@ _FENCE_RE = re.compile(r"```(?:json|JSON)?\s*(.*?)```", re.DOTALL)
 
 
 class JSONParseError(ValueError):
-    pass
+    """Raised when no JSON value can be parsed; ``raw_text`` holds the LLM output."""
+
+    def __init__(self, message: str = "", raw_text: Optional[str] = None):
+        super().__init__(message)
+        self.raw_text = raw_text
 
 
 def _balanced_spans(text: str, open_ch: str, close_ch: str):
@@ -84,4 +88,4 @@ def extract_json(text: str, expect: Optional[type] = None) -> Any:
         val = _try_load(span)
         if val is not None and (expect is None or isinstance(val, expect)):
             return val
-    raise JSONParseError(f"No JSON value found in LLM output: {text[:200]!r}")
+    raise JSONParseError(f"No JSON value found in LLM output: {text[:200]!r}", raw_text=text)
