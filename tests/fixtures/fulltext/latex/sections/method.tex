@@ -1,0 +1,18 @@
+\section{Method}
+\label{sec:method}
+Our estimator featurizes each predicate.\footnote{Categorical values are hashed.}
+
+\subsection{Model}
+We use a multi-set convolutional network with loss $\mathcal{L} = \sum_i (\log \hat{c}_i - \log c_i)^2$.
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{fig1.pdf}
+\caption{Architecture of the {\bf estimator}.}
+\end{figure}
+\begin{itemize}
+\item Tables are one-hot encoded.
+\item[Joins] are encoded as edge sets.
+\end{itemize}
+
+\subsection{Training}
+Training queries are sampled from the workload.

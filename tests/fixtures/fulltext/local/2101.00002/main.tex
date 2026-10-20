@@ -1,0 +1,24 @@
+\documentclass{article}
+\usepackage{amsmath}
+% A comment that must disappear: \section{Not a section}
+\title{Learned Cardinality Estimation for Join Queries}
+\begin{document}
+\maketitle
+\begin{abstract}
+We study learned cardinality estimation for multi-way join queries.
+\end{abstract}
+
+\section{Introduction}
+\label{sec:intro}
+Cardinality estimation is the \emph{Achilles heel} of query optimizers~\cite{leis2015}.
+Errors grow exponentially with the number of joins (see Section~\ref{sec:method}).
+We reduce the error by 50\% on JOB.
+
+\input{sections/method}
+
+\section*{Acknowledgments}
+We thank the reviewers.
+
+\bibliographystyle{plain}
+\bibliography{refs}
+\end{document}

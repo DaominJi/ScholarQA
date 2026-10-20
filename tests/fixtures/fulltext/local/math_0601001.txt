@@ -1,0 +1,19 @@
+Convex Relaxations of Scheduling Problems
+Petr Novak
+
+Abstract
+We study convex relaxations.
+
+1 Introduction
+Scheduling problems are hard. Linear programming relaxations give lower bounds on the optimal makespan,
+and we strengthen them with semidefinite constraints that capture pairwise precedence information.
+
+2 Semidefinite Relaxations
+The semidefinite relaxation lifts the assignment variables into a matrix and adds precedence cuts.
+It is solved with an interior point method in polynomial time for moderate instance sizes.
+
+3 Experiments
+On standard benchmarks the gap closes by thirty percent compared to the linear relaxation baseline.
+
+References
+[1] A. Author. A paper. 2001.

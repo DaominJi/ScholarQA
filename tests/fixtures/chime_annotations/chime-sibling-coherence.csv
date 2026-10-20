@@ -1,0 +1,4 @@
+sibling_group_id,parent_category,child_category,agg_label,coherence_rate,split
+0,Effectiveness of family programmes,Impact on smoking onset,1,1.0,train
+0,Effectiveness of family programmes,Impact on alcohol use,1,1.0,train
+1,Population subgroups,Effects by ethnicity,0,0.33,train

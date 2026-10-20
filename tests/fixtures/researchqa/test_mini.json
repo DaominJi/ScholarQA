@@ -1,0 +1,126 @@
+[
+ {
+  "id": "100000000000000001-s1",
+  "general_domain": "Engineering",
+  "subdomain": "Computer Science",
+  "field": "Databases",
+  "query": "How have learned models been used for cardinality estimation in relational query optimizers?",
+  "date": "2021-6-5",
+  "rubric": [
+   {
+    "rubric_item": "Does the response explain why classical histogram-based estimators fail on correlated joins?",
+    "type": [
+     "Limitation"
+    ],
+    "citation_metadata": null
+   },
+   {
+    "rubric_item": "Does the response compare query-driven and data-driven learned estimators?",
+    "type": [
+     "Comparison",
+     "Example"
+    ],
+    "citation_metadata": null
+   },
+   {
+    "rubric_item": "Does the response cite Smith et al. (2021) (title: Learned Cardinality Estimation for Join Queries)?",
+    "type": [
+     "Citation"
+    ],
+    "citation_metadata": {
+     "first_author": "Smith",
+     "title": "Learned Cardinality Estimation for Join Queries",
+     "url": "https://arxiv.org/abs/2101.00001v2",
+     "year": 2021
+    }
+   },
+   {
+    "rubric_item": "Does the response cite Lee (2021) on index advisors?",
+    "type": [
+     "Citation"
+    ],
+    "citation_metadata": {
+     "first_author": "Lee",
+     "title": "Index tuning with reinforcement-learning",
+     "url": null,
+     "year": 2021
+    }
+   },
+   {
+    "rubric_item": "Does the response cite Kim (2020) (title: Workload Forecasting for Cloud Databases)?",
+    "type": [
+     "Citation"
+    ],
+    "citation_metadata": {
+     "first_author": "Kim",
+     "title": "Workload forecasting for cloud database systems",
+     "url": "https://doi.org/10.1145/5555.6666",
+     "year": 2020
+    }
+   },
+   {
+    "rubric_item": "Does the response cite the classic System R paper?",
+    "type": [
+     "Citation"
+    ],
+    "citation_metadata": {
+     "first_author": "Selinger",
+     "title": "Access Path Selection in a Relational Database Management System",
+     "url": null,
+     "year": 1979
+    }
+   },
+   {
+    "rubric_item": "Does the response cite Smith et al. again for the join estimator?",
+    "type": [
+     "Citation"
+    ],
+    "citation_metadata": {
+     "first_author": "Smith",
+     "title": "Learned cardinality estimation for join queries.",
+     "url": null,
+     "year": 2021
+    }
+   }
+  ]
+ },
+ {
+  "id": "100000000000000002-s3",
+  "general_domain": "Physical & Theoretical Sciences",
+  "subdomain": "Mathematics",
+  "field": "Optimization",
+  "query": "What convex relaxations exist for scheduling problems?",
+  "date": "2019-11-20",
+  "rubric": [
+   {
+    "rubric_item": "Does the response cite Novak (2006) (title: Convex Relaxations of Scheduling Problems (an LP view)) when introducing relaxations?",
+    "type": [
+     "Citation"
+    ]
+   },
+   {
+    "rubric_item": "Does the response discuss the impact of integrality gaps on solution quality?",
+    "type": [
+     "Impact"
+    ]
+   }
+  ]
+ },
+ {
+  "id": "100000000000000003-s2",
+  "general_domain": "Health Sciences & Medicine",
+  "subdomain": "Public Health",
+  "field": "Pharmacology",
+  "query": "Which data sources support post-marketing drug surveillance?",
+  "date": "2022",
+  "rubric": [
+   {
+    "rubric_item": "Does the response mention spontaneous reporting systems?",
+    "type": [
+     "Other"
+    ],
+    "citation_metadata": null
+   }
+  ]
+ }
+]

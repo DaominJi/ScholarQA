@@ -1,0 +1,4 @@
+review_pmid,hierarchy_id,parent_category,child_category,agg_label,split
+90000001,0,Effectiveness of family programmes,Long-term effects,0,train
+90000001,0,Effectiveness of family programmes,Impact on alcohol use,1,train
+90000002,0,Sleep interventions,Pharmacological interventions,1,test_ID

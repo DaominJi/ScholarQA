@@ -1,0 +1,377 @@
+"""Prompts for temporal supervision (App. B.5) and held-out benchmark construction (App. C.1).
+
+Two LLM tasks are defined here:
+
+* ``benchmark.verify_application`` -- the application indicator
+  ``app_{(t, t+Delta]}(u, m)`` of Eq. (17) "requires source text that proposes
+  or materially uses the method for the problem": papers of the supervision
+  window that share a problem concept u and a method concept m only generate
+  *candidate* annotations, which are not accepted automatically. This prompt
+  shows the LLM one window paper (title and abstract) together with the
+  candidate (problem, method) pairs it generated and asks, for each pair,
+  whether the paper itself proposes or materially uses the method for the
+  problem. Billed to the ``link_training`` cost component.
+
+* ``benchmark.heldout_query`` -- "Queries and Expected Answers" of App. C.1:
+  "An LLM receives the title and abstract of the source paper, the setting,
+  and the label and definition of the new endpoint in the reference taxonomy,
+  and writes a query in the voice of a researcher who knows the new endpoint
+  but not the answer: the query describes the new problem or method and its
+  function, as an unfamiliar endpoint, and must not name the held-out
+  counterpart, its acronym, or a distinctive phrase of the abstract. The same
+  call extracts the expected answer record: the held-out counterpart concept
+  and a one-sentence rationale from the source paper." Billed to the
+  ``benchmark`` cost component.
+
+Both modules export offline mock handlers (:data:`MOCK_HANDLERS`) that answer
+deterministically from the request payload with lexical heuristics.
+"""
+
+from __future__ import annotations
+
+import re
+from typing import Any, Dict, Mapping, Optional, Sequence, Set, Tuple
+
+from scholarpath.llm.base import LLMRequest, chat
+from scholarpath.text import tokenize
+
+# The two settings of the Held-Out Hypothesis benchmark (Sec. 5.3, App. C.1).
+NEW_PROBLEM = "new_problem_existing_method"  # setting (1): new problem, adapted existing method
+NEW_METHOD = "new_method_existing_problem"  # setting (2): new method, existing problem in a new domain
+SETTINGS = (NEW_PROBLEM, NEW_METHOD)
+
+# Facet of the *new* endpoint (described by the query) and of the held-out
+# counterpart (the expected answer) in each setting.
+NEW_FACET = {NEW_PROBLEM: "problem", NEW_METHOD: "method"}
+COUNTERPART_FACET = {NEW_PROBLEM: "method", NEW_METHOD: "problem"}
+
+# Words too generic to identify a concept on their own; ignored when matching
+# concept names against free text (mock verification, leakage checks).
+GENERIC_TERMS = frozenset(
+    """
+    learning model models modeling modelling network networks data analysis estimation system systems
+    algorithm algorithms framework frameworks technique techniques task tasks problem problems
+    approach approaches method methods application applications based general improved novel
+    """.split()
+)
+
+
+# ---------------------------------------------------------------------------
+# Lexical helpers (shared with scholarpath.data.heldout)
+# ---------------------------------------------------------------------------
+
+
+def stem(word: str) -> str:
+    """Very light plural stemming so that 'networks' matches 'network'."""
+    w = word.lower()
+    if len(w) <= 3:
+        return w
+    if w.endswith("sses"):
+        return w[:-2]
+    if w.endswith("ies") and len(w) > 4:
+        return w[:-3] + "y"
+    if w.endswith("es") and (w[-3] in "sxz" or w[-4:-2] in ("ch", "sh")):
+        return w[:-2]
+    if w.endswith("s") and not w.endswith("ss"):
+        return w[:-1]
+    return w
+
+
+def content_terms(text: str, drop_generic: bool = True) -> Set[str]:
+    """Stemmed non-stopword tokens of ``text`` (optionally without generic terms)."""
+    out: Set[str] = set()
+    for tok in tokenize(text or "", remove_stopwords=True):
+        if len(tok) <= 2 or tok.isdigit():
+            continue
+        s = stem(tok)
+        if drop_generic and (tok in GENERIC_TERMS or s in GENERIC_TERMS):
+            continue
+        out.add(s)
+    return out
+
+
+def _concept_line(concept: Mapping[str, Any]) -> str:
+    name = str(concept.get("name", "") or "")
+    definition = str(concept.get("definition", "") or "")
+    return f"{name} -- {definition}" if definition else name
+
+
+# ---------------------------------------------------------------------------
+# benchmark.verify_application (App. B.5, Eq. 17)
+# ---------------------------------------------------------------------------
+
+VERIFY_SYSTEM = (
+    "You are an expert scientific annotator. From a paper's title and abstract you decide whether the "
+    "paper itself proposes or materially uses a given method to address a given research problem. "
+    "Always answer with a single JSON object and nothing else."
+)
+
+
+def verify_application_request(
+    paper: Mapping[str, Any],
+    pairs: Sequence[Mapping[str, Any]],
+    component: Optional[str] = "link_training",
+) -> LLMRequest:
+    """Verify candidate application annotations generated by one window paper.
+
+    ``paper`` is ``{"id", "title", "abstract"}``; ``pairs`` is a list of
+    ``{"key", "problem": {"name", "definition"}, "method": {"name", "definition"}}``.
+    The answer is ``{"verdicts": [{"key", "applies", "reason"}]}`` (see
+    :func:`parse_verdicts`).
+    """
+    lines = []
+    for p in pairs:
+        lines.append(
+            f"{p['key']}: PROBLEM = {_concept_line(p['problem'])}\n"
+            f"    METHOD  = {_concept_line(p['method'])}"
+        )
+    abstract = str(paper.get("abstract", "") or "").replace("\n", " ")
+    user = (
+        f"Paper [{paper.get('id', '')}]\nTitle: {paper.get('title', '')}\nAbstract: {abstract}\n\n"
+        "Candidate (problem, method) relationships taken from a concept taxonomy:\n"
+        + "\n".join(lines)
+        + "\n\nFor each candidate decide whether THIS paper proposes or materially uses the METHOD (or a "
+        "direct instance or adaptation of it) to address the PROBLEM (or a direct instance of it). Answer "
+        '"applies": false if the method is only mentioned as related work, as a baseline, or as future '
+        "work, if the paper addresses the problem with a different method, or if the title and abstract "
+        "do not support the relationship.\n\n"
+        "Answer JSON:\n"
+        '{"verdicts": [{"key": "A1", "applies": true, "reason": "<short paraphrase of the supporting text>"}]}'
+    )
+    payload = {
+        "paper": {"id": paper.get("id"), "title": paper.get("title", ""), "abstract": paper.get("abstract", "")},
+        "pairs": [dict(p) for p in pairs],
+    }
+    return LLMRequest(
+        task="benchmark.verify_application",
+        messages=chat(VERIFY_SYSTEM, user),
+        payload=payload,
+        component=component,
+        json_mode=True,
+    )
+
+
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value).strip().lower() in {"true", "yes", "y", "1", "applies"}
+
+
+def parse_verdicts(obj: Any, keys: Sequence[str]) -> Dict[str, bool]:
+    """Parse ``{"verdicts": [...]}`` into ``key -> applies``; missing keys count as rejected."""
+    out = {k: False for k in keys}
+    items: Any = obj.get("verdicts", []) if isinstance(obj, dict) else obj
+    if isinstance(items, dict):  # {"A1": true, ...}
+        items = [{"key": k, "applies": v} for k, v in items.items()]
+    for it in items or []:
+        if not isinstance(it, dict):
+            continue
+        key = str(it.get("key", "")).strip()
+        if key in out:
+            out[key] = _as_bool(it.get("applies", False))
+    return out
+
+
+def _mock_overlap(concept: Mapping[str, Any], terms: Set[str]) -> float:
+    name = content_terms(str(concept.get("name", "")), drop_generic=False)
+    if not name:
+        return 0.0
+    return len(name & terms) / len(name)
+
+
+def _mock_verify(payload: Dict[str, Any], request: LLMRequest) -> Dict[str, Any]:
+    """Accept a pair when the paper text covers at least half of both concept names."""
+    paper = payload.get("paper", {}) or {}
+    terms = content_terms(f"{paper.get('title', '')}. {paper.get('abstract', '')}", drop_generic=False)
+    verdicts = []
+    for p in payload.get("pairs", []) or []:
+        sp = _mock_overlap(p.get("problem", {}), terms)
+        sm = _mock_overlap(p.get("method", {}), terms)
+        ok = sp >= 0.5 and sm >= 0.5
+        verdicts.append({
+            "key": p.get("key"),
+            "applies": ok,
+            "reason": "title/abstract names both concepts" if ok else "abstract does not support the pair",
+        })
+    return {"verdicts": verdicts}
+
+
+# ---------------------------------------------------------------------------
+# benchmark.heldout_query (App. C.1)
+# ---------------------------------------------------------------------------
+
+HELDOUT_SYSTEM = (
+    "You construct a benchmark of research-hypothesis questions from recent papers. You write questions "
+    "the way a researcher would ask them, never revealing the answer. Always answer with a single JSON "
+    "object and nothing else."
+)
+
+_SETTING_TEXT = {
+    NEW_PROBLEM: (
+        "NEW PROBLEM / EXISTING METHOD: the source paper proposes a new research problem in its field and "
+        "addresses it by adapting an existing method from another domain. The new endpoint below is that "
+        "new PROBLEM; the held-out counterpart is the existing METHOD the paper adapts."
+    ),
+    NEW_METHOD: (
+        "NEW METHOD / EXISTING PROBLEM: the source paper proposes a new method and uses it to solve an "
+        "existing problem in a new domain. The new endpoint below is that new METHOD; the held-out "
+        "counterpart is the existing PROBLEM the paper solves with it."
+    ),
+}
+
+_ASK_TEXT = {
+    NEW_PROBLEM: "which existing methods, possibly from other research areas, could be adapted to solve it, and why",
+    NEW_METHOD: "which established research problems, possibly in other domains, it could be applied to, and why",
+}
+
+
+def heldout_query_request(
+    source: Mapping[str, Any],
+    setting: str,
+    new_endpoint: Mapping[str, Any],
+    counterpart: Optional[Mapping[str, Any]] = None,
+    component: Optional[str] = "benchmark",
+) -> LLMRequest:
+    """Write a held-out hypothesis query and extract its expected answer record.
+
+    ``source`` is the source paper ``{"id", "title", "abstract", "date"}``;
+    ``new_endpoint`` is ``{"facet", "name", "definition", "path"}`` from the
+    reference taxonomy. ``counterpart`` (optional, ``{"facet", "name",
+    "definition"}``) is an alignment hint that is *not* part of the paper's
+    protocol (App. C.1 gives the LLM only the new endpoint); when supplied the
+    LLM is told to use it only to identify the expected answer and never to
+    mention it in the query.
+
+    The answer is ``{"query", "counterpart", "rationale"}`` (see
+    :func:`parse_heldout_query`).
+    """
+    if setting not in _SETTING_TEXT:
+        raise ValueError(f"Unknown held-out setting {setting!r}; expected one of {SETTINGS}")
+    new_facet = NEW_FACET[setting]
+    cp_facet = COUNTERPART_FACET[setting]
+    path = " > ".join(new_endpoint.get("path", []) or []) or str(new_endpoint.get("name", ""))
+    abstract = str(source.get("abstract", "") or "").replace("\n", " ")
+    hint = ""
+    if counterpart:
+        hint = (
+            f"\nFor alignment only: in the reference taxonomy the held-out counterpart {cp_facet} is labelled "
+            f"\"{counterpart.get('name', '')}\" ({counterpart.get('definition', '')}). Use this to identify the "
+            "expected answer, but never mention it, its wording, or its acronym in the query.\n"
+        )
+    user = (
+        f"Setting: {_SETTING_TEXT[setting]}\n\n"
+        f"New endpoint ({new_facet}) in the reference taxonomy:\n"
+        f"Label: {new_endpoint.get('name', '')}\nDefinition: {new_endpoint.get('definition', '')}\n"
+        f"Taxonomy path: {path}\n\n"
+        f"Source paper:\nTitle: {source.get('title', '')}\nAbstract: {abstract}\n{hint}\n"
+        f"Task 1 -- write ONE query (2-4 sentences) in the voice of a researcher who knows the new {new_facet} "
+        f"but not the answer. Describe the new {new_facet} and its function as an unfamiliar endpoint (what it "
+        f"is, what it must achieve or what it does, and its key properties), then ask {_ASK_TEXT[setting]}. "
+        f"The query must NOT name the held-out counterpart {cp_facet}, its acronym, or any synonym that gives "
+        "it away; it must NOT copy any distinctive phrase of the abstract; and it must not mention the source "
+        "paper.\n"
+        f"Task 2 -- from the source paper, extract the expected answer record: the held-out counterpart "
+        f"{cp_facet} as a concise concept name (as the paper names it), and a one-sentence rationale, grounded "
+        f"in the source paper, explaining why it fits the new {new_facet}.\n\n"
+        "Answer JSON:\n"
+        '{"query": "<the query>", "counterpart": "<counterpart concept name>", "rationale": "<one sentence>"}'
+    )
+    payload = {
+        "source": {
+            "id": source.get("id"),
+            "title": source.get("title", ""),
+            "abstract": source.get("abstract", ""),
+            "date": source.get("date"),
+        },
+        "setting": setting,
+        "new_endpoint": dict(new_endpoint),
+        "counterpart": dict(counterpart) if counterpart else None,
+    }
+    return LLMRequest(
+        task="benchmark.heldout_query",
+        messages=chat(HELDOUT_SYSTEM, user),
+        payload=payload,
+        component=component,
+        json_mode=True,
+    )
+
+
+def parse_heldout_query(obj: Any) -> Tuple[str, str, str]:
+    """``(query, counterpart, rationale)`` from the LLM's JSON answer."""
+    if not isinstance(obj, dict):
+        return "", "", ""
+    record = obj.get("expected_answer") if isinstance(obj.get("expected_answer"), dict) else obj
+    query = str(obj.get("query", "") or "").strip()
+    counterpart = str(record.get("counterpart", "") or "").strip()
+    rationale = str(record.get("rationale", "") or "").strip()
+    return query, counterpart, rationale
+
+
+# Words that open "<Variant> <Method> Approach for <Problem>" style titles.
+_TITLE_PREFIX = re.compile(
+    r"^(?:(?:a|an|the|towards?|revisiting|learning|fast|scalable|efficient|robust|unified|improved|"
+    r"novel|simple|deep|on)\s+)+",
+    re.IGNORECASE,
+)
+_TITLE_SUFFIX = re.compile(r"\s+(?:approach|framework|model|method|technique)s?$", re.IGNORECASE)
+
+
+def counterpart_from_title(title: str, facet: str) -> str:
+    """Heuristic counterpart extraction from "<method> for <problem>" titles (mock only)."""
+    title = (title or "").strip()
+    cut = title.lower().find(" for ")
+    if cut < 0:
+        return title.split(":")[0].strip()
+    if facet == "method":
+        part = _TITLE_SUFFIX.sub("", _TITLE_PREFIX.sub("", title[:cut]).strip())
+    else:
+        part = re.split(r"\bwith\b|:|\busing\b|\bvia\b|\bunder\b", title[cut + 5 :], maxsplit=1)[0]
+    return part.strip(" .,;") or title
+
+
+def _sanitize(text: str, banned: Set[str]) -> str:
+    """Drop words whose stem is banned and tidy the spacing/punctuation."""
+    kept = []
+    for word in re.split(r"(\s+)", text):
+        core = re.sub(r"[^A-Za-z0-9\-]", "", word).lower()
+        parts = [stem(p) for p in core.split("-") if p]
+        if parts and any(p in banned for p in parts):
+            continue
+        kept.append(word)
+    out = re.sub(r"\s+", " ", "".join(kept)).strip()
+    out = re.sub(r"\s+([.,;:?])", r"\1", out)
+    return re.sub(r"([.,;:])\1+", r"\1", out)
+
+
+def _mock_heldout_query(payload: Dict[str, Any], request: LLMRequest) -> Dict[str, Any]:
+    setting = payload.get("setting", NEW_PROBLEM)
+    new = payload.get("new_endpoint", {}) or {}
+    src = payload.get("source", {}) or {}
+    hint = payload.get("counterpart") or {}
+    cp_facet = COUNTERPART_FACET.get(setting, "method")
+    counterpart = str(hint.get("name") or "") or counterpart_from_title(str(src.get("title", "")), cp_facet)
+    banned = content_terms(counterpart, drop_generic=True)
+    name = str(new.get("name", "")).strip()
+    definition = str(new.get("definition", "")).strip()
+    if definition and not definition.endswith("."):
+        definition += "."
+    if setting == NEW_METHOD:
+        text = (f"I have developed a new method: {name}. {definition} To which established research problems, "
+                "possibly in other domains, could this method be applied, and why would it fit?")
+    else:
+        text = (f"I am working on a new research problem: {name}. {definition} Which existing methods, possibly "
+                "developed in other research areas, could be adapted to solve this problem, and why would they fit?")
+    query = _sanitize(text, banned)
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", str(src.get("abstract", "") or "")) if s.strip()]
+    cp_terms = content_terms(counterpart, drop_generic=False)
+    rationale = next((s for s in sentences if content_terms(s, drop_generic=False) & cp_terms), "")
+    rationale = rationale or (sentences[1] if len(sentences) > 1 else (sentences[0] if sentences else ""))
+    return {"query": query, "counterpart": counterpart, "rationale": rationale}
+
+
+MOCK_HANDLERS = {
+    "benchmark.verify_application": _mock_verify,
+    "benchmark.heldout_query": _mock_heldout_query,
+}
