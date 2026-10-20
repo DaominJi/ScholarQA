@@ -1,0 +1,153 @@
+# ScholarPath default configuration (offline: mock LLM + hashing embedder).
+#
+# Hyper-parameters follow Section 5.1 / Appendix C.3 of the paper:
+#   eps = 0.10, 1 - delta = 0.95, eta_A = 0.02, beta = 16, kappa = 3,
+#   min node size 16, max depth 5, G_v = min{8, floor(n_v / 24)},
+#   router = 2-layer MLP (hidden 256, GELU, AdamW, 20% stratified validation),
+#   context budget B = 8192 tokens, DeepSeek-V4.0-Flash pricing $0.14 / $0.28 per 1M tokens.
+#
+# For the paper's setting use configs/paper.yaml (real LLM + SPECTER2), or
+# override fields on the command line:  --set llm.provider=openai --set retrieval.budget=4096
+llm:
+  provider: mock
+  model: deepseek-v4-flash
+  base_url: null
+  api_key_env: SCHOLARPATH_LLM_API_KEY
+  temperature: 0.0
+  max_output_tokens: 2048
+  timeout_s: 120.0
+  max_retries: 4
+  json_retries: 2
+  price_input_per_m: 0.14
+  price_output_per_m: 0.28
+  cache_dir: cache/llm
+  bill_cached_calls: true
+  seed: 0
+embedding:
+  backend: hashing
+  model_name: allenai/specter2_base
+  adapter: allenai/specter2
+  query_adapter: allenai/specter2_adhoc_query
+  dim: 768
+  batch_size: 32
+  max_length: 512
+  device: null
+  cache_dir: cache/embeddings
+builder:
+  facet: problem
+  epsilon: 0.1
+  delta: 0.05
+  delta_allocation: spend
+  max_nodes: 512
+  batch_cap: 16
+  kappa: 3
+  eta_A: 0.02
+  s_max: 32
+  min_node_size: 16
+  max_depth: 5
+  max_regions: 8
+  papers_per_region: 24
+  seed_per_region: 2
+  min_children: 2
+  max_children: 8
+  llm_papers_per_call: 16
+  max_rounds: 12
+  max_cycles: 6
+  audit_batch_size: 8
+  repair_pool_fraction: 0.02
+  repair_pool_floor: 2
+  audit_abort_factor: 1.5
+  audit_min_draws: 8
+  prior_slope_mean: 0.05
+  prior_slope_var: 0.0025000000000000005
+  obs_noise_var: 0.0004
+  use_transferred_prior: true
+  use_bayesian_acquisition: true
+  use_snapshot_certification: true
+  fixed_ratio: 0.08
+  use_discovery: true
+  use_correction: true
+  use_targeted_repair: true
+  max_llm_papers_per_node: null
+  router:
+    hidden_dim: 256
+    learning_rate: 0.001
+    weight_decay: 0.01
+    epochs: 60
+    batch_size: 64
+    validation_fraction: 0.2
+    threshold: 0.5
+    negatives_per_positive: 3
+    seed: 0
+  seed: 0
+baseline:
+  selector: full
+  eta: 0.2
+  mode: node_wise
+  facet: problem
+  min_node_size: 16
+  max_depth: 5
+  min_children: 2
+  max_children: 8
+  llm_papers_per_call: 16
+  router:
+    hidden_dim: 256
+    learning_rate: 0.001
+    weight_decay: 0.01
+    epochs: 60
+    batch_size: 64
+    validation_fraction: 0.2
+    threshold: 0.5
+    negatives_per_positive: 3
+    seed: 0
+  seed: 0
+retrieval:
+  budget: 8192
+  grounding_top_k: 3
+  grounding_min_sim: 0.2
+  anchor_top_k: 3
+  max_aspects: 6
+  granularity_weights:
+    overview:
+      concept: 0.9
+      paper: 0.8
+      chunk: 0.5
+    empirical:
+      concept: 0.0
+      paper: 0.85
+      chunk: 0.9
+    mechanism:
+      concept: 0.0
+      paper: 0.6
+      chunk: 1.0
+  bridge_decay: 0.8
+  max_bridge_distance: 4
+  max_hypothesis_candidates: 64
+  max_chunks_per_paper: 64
+  use_link_prediction: true
+  use_bound_guided_search: true
+  use_role_aware_granularity: true
+  use_shared_cost_update: true
+  llm_query_understanding: true
+  answer_max_tokens: 1536
+link_prediction:
+  embed_dim: 128
+  hidden_dim: 256
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  epochs: 40
+  negatives_per_positive: 8
+  context_dropout: 0.2
+  horizon_years: 2.0
+  cutoffs:
+  - '2019-01-01'
+  - '2020-01-01'
+  - '2021-01-01'
+  - '2022-01-01'
+  verify_with_llm: true
+  seed: 0
+index:
+  chunk_max_tokens: 512
+  chunk_min_tokens: 32
+  use_fulltext: true
+seed: 0

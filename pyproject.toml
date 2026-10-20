@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scholarpath"
+version = "0.1.0"
+description = "ScholarPath: multi-granularity semantic indexing and budgeted support-path retrieval for evidence and hypothesis queries over scholarly repositories"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "scikit-learn>=1.3",
+    "pyyaml>=6.0",
+    "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+llm = [
+    "openai>=1.30",
+    "tiktoken>=0.7",
+]
+embeddings = [
+    "torch>=2.0",
+    "transformers>=4.40",
+    "adapters>=1.0",
+    "sentence-transformers>=2.7",
+]
+data = [
+    "requests>=2.31",
+    "datasets>=2.19",
+    "pymupdf>=1.24",
+]
+agents = [
+    "paper-qa>=5.0",
+]
+dev = [
+    "pytest>=7.4",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["scholarpath*"]
+
+[tool.setuptools.package-dir]
+"" = "src"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

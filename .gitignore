@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+*.log
+.DS_Store
+build/
+dist/
+# Experiment outputs and caches
+results/
+artifacts/
+cache/
+.cache/
+tmp/
+# Raw / downloaded data (fetched by scripts/download_data.py)
+data/raw/
+data/processed/
+data/fulltext/
+!data/README.md
