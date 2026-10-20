@@ -200,6 +200,8 @@ class RetrievalConfig:
     grounding_top_k: int = 3  # scopes matched per query concept
     grounding_min_sim: float = 0.2
     anchor_top_k: int = 3  # neighbours of a query-local anchor concept
+    # Cosine an anchor's neighbour needs to act as a scope (None: 0.5 * grounding_min_sim).
+    anchor_min_sim: Optional[float] = None
     max_aspects: int = 6
     # Granularity weights gamma_{a, level} per evidential role (Section 4.4).
     # Roles: overview, empirical, mechanism. Levels: concept, paper, chunk.

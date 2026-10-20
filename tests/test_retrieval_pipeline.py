@@ -9,7 +9,7 @@ import pytest
 
 from scholarpath.data.synthetic import make_synthetic_benchmark
 from scholarpath.index import SemanticIndex
-from scholarpath.retrieval import ScholarPathRetriever
+from scholarpath.retrieval import EmbeddingLinkPredictor, ScholarPathRetriever
 from scholarpath.runtime import Runtime
 from scholarpath.text import count_tokens
 from scholarpath.types import EVIDENCE, HYPOTHESIS_DISCOVERY
@@ -127,9 +127,18 @@ def test_ablation_switches_change_behaviour(index, bench, rt):
     assert e_hyp.stats["algorithm"] == "exhaustive"
     assert e_hyp.stats["units_created"] > base_hyp.stats["units_created"]
 
-    # w/o link prediction: eta = phi only, so the hypothesis scores change.
+    # "w/o temporal link prediction" (Table 7) swaps in another (untrained) prior: candidates are still
+    # scored ("Scored" column), but with different link probabilities.
+    other = copy.deepcopy(rt.config.retrieval)
+    other.max_chunks_per_paper = 2
+    untrained = ScholarPathRetriever(index, rt.llm, rt.embedder, other,
+                                     link_predictor=EmbeddingLinkPredictor(scale=2.0, bias=-1.0)).retrieve(q_hyp, 1500)
+    assert untrained.stats["scored_candidates"] == base_hyp.stats["scored_candidates"] > 0
+    assert untrained.stats["candidate_scores"] != base_hyp.stats["candidate_scores"]
+    # Dropping the prior altogether (eta = phi): no link evaluation, candidates still scored.
     nolink = _retriever(index, rt, use_link_prediction=False).retrieve(q_hyp, 1500)
-    assert nolink.stats["scored_candidates"] == 0 < base_hyp.stats["scored_candidates"]
+    assert nolink.stats["link_evaluations"] == 0 < base_hyp.stats["link_evaluations"]
+    assert nolink.stats["scored_candidates"] == base_hyp.stats["scored_candidates"]
     assert nolink.stats["candidate_scores"] != base_hyp.stats["candidate_scores"]
 
     # w/o role-aware granularity and w/o shared-cost reuse: different selections.
@@ -140,6 +149,35 @@ def test_ablation_switches_change_behaviour(index, bench, rt):
         noshare = [u.key for u in _retriever(index, rt, use_shared_cost_update=False).retrieve(q, 1500).units]
         changed += int(flat != ref) + int(noshare != ref)
     assert changed >= 2
+
+
+def test_node_costs_are_priced_once_per_index(index, bench, rt):
+    """c(x) and the subtree minima behind c_low(H | S) are query-independent and shared across queries."""
+    r = _retriever(index, rt)
+    first, second = bench.hypothesis_queries[0], bench.hypothesis_queries[1]
+    r.retrieve(first, budget=2048)
+    papers = r.costs.priced("paper")
+    assert papers > 0
+    res = r.retrieve(second, budget=2048)
+    assert r.costs.priced("paper") <= papers + len(res.ranked_papers)
+    again = r.costs.priced()
+    r.retrieve(first, budget=2048)
+    assert r.costs.priced() == again  # a repeated query prices nothing
+    space = r.search_space(r.analyze(first), r.ground(r.analyze(first)))
+    assert space.renderer.costs is r.costs
+
+
+def test_sources_attribute_shared_premise_papers_to_every_candidate(index, bench, rt):
+    r = _retriever(index, rt)
+    for q in bench.hypothesis_queries[:2]:
+        res = r.retrieve(q, budget=4096)
+        named = {s["candidate"] for s in res.sources if s["candidate"]}
+        assert named == set(res.candidates)
+        for u in res.units:
+            if u.kind == "complementary":
+                assert {(p, u.candidate) for p in u.papers} <= {(s["paper_id"], s["candidate"]) for s in res.sources}
+        ans = r.answer(q, budget=4096)
+        assert {it.candidate for it in ans.items if it.status == "hypothesis"} == set(res.candidates[:10])
 
 
 def test_retrieval_result_is_json_serializable(index, bench, rt):

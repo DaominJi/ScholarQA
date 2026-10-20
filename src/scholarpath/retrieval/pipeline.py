@@ -10,6 +10,21 @@
 
 The search itself issues no LLM call; the only calls are query
 understanding (optional) and composition (Table 5).
+
+Ablations (Table 7)
+-------------------
+* "w/o temporal link prediction": pass the untrained
+  :class:`~scholarpath.retrieval.link_prediction.EmbeddingLinkPredictor`
+  (text similarity of concept descriptions) instead of the temporally trained
+  predictor; candidates are still scored, by the untrained prior.
+* "w/o bound-guided search": ``config.use_bound_guided_search = False``
+  (exhaustive greedy scan; identical selections, Proposition 7).
+* "w/o role-aware granularity": ``config.use_role_aware_granularity = False``.
+* "w/o shared-cost reuse update": ``config.use_shared_cost_update = False``.
+* ``config.use_link_prediction = False`` is a further ablation that drops the
+  prior altogether (eta_hat = phi).
+
+``RetrievalResult.stats["scored_candidates"]`` is the "Scored" column.
 """
 
 from __future__ import annotations
@@ -22,7 +37,7 @@ from scholarpath.config import RetrievalConfig
 from scholarpath.embeddings import Embedder
 from scholarpath.index.semantic_index import SemanticIndex
 from scholarpath.llm import LLMClient, sum_usage
-from scholarpath.retrieval.compose import ContextRenderer, assemble_context, compose_answer
+from scholarpath.retrieval.compose import ContextRenderer, NodeCostTable, assemble_context, compose_answer
 from scholarpath.retrieval.grounding import Grounding, ground
 from scholarpath.retrieval.link_prediction import EmbeddingLinkPredictor, LinkPredictor
 from scholarpath.retrieval.query_understanding import QueryAnalysis, analyze_query
@@ -57,6 +72,8 @@ class ScholarPathRetriever:
         self._link_predictor = link_predictor
         if link_predictor is not None and getattr(link_predictor, "prepared_for", None) != id(index):
             link_predictor.prepare(index)
+        # Query-independent node costs c(x) and subtree minima, shared by all queries (Section 4.3).
+        self.costs = NodeCostTable(index)
 
     @property
     def link_predictor(self) -> LinkPredictor:
@@ -73,10 +90,14 @@ class ScholarPathRetriever:
         lp = self.link_predictor if analysis.is_hypothesis else None
         return ground(analysis, self.index, self.embedder, self.config, lp)
 
+    def renderer(self) -> ContextRenderer:
+        """A fresh per-query renderer that prices index nodes through the shared cost table."""
+        return ContextRenderer(self.index, self.costs)
+
     def search_space(self, analysis: QueryAnalysis, grounding: Grounding,
                      renderer: Optional[ContextRenderer] = None) -> SearchSpace:
         lp = self.link_predictor if analysis.is_hypothesis else None
-        return build_search_space(analysis, grounding, self.index, self.config, lp, renderer)
+        return build_search_space(analysis, grounding, self.index, self.config, lp, renderer or self.renderer())
 
     # ---------------------------------------------------------------- public
     def retrieve(self, query: Union[Query, str], budget: Optional[int] = None) -> RetrievalResult:
@@ -88,7 +109,7 @@ class ScholarPathRetriever:
         before = meter.snapshot() if meter is not None else {}
         analysis = self.analyze(query)
         grounding = self.ground(analysis)
-        renderer = ContextRenderer(self.index)
+        renderer = self.renderer()
         space = self.search_space(analysis, grounding, renderer)
         search_budget = max(0, budget - renderer.header_overhead())
         result = make_search(space).run(search_budget)

@@ -25,10 +25,14 @@ instance is an element of A_q with its own support f:
 * evidence aspects with an *empirical* or *mechanism* role target the
   established findings, i.e. the papers of J(u_q, m_q) (a path covers the
   instance iff it ends at the paper or at one of its chunks);
-* background aspects of a hypothesis query target the known endpoint (when an
-  assessed pair is already studied, they target its findings J(u_q, m_q) as above);
+* background aspects of a hypothesis query target the already-studied
+  baselines of the known endpoint: overview aspects the baseline concepts m'
+  (a path covers m' iff m' lies on it), empirical / mechanism aspects the
+  findings J(u_q, m') (as above);
 * the premise aspects of a hypothesis query define one hypothesis instance
-  h_c per unexplored candidate c, covered by the path sets of c (Eq. 9).
+  h_c per unexplored candidate c, covered by the path sets of c (Eq. 9). When
+  an assessed pair is already studied (J(u_q, m_q) non-empty) no hypothesis is
+  formed and every aspect targets the findings J(u_q, m_q).
 
 The weight w_a of an aspect is split evenly over its targets, so the instance
 weights still sum to one. Instances are organized in *groups* such that a
@@ -44,7 +48,7 @@ from typing import Callable, Dict, FrozenSet, Iterable, List, Mapping, Optional,
 
 INF = math.inf
 
-CONCEPT_GROUP = "concept"  # explicit target keys (overview sub-concepts, known endpoint)
+CONCEPT_GROUP = "concept"  # explicit target keys (overview sub-concepts, baselines m', known endpoint)
 FINDING_GROUP = "finding"  # papers of the junction J(u_q, m_q)
 HYPOTHESIS_GROUP = "hypothesis"  # one instance per candidate c
 

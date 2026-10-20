@@ -11,18 +11,22 @@ import pytest
 
 from scholarpath.data.synthetic import make_synthetic_benchmark
 from scholarpath.index import SemanticIndex
-from scholarpath.retrieval.grounding import ground
-from scholarpath.retrieval.objective import SelectionState, delta
+from scholarpath.retrieval.grounding import default_anchor_min_sim, ground
+from scholarpath.retrieval.objective import Coverage, SelectionState, delta
 from scholarpath.retrieval.pipeline import ScholarPathRetriever
 from scholarpath.retrieval.query_understanding import Aspect, QueryAnalysis
 from scholarpath.retrieval.search import (
     BoundGuidedSearch,
+    CandidateSubtreeRegion,
     ExhaustiveGreedy,
+    RangeArgMin,
     Region,
+    Witness,
+    WitnessCosts,
     build_search_space,
     ranked_join,
 )
-from scholarpath.retrieval.units import ComplementaryPathSet
+from scholarpath.retrieval.units import ComplementaryPathSet, DirectPath
 from scholarpath.runtime import Runtime
 from scholarpath.taxonomy.tree import Taxonomy
 from scholarpath.types import EVIDENCE, HYPOTHESIS_ASSESSMENT, HYPOTHESIS_DISCOVERY, Chunk, Paper, Query
@@ -146,12 +150,24 @@ def test_example1_hypothesis_assessment(rt, toy):
     assert sets and sets[0].metadata["e_P"][-1] == "paper:p4"
     phi = rt.config.retrieval.bridge_decay ** (sets[0].metadata["distance"] - 1)
     assert sets[0].metadata["eta"] == pytest.approx(phi)
-    assert res.stats["scored_candidates"] == 0
-    # An assessed pair that is already studied also retrieves its direct junction evidence J(u_q, m_q).
-    studied = r.retrieve(Query("qs", "Could graph neural networks be applied to drug discovery?",
-                               HYPOTHESIS_ASSESSMENT), 1024)
-    direct = [u for u in studied.units if u.kind == "direct"]
-    assert direct and {p for u in direct for p in u.papers} <= toy.shared_papers("u1", "m4")
+    assert res.stats["scored_candidates"] == 1 and res.stats["link_evaluations"] == 0
+
+
+@pytest.mark.parametrize("text, method", [
+    ("Could graph neural networks be applied to drug discovery?", "m4"),  # J(u1, m4) = {p2, p3}
+    ("Could graph learning be applied to air-quality forecasting?", "m1"),  # J(u5, m1) = {p4}: m1 is above m4
+])
+def test_assessment_of_a_studied_pair_returns_established_findings(rt, toy, text, method):
+    """Sec. 2.1: hypotheses concern pairs with J(u, m) empty; a studied pair is answered by J(u_q, m_q)."""
+    r = ScholarPathRetriever(toy, rt.llm, rt.embedder, rt.config.retrieval)
+    res = r.retrieve(Query("qs", text, HYPOTHESIS_ASSESSMENT), 1024)
+    problem = res.stats["grounding"]["problem_scopes"][0][0]
+    assert res.stats["grounding"]["method_scopes"][0][0] == method
+    junction = toy.shared_papers(problem, method)
+    assert junction and res.units and not res.candidates
+    assert all(u.kind == "direct" and u.status == "established" for u in res.units)
+    assert set(res.ranked_papers) <= junction
+    assert "Hypothesis:" not in res.context
 
 
 def _analysis(rt, specs, problem, method, text="q") -> QueryAnalysis:
@@ -209,8 +225,7 @@ def syn(rt):
 def _c_low(space, region: Region, state: SelectionState, hit: set) -> int:
     total = sum(space.cost(x) for x in dict.fromkeys(region.req) if x not in state.nodes)
     for g in region.groups:
-        if not any(t in hit for t in g.tokens):
-            total += g.min_cost
+        total += g.value(state, any(t in hit for t in g.tokens))
     return total
 
 
@@ -319,6 +334,137 @@ def test_weaker_premise_rule_on_synthetic_hypotheses(rt, syn):
     assert seen_upgrade
 
 
+def test_subtree_bound_uses_the_best_bridge_discount_below_v(rt, syn):
+    """eta_bar(H) = sigma(U(u_q, v)) phi_bar(H), phi_bar(H) = max bridge discount of the candidates below v."""
+    _, index, retriever, prepared = syn
+    cfg = retriever.config
+    checked = 0
+    for q, a, g in prepared:
+        if not a.is_hypothesis:
+            continue
+        space = retriever.search_space(a, g)
+        hyp = space.hyp
+        tax = index.taxonomy(hyp.cand_facet)
+        for v, flag in hyp.has_candidate.items():
+            below = [c for c in tax.descendants(v, include_self=True) if c in hyp.candidates]
+            assert flag == bool(below)
+            best = max((cfg.bridge_decay ** (hyp.d_min[c] - 1) for c in below), default=0.0)
+            assert hyp.phi_bar[v] == pytest.approx(best)
+            if flag:
+                region = CandidateSubtreeRegion(space, v)
+                expected = space.link_bound(v) * best * min(space.known_premise_bound(), space.cand_premise_bound(v))
+                assert region.rbar(space) == pytest.approx(expected)
+                checked += 1
+    assert checked
+
+
+def test_range_minimum_queries_under_a_selection():
+    """Cost bounds of the pair ranges: range minima of terminal costs, exact under the current S."""
+    rng = random.Random(3)
+    values = [rng.randint(1, 50) for _ in range(37)]
+    rmq = RangeArgMin(values)
+    for lo in range(len(values)):
+        for hi in range(lo + 1, len(values) + 1):
+            m = rmq.argmin(lo, hi)
+            assert values[m] == min(values[lo:hi]) and m == values.index(values[m], lo, hi)
+    costs = {f"paper:p{i}": rng.randint(5, 40) for i in range(8)}
+    costs.update({f"chunk:p{i}#0": rng.randint(5, 40) for i in range(8)})
+    witnesses = []
+    for i in range(8):
+        witnesses.append(Witness(0.0, DirectPath(("concept:c", f"paper:p{i}"), "c", "method")))
+        witnesses.append(Witness(0.0, DirectPath(("concept:c", f"paper:p{i}", f"chunk:p{i}#0"), "c", "method")))
+    rng.shuffle(witnesses)
+    space = type("Space", (), {"cost": staticmethod(costs.__getitem__)})()
+    wc = WitnessCosts(space, witnesses)
+    state = SelectionState(10 ** 6, costs.__getitem__)
+    for step in range(4):
+        for lo in range(len(witnesses)):
+            for hi in range(lo + 1, len(witnesses) + 1):
+                brute = min(sum(costs[k] for k in w.path.nodes[1:] if k not in state.nodes) for w in witnesses[lo:hi])
+                assert wc.min(lo, hi, state) == brute
+        state.apply((f"paper:p{2 * step}",) + ((f"chunk:p{2 * step}#0",) if step % 2 else ()), Coverage())
+
+
+def test_junction_pruning_is_reported(rt, syn):
+    _, index, retriever, prepared = syn
+    q, a, g = next(t for t in prepared if t[1].kind == EVIDENCE)
+    stats = BoundGuidedSearch(retriever.search_space(a, g)).run(10 ** 6).stats
+    assert stats["postings_pruned_by_junction"] > 0
+    assert stats["postings_scanned"] + stats["postings_pruned"] == stats["postings_total"]
+
+
+# ---------------------------------------------------------------------------
+# Prop. 7 / Lemma 6 on deeper random taxonomies with multi-label and residual papers
+# ---------------------------------------------------------------------------
+
+_WORDS = ("graph neural network contrastive learning drug target molecule property pollution sensor forecasting "
+          "federated client privacy evolutionary search mutation transformer attention image segmentation protein "
+          "folding diffusion model reinforcement policy reward time series anomaly detection kernel bayesian "
+          "optimization causal inference language retrieval summarization").split()
+
+
+def _random_index(embedder, seed: int, n_papers: int = 45, n_concepts: int = 11) -> SemanticIndex:
+    rng = random.Random(seed)
+
+    def text(k: int) -> str:
+        return " ".join(rng.choice(_WORDS) for _ in range(k))
+
+    def taxonomy(facet: str) -> Taxonomy:
+        tax = Taxonomy(facet, "Root", f"all {facet}s")
+        frontier = [tax.root_id]
+        while len(tax.nodes) < n_concepts and frontier:
+            parent = rng.choice(frontier)
+            if len(tax.nodes[parent].children) >= 3:
+                frontier.remove(parent)
+                continue
+            frontier.append(tax.add_node(f"{text(2)} {facet[0]}{len(tax.nodes)}", text(6), parent=parent))
+        return tax
+
+    P, M = taxonomy("problem"), taxonomy("method")
+    papers = []
+    for i in range(n_papers):
+        pid = f"x{i}"
+        chunks = [Chunk(f"{pid}#{j}", pid, rng.choice(["Method", "Experiments"]), text(15), j)
+                  for j in range(rng.randint(0, 2))]
+        papers.append(Paper(pid, text(5), text(20), chunks=chunks))
+        for tax in (P, M):  # one or two labels anywhere in the tree (internal labels leave residual papers)
+            for nid in rng.sample([n for n in tax.nodes if n != tax.root_id], rng.choice([1, 1, 2])):
+                tax.assign(pid, nid)
+    return SemanticIndex.build(P, M, papers, embedder)
+
+
+@pytest.mark.parametrize("seed", range(3))
+def test_prop7_on_random_multilabel_taxonomies(rt, seed):
+    index = _random_index(rt.embedder, seed)
+    cfg = copy.deepcopy(rt.config.retrieval)
+    cfg.max_chunks_per_paper = 2
+    r = ScholarPathRetriever(index, rt.llm, rt.embedder, cfg)
+    rng = random.Random(seed)
+    pn = [index.problem.nodes[n].name for n in index.problem.nodes if n != index.problem.root_id]
+    mn = [index.method.nodes[n].name for n in index.method.nodes if n != index.method.root_id]
+    queries = [
+        Query("e1", f"How has {rng.choice(mn)} been used for {rng.choice(pn)}?", EVIDENCE),
+        Query("e2", f"What methods are used for {rng.choice(pn)}?", EVIDENCE),
+        Query("h1", f"Which other methods could be applied to {rng.choice(pn)}?", HYPOTHESIS_DISCOVERY),
+        Query("h2", f"Which problems could {rng.choice(mn)} be applied to?", HYPOTHESIS_DISCOVERY),
+        Query("a1", f"Could {rng.choice(mn)} be applied to {rng.choice(pn)}?", HYPOTHESIS_ASSESSMENT),
+        Query("a2", f"Could quantum annealing hardware be applied to {rng.choice(pn)}?", HYPOTHESIS_ASSESSMENT),
+    ]
+    for q in queries:
+        a = r.analyze(q)
+        g = r.ground(a)
+        for budget in (300, 3000):
+            bgs = BoundGuidedSearch(r.search_space(a, g)).run(budget)
+            exh = ExhaustiveGreedy(r.search_space(a, g)).run(budget)
+            assert bgs.uids == exh.uids, (seed, q.query_id, budget)
+            assert bgs.state.used == exh.state.used <= budget
+        res = r.retrieve(q, 600)
+        assert res.context_tokens <= 600
+        if seed == 0:  # Lemma 6 on every region of the query
+            space = r.search_space(a, g)
+            assert _check_region_bounds(space, SelectionState(10 ** 6, space.cost))
+
+
 # ---------------------------------------------------------------------------
 # Appendix A.3: ranked join with early termination (Proposition 3)
 # ---------------------------------------------------------------------------
@@ -348,6 +494,8 @@ def test_ranked_join_terminates_early(rt, toy):
     res = ranked_join(toy, pairs, lambda p: 1.0, k=1)
     assert res.top[0][1] == pytest.approx(1.0) and res.top[0][0] in {"p2", "p3"}
     assert res.pairs_processed == 1 and res.postings_pruned > 0
+    empty = ranked_join(toy, pairs, lambda p: 1.0, k=0)
+    assert empty.top == [] and empty.pairs_processed == 0 and empty.postings_pruned == empty.postings_total
 
 
 # ---------------------------------------------------------------------------
@@ -362,11 +510,101 @@ def test_unfamiliar_concept_becomes_query_local_anchor(rt, toy):
     g = r.ground(a)
     anchor = g.anchor("problem")
     assert anchor is not None and len(anchor.neighbors) == rt.config.retrieval.anchor_top_k
-    assert [s for s, _ in g.problem_scopes] == [n for n, _ in anchor.neighbors][: len(g.problem_scopes)]
+    # Unrelated neighbours (cosine below anchor_min_sim) do not become scopes: the facet is unmatched.
+    assert max(sim for _, sim in anchor.neighbors) < default_anchor_min_sim(rt.config.retrieval)
+    assert g.unmatched["problem"] and g.problem_scopes == [(toy.problem.root_id, 1.0)]
     z = r.link_predictor.z(anchor.anchor_id)  # encoded from its description (Section 4.3)
     assert np.all(np.isfinite(z))
     res = r.retrieve(q, 1024)
     assert res.context_tokens <= 1024
+    # The hypothesis side still attaches the anchor to its top-k neighbours, and says so in the context.
+    assert res.context.startswith('Note: "zebrafish morphogenesis" is not in the index')
     for u in res.units:
         if u.kind == "complementary":
             assert u.metadata["known"] == anchor.anchor_id
+
+
+def test_anchor_neighbours_scope_evidence_only_when_related(rt, toy):
+    r = ScholarPathRetriever(toy, rt.llm, rt.embedder, rt.config.retrieval)
+    # "contrastive pretraining" is absent from I but close to GCL (m3): m3 stands in for it.
+    near = r.retrieve(Query("e1", "How has contrastive pretraining been used for drug discovery?", EVIDENCE), 1024)
+    g = near.stats["grounding"]
+    assert g["anchors"] and [s for s, _ in g["method_scopes"]] == ["m3"] and not g["unmatched"]
+    assert set(near.ranked_papers) <= toy.shared_papers("u1", "m3") and not near.context.startswith("Note:")
+    # An unrelated absent method: no neighbour stands in, so no other method's papers are cited for the pair;
+    # the findings of the matched problem are returned under an explicit note.
+    far = r.retrieve(Query("e2", "How has quantum annealing hardware been used for drug discovery?", EVIDENCE), 1024)
+    g = far.stats["grounding"]
+    assert g["unmatched"] == {"method": True} and g["method_scopes"] == [[toy.method.root_id, 1.0]]
+    assert far.context.startswith('Note: no method concept in the index matches "quantum annealing hardware"')
+    assert set(far.ranked_papers) <= toy.extent("u1") and far.context_tokens <= 1024
+    # The note's tokens are reserved from the budget.
+    for budget in (60, 150, 250):
+        tight = r.retrieve(Query("e2", far.stats["analysis"]["text"], EVIDENCE), budget)
+        assert tight.context_tokens <= budget
+        assert tight.context.startswith("Note:") == bool(tight.units)
+
+
+def test_assessment_of_a_concept_absent_from_the_index_keeps_the_asked_pair(rt, toy):
+    """The given method is a query-local anchor, never silently replaced by its closest neighbour."""
+    r = ScholarPathRetriever(toy, rt.llm, rt.embedder, rt.config.retrieval)
+    q = Query("qa", "Could spiking neuromorphic chips be applied to air-quality forecasting?", HYPOTHESIS_ASSESSMENT)
+    a = r.analyze(q)
+    g = r.ground(a)
+    anchor = g.anchor("method")
+    assert anchor is not None
+    res = r.retrieve(q, 1024)
+    assert res.candidates == ["spiking neuromorphic chips"]
+    assert "## Hypothesis: spiking neuromorphic chips for Air-quality forecasting" in res.context
+    assert "## Hypothesis: Graph learning" not in res.context
+    sets = [u for u in res.units if u.kind == "complementary"]
+    neighbours = [n for n, _ in anchor.neighbors]
+    assert sets and all(u.candidate_id == anchor.anchor_id for u in sets)
+    for u in sets:
+        assert u.metadata["e_C"][-1] in {f"concept:{n}" for n in neighbours}  # attached to a neighbour
+        assert u.metadata["e_M"][0] in {f"concept:{n}" for n in neighbours}  # method side via a neighbour
+        assert u.metadata["e_P"][0] == "concept:u5" and u.metadata["eta"] == pytest.approx(
+            rt.config.retrieval.bridge_decay ** (u.metadata["distance"] - 1))
+    assert res.stats["link_evaluations"] == 0 and res.context_tokens <= 1024
+    space_a, space_b = r.search_space(a, g), r.search_space(a, g)
+    for budget in (200, 1024):
+        assert BoundGuidedSearch(space_a).run(budget).uids == ExhaustiveGreedy(space_b).run(budget).uids
+
+
+def test_discovery_retrieves_the_already_studied_baselines(rt, toy):
+    """Step 2: discovery aspects also target the baselines m' with J(u_q, m') non-empty (here m4 and m2)."""
+    r = ScholarPathRetriever(toy, rt.llm, rt.embedder, rt.config.retrieval)
+    q2 = Query("q2", "Which other methods could be applied to air-quality forecasting?", HYPOTHESIS_DISCOVERY)
+    a = r.analyze(q2)
+    space = r.search_space(a, r.ground(a))
+    assert space.hyp.baselines == {"p4": ("m4",), "p5": ("m2",)}
+    targets = {t for grp in space.aspects.groups.values() if grp.kind == "concept" for t in grp.targets}
+    assert targets == {"concept:m4", "concept:m2"}
+    res = r.retrieve(q2, 2048)
+    direct = [u for u in res.units if u.kind == "direct"]
+    assert {"p4", "p5"} <= {p for u in direct for p in u.papers}
+    assert all(u.status == "established" for u in direct)
+    assert res.candidates[0] == "Graph contrastive learning"
+    for pid in ("p4", "p5"):  # shared nodes appear once even though p4 is also a premise of the hypothesis
+        assert res.context.count(f"- [{pid}] ") == 1
+
+
+def test_problem_side_discovery(rt, toy):
+    """Roles exchanged (App. A.4): candidate problems for a given method, here GCL (m3)."""
+    r = ScholarPathRetriever(toy, rt.llm, rt.embedder, rt.config.retrieval)
+    q3 = Query("q3", "Which problems could graph contrastive learning be applied to?", HYPOTHESIS_DISCOVERY)
+    a = r.analyze(q3)
+    assert a.searched_side == "problem"
+    space = r.search_space(a, r.ground(a))
+    assert space.hyp.known_id == "m3" and space.hyp.candidates == {"u2", "u5"}
+    res = r.retrieve(q3, 1024)
+    assert set(res.candidates) == {"Environmental forecasting", "Air-quality forecasting"}
+    sets = [u for u in res.units if u.kind == "complementary"]
+    assert sets
+    for u in sets:
+        assert not toy.shared_papers(u.candidate_id, "m3")
+        assert u.metadata["e_M"][0] == "concept:m3"  # known (method) side
+        assert u.metadata["e_P"][0] == f"concept:{u.candidate_id}"  # candidate (problem) side
+    # Every candidate reaches the composed answer even though both share their premise papers.
+    ans = r.answer(q3, 1024)
+    assert {it.candidate for it in ans.items if it.status == "hypothesis"} == set(res.candidates)

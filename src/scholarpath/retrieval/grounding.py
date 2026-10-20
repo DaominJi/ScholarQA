@@ -17,6 +17,16 @@ The matched nodes are the *scopes* that confine the search:
   ``LinkPredictor.encode_query_concept`` (Section 4.3) and registered with
   ``LinkPredictor.set_z``.
 
+The neighbours of an anchor stand in for it as *scopes* of the facet only
+when they are at least loosely related to it (cosine >= ``anchor_min_sim``,
+by default half of ``grounding_min_sim``): an evidence query must not present
+the papers of an unrelated concept as established findings for the asked
+pair. When no neighbour qualifies, the facet is flagged ``unmatched`` and
+defaults to the root like an unspecified facet. The anchor itself keeps all
+``anchor_top_k`` neighbours: hypothesis queries attach it to them (its
+premise paths start there, and Eq. (9) scores how well they actually
+support it).
+
 What the aspects target given these scopes (junction sub-concepts and
 findings J(u_q, m_q) for evidence queries; baselines, unexplored candidates
 and their families for discovery; the transfer premises of the given pair
@@ -36,6 +46,7 @@ from scholarpath.embeddings import Embedder, l2_normalize
 from scholarpath.index.semantic_index import SemanticIndex, concept_key
 from scholarpath.llm.mock import stable_hash
 from scholarpath.retrieval.query_understanding import QueryAnalysis
+from scholarpath.retrieval.units import ANCHOR_PREFIX
 from scholarpath.types import HYPOTHESIS_ASSESSMENT, HYPOTHESIS_DISCOVERY
 
 FACETS = ("problem", "method")
@@ -66,6 +77,8 @@ class Grounding:
     similarities: Dict[str, float] = field(default_factory=dict)  # raw cosine of matched nodes
     unspecified: Dict[str, bool] = field(default_factory=dict)  # facet -> defaulted to the root
     facet_anchor: Dict[str, Optional[str]] = field(default_factory=dict)  # facet -> anchor id
+    # facet -> the query names a concept of this facet, but nothing in I is close enough to scope it
+    unmatched: Dict[str, bool] = field(default_factory=dict)
 
     def scopes(self, facet: str) -> List[Tuple[str, float]]:
         return self.problem_scopes if facet == "problem" else self.method_scopes
@@ -86,6 +99,7 @@ class Grounding:
                 for k, a in self.anchors.items()
             },
             "unspecified": dict(self.unspecified),
+            "unmatched": {f: True for f, v in self.unmatched.items() if v},
         }
 
 
@@ -104,15 +118,30 @@ def _facet_texts(analysis: QueryAnalysis, facet: str) -> List[str]:
     return texts
 
 
+def default_anchor_min_sim(config: RetrievalConfig) -> float:
+    """Smallest cosine at which an anchor's neighbour may serve as a scope.
+
+    ``config.anchor_min_sim`` when set, otherwise half of ``grounding_min_sim``.
+    """
+    value = getattr(config, "anchor_min_sim", None)
+    return 0.5 * float(config.grounding_min_sim) if value is None else float(value)
+
+
 def ground(
     analysis: QueryAnalysis,
     index: SemanticIndex,
     embedder: Embedder,
     config: Optional[RetrievalConfig] = None,
     link_predictor: Optional[object] = None,
+    anchor_min_sim: Optional[float] = None,
 ) -> Grounding:
-    """Algorithm 2, line 4: match the query concepts to scopes in T_P and T_M."""
+    """Algorithm 2, line 4: match the query concepts to scopes in T_P and T_M.
+
+    ``anchor_min_sim`` overrides :func:`default_anchor_min_sim`, the cosine an
+    anchor's neighbour needs to stand in for it as a scope.
+    """
     config = config or RetrievalConfig()
+    floor = default_anchor_min_sim(config) if anchor_min_sim is None else float(anchor_min_sim)
     out = Grounding(problem_scopes=[], method_scopes=[])
     for facet in FACETS:
         tax = index.taxonomy(facet)
@@ -120,6 +149,7 @@ def ground(
         # The candidate side of a discovery query only restricts where candidates are
         # searched; an unmatched description there means "anywhere" (the root).
         searched = analysis.kind == HYPOTHESIS_DISCOVERY and facet == (analysis.searched_side or "method")
+        out.unmatched[facet] = False
         if not texts:
             _set(out, facet, [(tax.root_id, 1.0)])
             out.unspecified[facet] = True
@@ -145,13 +175,17 @@ def ground(
         if matched:
             _set(out, facet, _normalize(matched))
             out.unspecified[facet] = False
-        elif anchor_id is not None:
-            anc = out.anchors[anchor_id]
-            _set(out, facet, _normalize({n: max(s, 1e-3) for n, s in anc.neighbors}))
-            out.unspecified[facet] = False
         else:
-            _set(out, facet, [(tax.root_id, 1.0)])
-            out.unspecified[facet] = True
+            proxies: Dict[str, float] = {}
+            if anchor_id is not None:
+                proxies = {n: s for n, s in out.anchors[anchor_id].neighbors if s > 0.0 and s >= floor}
+            if proxies:
+                _set(out, facet, _normalize(proxies))
+                out.unspecified[facet] = False
+            else:
+                _set(out, facet, [(tax.root_id, 1.0)])
+                out.unspecified[facet] = True
+                out.unmatched[facet] = not searched
         out.facet_anchor[facet] = anchor_id if not matched else None
     return out
 
@@ -178,7 +212,7 @@ def _make_anchor(
     """Create a query-local anchor attached to its top-k closest concepts (Section 4.1)."""
     neighbors = [(ids[i], float(col[i])) for i in order[: max(1, config.anchor_top_k)]]
     vec = l2_normalize(np.asarray(embedder.encode([text]), dtype=np.float32))[0]
-    anchor_id = f"~{facet[0].upper()}{stable_hash(facet, text) % 10 ** 10}"
+    anchor_id = f"{ANCHOR_PREFIX}{facet[0].upper()}{stable_hash(facet, text) % 10 ** 10}"
     out.anchors[anchor_id] = Anchor(anchor_id=anchor_id, facet=facet, text=text, vector=vec, neighbors=neighbors)
     if link_predictor is not None:
         anc = np.stack([index.vector(concept_key(n)) for n, _ in neighbors]).astype(np.float32)

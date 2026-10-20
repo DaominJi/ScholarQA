@@ -16,6 +16,10 @@ target paper, until no child does. Hence every (start, terminal) pair has a
 single path, and a search region "below v" (Section 4.3) holds exactly the
 paths routed through v.
 
+A query concept absent from I is represented by a *query-local anchor*
+(Section 4.1, Step 2) whose id starts with ``~``; it has no index key and is
+attached to its closest taxonomy concepts (:mod:`scholarpath.retrieval.grounding`).
+
 Besides index keys, ``V(z)`` may contain *virtual context nodes*
 (``hyp:<candidate>`` and ``set:<uid>``): the lines that label a hypothesis and
 list the premises of a path set in the assembled context. Treating them as
@@ -35,6 +39,12 @@ DIRECT = "direct"
 COMPLEMENTARY = "complementary"
 HYP_PREFIX = "hyp:"
 SET_PREFIX = "set:"
+ANCHOR_PREFIX = "~"
+
+
+def is_anchor(node_id: Optional[str]) -> bool:
+    """Whether ``node_id`` names a query-local anchor rather than a taxonomy concept."""
+    return bool(node_id) and node_id.startswith(ANCHOR_PREFIX)
 
 
 def key_level(key: str) -> str:
@@ -87,17 +97,22 @@ class DirectPath:
 class ComplementaryPathSet:
     """b = {e_C, e_P, e_M} supporting the hypothesis that ``candidate`` pairs with ``known``."""
 
-    candidate: str  # candidate concept c (method for discovery of methods)
+    candidate: str  # candidate concept c (or the anchor id of an assessed concept absent from I)
     candidate_facet: str
     known: str  # known endpoint (scope concept or anchor id)
     baseline: str  # m': the concept of the bridging paper closest to the candidate
-    bridge: str  # bridge family f = LCA(m', c); e_C = f -> ... -> c
+    bridge: str  # bridge family f = LCA(m', c); e_C = f -> ... -> c (-> the anchor's neighbour)
     distance: int  # taxonomic distance d(m', c) of the bridge anchors
     phi: float  # bridge discount phi(b) in (0, 1]
     e_C: DirectPath
     e_P: DirectPath  # problem-side premise path
     e_M: DirectPath  # method-side premise path
     known_label: str = ""  # display name of the known endpoint (anchors have no index node)
+
+    @property
+    def attach(self) -> str:
+        """Concept at which e_C ends: c itself, or the neighbour an anchored candidate is attached to."""
+        return key_id(self.e_C.end)
 
     @property
     def known_path(self) -> DirectPath:
