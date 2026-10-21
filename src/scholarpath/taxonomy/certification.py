@@ -77,7 +77,7 @@ def hypergeom_tail(y: int, R: int, K: int, a: int) -> float:
 
 
 def hypergeom_tail_scipy(y: int, R: int, K: int, a: int) -> float:
-    """Reference implementation through :mod:`scipy.stats` (used in tests)."""
+    """Reference implementation through :mod:`scipy.stats`."""
     return float(hypergeom.cdf(int(y), int(R), int(K), int(a)))
 
 

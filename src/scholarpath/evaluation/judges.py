@@ -26,7 +26,7 @@ Example (paper setting, OpenAI-compatible endpoints such as OpenRouter)::
 
 or ``JudgePanel.paper_default()`` with ``$SCHOLARPATH_JUDGE_BASE_URL`` /
 ``$SCHOLARPATH_JUDGE_API_KEY`` set. ``JudgePanel.mock()`` gives an offline
-panel for tests.
+panel for dry runs.
 """
 
 from __future__ import annotations
@@ -200,7 +200,7 @@ class JudgePanel:
 
     @classmethod
     def mock(cls, names: Sequence[str] = PAPER_JUDGES, seed: int = 0) -> "JudgePanel":
-        """Offline panel of :class:`~scholarpath.llm.MockLLM` judges (tests, dry runs)."""
+        """Offline panel of :class:`~scholarpath.llm.MockLLM` judges (dry runs)."""
         specs = [JudgeSpec(n, LLMConfig(provider="mock", model=f"mock-{n}", cache_dir=None, seed=seed,
                                         price_input_per_m=0.0, price_output_per_m=0.0)) for n in names]
         return cls.from_specs(specs)

@@ -1557,8 +1557,8 @@ class ExhaustiveGreedy:
     including every witness pair of every hypothesis candidate), then
     repeatedly selects the feasible unit of maximum delta(z | S) (ties by id)
     until no feasible unit has a positive gain. Its unit count grows with the
-    product of the witness lists, so it serves as the correctness reference in
-    the tests; the Table 7 "w/o bound-guided search" variant is the unpruned
+    product of the witness lists, so it serves as the correctness reference
+    for Proposition 7; the Table 7 "w/o bound-guided search" variant is the unpruned
     :class:`BoundGuidedSearch` (``prune=False``), which selects the same units.
     """
 

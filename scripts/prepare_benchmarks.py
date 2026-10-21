@@ -25,10 +25,6 @@ Examples::
 
     python scripts/prepare_benchmarks.py
     python scripts/prepare_benchmarks.py --only taxobench,chime --limit 5
-    # end-to-end on the test fixtures
-    python scripts/prepare_arxiv.py --snapshot tests/fixtures/arxiv/arxiv-metadata-sample.json --out /tmp/bench --n-per-set 2
-    python scripts/prepare_benchmarks.py --raw tests/fixtures --out /tmp/bench \\
-        --corpus /tmp/bench/arxiv_subfields/papers.jsonl.gz
 """
 
 from __future__ import annotations

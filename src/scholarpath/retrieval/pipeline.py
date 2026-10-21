@@ -20,7 +20,7 @@ Ablations (Table 7)
 * "w/o bound-guided search": ``config.use_bound_guided_search = False``
   (unpruned scan that scores every candidate node in scope; identical
   selections, Proposition 7; :class:`~scholarpath.retrieval.search.ExhaustiveGreedy`
-  is the fully enumerating reference used by the tests).
+  is the fully enumerating reference).
 * "w/o role-aware granularity": ``config.use_role_aware_granularity = False``.
 * "w/o shared-cost reuse update": ``config.use_shared_cost_update = False``.
 * ``config.use_link_prediction = False`` is a further ablation that drops the

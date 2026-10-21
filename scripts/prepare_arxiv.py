@@ -11,7 +11,6 @@ Examples::
 
     python scripts/prepare_arxiv.py --snapshot data/raw/arxiv
     python scripts/prepare_arxiv.py --snapshot data/raw/arxiv/arxiv-metadata-oai-snapshot.json --until 2026-09-30
-    python scripts/prepare_arxiv.py --snapshot tests/fixtures/arxiv/arxiv-metadata-sample.json --out /tmp/ax --limit 100
 """
 
 from __future__ import annotations

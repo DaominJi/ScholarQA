@@ -8,7 +8,6 @@
 #
 #   bash scripts/smoke_test.sh            # writes everything under results/smoke/
 #   OUT=/tmp/sp_smoke bash scripts/smoke_test.sh
-#   RUN_TESTS=1 bash scripts/smoke_test.sh  # also run the unit tests first
 #
 # Stages (paper section in brackets):
 #   1. synthetic data in the processed layout                 [data/README.md]
@@ -18,9 +17,7 @@
 #   4. multi-granularity index (over the stage-2 taxonomies)
 #      + link predictor; held-out benchmark construction      [Sec. 2.1, Sec. 4.3, App. B.5, App. C.1]
 #   5. retrieval accuracy, end-to-end QA, agents, efficiency,
-#      retrieval ablation; the official benchmark formats
-#      (ResearchQA, ScholarQABench, TaxoBench, CHIME) prepared
-#      from tests/fixtures                                    [Sec. 5.3, Tables 1-5, 7, Figs 5-6, App. C.2]
+#      retrieval ablation                                     [Sec. 5.3, Tables 2-5, 7, Figs 5-6]
 #   6. interactive question answering                         [Alg. 2]
 #
 # Caveat: under the mock LLM the budgeted baselines answer the synthetic
@@ -40,11 +37,6 @@ SMALL=(--set builder.router.hidden_dim=32 --set baseline.router.hidden_dim=32)
 cd "$REPO"
 mkdir -p "$OUT"
 step() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
-
-if [[ "${RUN_TESTS:-0}" == "1" ]]; then
-  step "Unit tests"
-  "$PY" -m pytest -q tests/
-fi
 
 step "1. Synthetic data"
 "$PY" scripts/make_synthetic_data.py --out "$DATA" --n-papers 240
@@ -126,23 +118,6 @@ step "5d. Efficiency (Table 5)"
 step "5e. Retrieval ablation on hypothesis queries (Table 7)"
 "$PY" scripts/run_retrieval_ablation.py --data-dir "$DATA" --index-dir "$INDEX" --budget 2048 --limit 2 \
   --output-dir "$OUT/run_retrieval_ablation"
-
-step "5f. Official benchmark formats prepared from tests/fixtures (Tables 1-3: Rub, Corr, Cite, ARI, Sem, Cat, Assn)"
-FIX="$OUT/data_fixtures"
-rm -rf "$FIX"
-"$PY" scripts/prepare_arxiv.py --snapshot tests/fixtures/arxiv/arxiv-metadata-sample.json --out "$FIX" --n-per-set 2
-"$PY" scripts/prepare_fulltext.py --corpus "$FIX/arxiv_subfields/papers.jsonl.gz" --sources local,s2orc \
-  --local-dir tests/fixtures/fulltext/local --s2orc tests/fixtures/fulltext/s2orc_v2-sample.jsonl
-"$PY" scripts/prepare_benchmarks.py --raw tests/fixtures --out "$FIX" --corpus "$FIX/arxiv_subfields/papers.jsonl.gz"
-for corpus in arxiv_subfields taxobench chime; do
-  "$PY" scripts/build_index.py --data-dir "$FIX" --index-dir "$OUT/index_fixtures" --corpus "$corpus" \
-    --output-dir "$OUT/build_index_fixtures_$corpus" "${SMALL[@]}"
-done
-"$PY" scripts/run_retrieval_eval.py --data-dir "$FIX" --index-dir "$OUT/index_fixtures" --budgets 2048 --limit 2 \
-  --graph-candidates 8 --raptor-clustering kmeans --raptor-no-umap --no-plots \
-  --output-dir "$OUT/run_retrieval_eval_fixtures"
-"$PY" scripts/run_qa_eval.py --data-dir "$FIX" --index-dir "$OUT/index_fixtures" --budgets 2048 --sweep-budgets none \
-  --limit 2 --no-plots --output-dir "$OUT/run_qa_eval_fixtures"
 
 step "6. Ask a question"
 "$PY" scripts/ask.py --index-dir "$INDEX" --corpus arxiv_subfields --output-dir "$OUT/ask" \

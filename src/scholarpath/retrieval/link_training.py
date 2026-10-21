@@ -602,7 +602,7 @@ class _Pool:
         return self.rows(rng.choice(self.size, size=n, replace=self.size < n))
 
     def members(self) -> np.ndarray:
-        """Every admissible comparison (for inspection and tests)."""
+        """Every admissible comparison (for inspection)."""
         return self.rows(np.arange(self.size, dtype=np.int64))
 
 
@@ -735,7 +735,7 @@ class ComparisonSampler:
         return self.ids
 
     def pool(self, item: _Item) -> np.ndarray:
-        """All admissible comparison rows of an item (materialised; for inspection and tests)."""
+        """All admissible comparison rows of an item (materialised; for inspection)."""
         return self.pools[item.pool].members()
 
     def nbytes(self) -> int:

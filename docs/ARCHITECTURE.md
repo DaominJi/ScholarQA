@@ -70,10 +70,6 @@ modules.
   Use `embedder.encode_queries` for queries/aspects and `embedder.encode` for documents.
 * Token counts / costs c(x): `scholarpath.text.count_tokens`.
 * Randomness: always seeded (`config.seed` or explicit `seed=` args); no global state.
-* Tests live in `tests/test_<module>.py`, use the `MockLLM` + `HashingEmbedder`
-  (`Runtime.from_config()` with default config) and
-  `scholarpath.data.synthetic.make_synthetic_benchmark`, never touch the network,
-  and run in a few seconds each. Run with `python -m pytest -q`.
 * Scripts in `scripts/` add `src/` to `sys.path`, so they run without
   installation. Experiment scripts use `scholarpath.runtime.add_common_args`
   / `Runtime.from_args` (invalid `--set` overrides and missing optional
@@ -222,7 +218,7 @@ download_dataset(name, root, ...)                                               
 # scholarpath.data.heldout (App. C.1)
 select_targets, reduce_corpus, generate_queries, export_annotation_sheet, apply_annotations,
 build_heldout_benchmark(..., oversample=), save_heldout_benchmark
-# scholarpath.data.synthetic (offline tests)
+# scholarpath.data.synthetic (offline smoke runs)
 make_synthetic_benchmark(...)
 ```
 

@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=77.0", "wheel"]
+requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,7 +7,6 @@ name = "scholarpath"
 version = "0.1.0"
 description = "ScholarPath: multi-granularity semantic indexing and budgeted support-path retrieval for evidence and hypothesis queries over scholarly repositories"
 readme = "README.md"
-license-files = ["THIRD_PARTY_NOTICES.md", "LICENSES/*"]
 requires-python = ">=3.9"
 dependencies = [
     "numpy>=1.24",
@@ -44,10 +43,6 @@ baselines = [
 agents = [
     "paper-qa>=5.0",
 ]
-dev = [
-    "pytest>=7.4",
-    "ruff>=0.5",        # ruff check src scripts tests
-]
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -55,14 +50,3 @@ include = ["scholarpath*"]
 
 [tool.setuptools.package-dir]
 "" = "src"
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-pythonpath = ["src"]
-
-[tool.ruff]
-line-length = 120
-target-version = "py39"
-
-[tool.ruff.lint]
-select = ["F"]  # pyflakes: unused imports / names, undefined names

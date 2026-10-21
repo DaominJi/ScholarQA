@@ -42,7 +42,7 @@ error.
 | `prepare_arxiv.py` | arXiv sets (8 primary categories × 2,000 papers) and arXiv-Subfields (148,400 papers) |
 | `prepare_fulltext.py` | full text → section chunks (local PDFs/LaTeX, arXiv GCS bucket, arXiv, S2ORC v2) |
 | `prepare_benchmarks.py` | ResearchQA, ScholarQA-CS/-Multi, TaxoBench, CHIME → `data/processed/`, corpus alignment report (App. C.2) |
-| `make_synthetic_data.py` | synthetic repository in the processed layout (offline runs and tests) |
+| `make_synthetic_data.py` | synthetic repository in the processed layout (offline runs) |
 
 ## Taxonomy construction (Section 3, Section 5.2)
 
@@ -64,7 +64,7 @@ error.
 | `run_retrieval_eval.py` | Table 2 and Fig. 5 (Recall@B / NDCG@B for ScholarPath, BM25, SPECTER, Dense + reranker, RAPTOR, LightRAG; B ∈ {2K, 4K, 6K, 8K, 16K}) |
 | `run_qa_eval.py` | Table 1 (benchmark statistics), Tables 3–4 and Fig. 6 (budgeted end-to-end QA: Answer LLM w/o retrieval, Keyword search, Dense retrieval, LightRAG, ScholarPath; evaluation of saved agent answers with `--answers-dir`) |
 | `run_official_eval.py` | the ResearchQA / ScholarQABench columns of Table 3 with the official evaluation scripts (App. C.3), from the saved answers of `run_qa_eval.py` / `run_agents.py` |
-| `run_agents.py` | unbudgeted agents (PaperQA2, OpenScholar, AgenticScholar, Codex; `simulated` for offline tests) |
+| `run_agents.py` | unbudgeted agents (PaperQA2, OpenScholar, AgenticScholar, Codex; `simulated` for offline smoke runs) |
 | `run_efficiency.py` | Table 5 (calls, tokens, cost, latency per query) and the Sec. 5.3.3 operator statistics (`--operator-stats`) |
 | `run_retrieval_ablation.py` | Table 7 (w/o temporal link prediction, bound-guided search, role-aware granularity, shared-cost reuse update) |
 | `ask.py` | answer a question with an index and print the selected support paths |

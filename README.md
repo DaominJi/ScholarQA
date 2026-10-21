@@ -49,9 +49,6 @@ API keys or downloads.
 - [Reproducing the experiments](#reproducing-the-experiments)
 - [Programmatic use](#programmatic-use)
 - [Implementation notes](#implementation-notes)
-- [Known differences from the paper text](#known-differences-from-the-paper-text)
-- [Tests](#tests)
-- [License and citation](#license-and-citation)
 
 ## Repository structure
 
@@ -61,7 +58,7 @@ API keys or downloads.
 │   ├── default.yaml          # all hyper-parameters (paper defaults), offline backends
 │   └── paper.yaml            # DeepSeek-V4.0-Flash + SPECTER2 + real judges (the paper's setting)
 ├── docs/ARCHITECTURE.md      # paper -> code map, conventions, module contracts
-├── data/README.md            # datasets: download, preprocessing, layout, coverage, licenses
+├── data/README.md            # datasets: download, preprocessing, layout, coverage
 ├── scripts/                  # one script per pipeline stage / table / figure (scripts/README.md)
 ├── src/scholarpath/
 │   ├── config.py, types.py, text.py, embeddings.py, runtime.py
@@ -80,8 +77,6 @@ API keys or downloads.
 │   ├── evaluation/           # soft node/edge F1, Recall@B/NDCG@B, Rub/Cite/Corr, ARI/Sem, Cat/Assn,
 │   │                         #   Disc + LLM judges, efficiency, reporting, official-script wrappers
 │   └── experiments/          # experiment runners behind the scripts
-├── tests/                    # offline unit and integration tests
-└── THIRD_PARTY_NOTICES.md    # reproduced / re-implemented third-party material and its licenses
 ```
 
 Generated files (all git-ignored): `data/raw/`, `data/processed/` (datasets),
@@ -103,7 +98,6 @@ pip install -e ".[data]"              # HF downloads, parquet reading (pandas, p
 pip install -e ".[eval]"              # nltk (statement splitting of the ScholarQABench citation eval)
 pip install -e ".[baselines]"         # umap-learn (RAPTOR), networkx (LightRAG graph export)
 pip install -e ".[agents]"            # paper-qa (PaperQA2; Python >= 3.11)
-pip install -e ".[dev]"               # pytest, ruff
 ```
 
 Python ≥ 3.9 is required. The Codex CLI and an OpenScholar checkout are
@@ -123,9 +117,7 @@ mock LLM and the hashing embedder:
 4. Index building, link-predictor training, and the held-out benchmark
    construction (`build_heldout_benchmark.py build` / `apply --auto-accept`).
 5. Retrieval accuracy, end-to-end QA, the agent path (offline simulated
-   agent), efficiency and the retrieval ablation; then the data-preparation
-   scripts (`prepare_arxiv`, `prepare_fulltext`, `prepare_benchmarks`) on the
-   format samples in `tests/fixtures/`, followed by retrieval and QA on them.
+   agent), efficiency and the retrieval ablation.
 6. One interactive question.
 
 It writes Tables 1–9 and the data of Figs 2–6 in the paper's format. It does
@@ -374,62 +366,3 @@ module docstrings:
 - **ResearchQA queries** search the whole arXiv-Subfields corpus. The survey
   date of a query is kept in its metadata but is not used as a retrieval
   cutoff, since the paper describes none.
-
-## Known differences from the paper text
-
-- **Table 5, ScholarPath calls.** The paper reports 1.0 LLM call per query
-  ("zero retrieval LLM calls"), but Step 1 of Algorithm 2 uses a
-  lightweight query-understanding call. Both are implemented:
-  `retrieval.llm_query_understanding=true` (default) gives 2 calls, and
-  `--no-query-llm` / `false` uses the embedding-only parser and 1 call.
-  `run_efficiency.py` reports composition and other calls separately.
-- **TaxoBench merged gold.** The released expert trees give 1,637 concept
-  nodes (the common root excluded) over up to 7 levels. Truncated to 4
-  levels (`--gold-max-depth 4`, the default of the construction
-  experiments), they give 1,030 concept nodes. The paper reports 814 concept
-  nodes over 4 levels, and we found no rule that reproduces that number. The
-  3,815 citations and 3,044 distinct papers match exactly.
-- **CHIME.** The 100 expert-annotated topics join to 2,439 study rows
-  (2,438 distinct studies) in the released files, against 2,146 studies in
-  the paper. The human-corrected hierarchies are reconstructed from the
-  generated hierarchies and the expert annotation tables
-  (`joe32140/chime-*` on Hugging Face); see `data/README.md`.
-- **Table 3 scorers.** By default Table 3 is computed with faithful
-  re-implementations of the official evaluation scripts, which run with any
-  judge backend. `run_official_eval.py` runs the official scripts themselves
-  (App. C.3).
-- **TaxoBench Sem.** Pass the all-MiniLM-L6-v2 embedder used by TaxoBench
-  (`organization_metrics.load_taxobench_embedder`) to obtain comparable
-  semantic path similarity. The public scorer falls back to string
-  similarity.
-
-## Tests
-
-```bash
-pip install -e ".[dev]"
-python -m pytest -q tests/            # ~500 offline tests, about 1-2 minutes
-ruff check src scripts tests          # pyflakes rules (configured in pyproject.toml)
-```
-
-## License and citation
-
-The license of the ScholarPath code itself is chosen by the authors; no
-license file is included yet (add `LICENSE` and a `license` field in
-`pyproject.toml` before release).
-`THIRD_PARTY_NOTICES.md` lists the third-party material it reproduces or
-re-implements: ScholarQABench prompts and rubrics (MIT), the TaxoBench
-scorer and CHIME parser (Apache-2.0), and the ResearchQA judge prompt (no
-license file upstream). The datasets are not redistributed. Each has its own
-terms, and TaxoBench's annotations are CC BY-NC 4.0, i.e. non-commercial only.
-See the dataset license table in `data/README.md`.
-
-If you use ScholarPath, please cite the paper:
-
-```bibtex
-@inproceedings{scholarpath2027,
-  title     = {Empowering Automated Research Agent At Scale: the Role of Evidence Query and Hypothesis Query},
-  booktitle = {Proceedings of the ACM SIGMOD International Conference on Management of Data (SIGMOD '27)},
-  year      = {2027},
-  note      = {Under submission}
-}
-```

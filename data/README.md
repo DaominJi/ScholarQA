@@ -184,12 +184,7 @@ only, and any fuzzy rule risks aligning a citation of a paper missing from the c
 
 ResearchQA and ScholarQABench need the alignment corpus; `prepare_benchmarks.py` stops if it is missing
 unless `--allow-unaligned` is given. `coverage_report.json` is updated per benchmark, so benchmarks can be
-prepared in separate runs. An end-to-end run on the test fixtures:
-
-```bash
-python scripts/prepare_arxiv.py --snapshot tests/fixtures/arxiv/arxiv-metadata-sample.json --out /tmp/bench --n-per-set 2
-python scripts/prepare_benchmarks.py --raw tests/fixtures --out /tmp/bench --corpus /tmp/bench/arxiv_subfields/papers.jsonl.gz
-```
+prepared in separate runs.
 
 | Benchmark | Paper (App. C.2) |
 |---|---|
@@ -200,25 +195,7 @@ python scripts/prepare_benchmarks.py --raw tests/fixtures --out /tmp/bench --cor
 
 `prepare_benchmarks.py` writes the reproduced numbers to `coverage_report.json`.
 
-## 7. Dataset licenses
-
-The datasets are downloaded from their sources and are not redistributed with
-this repository. Their terms apply to the raw files and to everything derived
-from them under `data/processed/`:
-
-| Dataset | Terms |
-|---|---|
-| arXiv metadata (Kaggle `Cornell-University/arxiv`) | CC0 1.0 for the metadata. The full texts fetched by `prepare_fulltext.py` keep each paper's own license (`metadata["license"]` of the paper record). |
-| TaxoBench | Code: Apache-2.0. **Annotations** (expert trees, paper-to-category mappings): **CC BY-NC 4.0, non-commercial research use only** (`DATASET_LICENSE.md` of the repository). Titles and abstracts may be subject to their publishers' rights. |
-| CHIME | Code and resources: Apache-2.0 (github.com/allenai/chime). Expert annotation tables: see the Hugging Face dataset cards of `joe32140/chime-*`. |
-| ResearchQA | See the Hugging Face dataset card of `realliyifei/ResearchQA`. The GitHub repository has no license file. |
-| ScholarQABench | MIT (github.com/AkariAsai/ScholarQABench). |
-| S2ORC v2 / S2AG papers | Semantic Scholar dataset license, accepted with the API key. |
-
-`THIRD_PARTY_NOTICES.md` covers the code and prompts that this repository
-reproduces or re-implements.
-
-## 8. Caveats
+## 7. Caveats
 
 * **Network.** Hugging Face, Kaggle, arxiv.org and api.semanticscholar.org may be blocked by proxies;
   GitHub and the public GCS bucket usually work. All loaders accept local files.
