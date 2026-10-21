@@ -135,7 +135,7 @@ papers without full text keep only their abstract.
 * **ScholarQA-CS**: one query per unique question (the first of the 10 double-annotated cases, as the official
   scorer; the other case is kept in `metadata["alternate_cases"]`), full `metric_config` kept for
   ScholarQABench's `scripts/rubric_eval.py`; rubric = `other_properties` (weights, evidence quotes). Gold papers are
-  reconstructed from the evidence quotes (see Caveats).
+  reconstructed from the evidence quotes.
 * **ScholarQA-Multi**: one query per expert answer (`reference_answer`), gold = the `ctxs` citations
   (citation markers in the answers are **0-based**).
 * **TaxoBench**: pooled corpus de-duplicated by normalized title (ids `tb-<sha1>`), per-survey gold trees
@@ -194,37 +194,3 @@ prepared in separate runs.
 | ResearchQA | 95.6% (10,830 of 11,328 survey-cited papers aligned to arXiv-Subfields) |
 
 `prepare_benchmarks.py` writes the reproduced numbers to `coverage_report.json`.
-
-## 7. Caveats
-
-* **Network.** Hugging Face, Kaggle, arxiv.org and api.semanticscholar.org may be blocked by proxies;
-  GitHub and the public GCS bucket usually work. All loaders accept local files.
-* **TaxoBench.** The public v0.2.0 data reproduces 72 surveys / 3,815 citations / 3,044 distinct papers
-  exactly, but its trees have 1,637 concept nodes (the common root excluded) over up to 7 levels below the
-  common root, not the 814 concept nodes over 4 levels reported for the merged gold. Cut at 4 levels they
-  have 1,030 concept nodes. `prepare_benchmarks.py` stores the full tree (`--taxobench-max-depth N` truncates
-  the stored file); the construction experiments cut it at evaluation time (`run_taxonomy_experiments.py
-  --gold-max-depth 4`, the default, and `build_taxonomy.py --reference-max-depth 4`).
-* **CHIME reconstruction.** No corrected-hierarchy file is released. We parse Claude-2's hierarchies
-  (472 reviews / 2,174 hierarchies with CHIME's own parser; our parser also expands claim ranges such as
-  "Claim 18-22"), keep the hierarchies present in the expert annotation tables, drop parent-child edges and
-  claim-category assignments with aggregated label 0, and take the studies of the annotated hierarchies as
-  the topic's gold set. Without the HF annotation tables, the uncorrected hierarchies of the 100 topics are
-  used (465 hierarchies, 2,306 categorized studies; the raw join has 2,439 study rows / 2,438 distinct
-  studies), and outputs are marked `corrected: false`.
-* **ScholarQA-CS gold papers.** The release has no citation list; its expert-cited papers are the sources of
-  the rubric evidence quotes. Quotes are matched to the system answers shown to the annotators by word
-  5-gram shingle overlap (>= 50%; words glued by lost markdown line breaks are split): quotes of Ai2
-  ScholarQA ("Nora") citation snippets or of Nora answer text map to the S2 CorpusIds of the cited papers,
-  quotes from Perplexity / GPT / Claude answers are not gold sources, and the remaining (paper) quotes are
-  attributed to the arXiv-Subfields paper containing them (abstracts and chunks), one gold entry per paper.
-  Unattributed quotes stay in the denominator, pooled per rubric item by default
-  (`--cs-unattributed item`; `quote` counts each quote). On the release (110 cases -> 100 queries) the
-  shingle classifier finds 1,163 paper quotes, 528 LLM-answer quotes, 41 Nora-snippet quotes and 168
-  Nora-answer quotes. Without the arXiv-Subfields corpus this gives 544 CS gold entries (1,346 with
-  `quote`), plus 524 distinct Multi citations, against the paper's 2,454; the paper's count is not
-  reproducible from the release alone.
-* **ResearchQA gold set.** The released records only carry the citations of `Citation`-type rubric items
-  (about 0.6 per query), fewer than the 14.6 gold papers per query of Table 1, which come from the
-  survey sections; supply them with `--researchqa-extra-gold` (`{"id", "references": [...]}` JSON lines)
-  when available.
