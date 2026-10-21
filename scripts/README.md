@@ -30,8 +30,7 @@ chunk sizes.
 Each script's module docstring (`--help`) states what it reproduces, the
 command for the paper setting, and a quick offline command on the synthetic
 layout (`python scripts/make_synthetic_data.py --out data/synthetic`).
-`bash scripts/smoke_test.sh` chains the offline commands end to end. An
-invalid `--set` value or an unknown field stops a script with a one-line
+An invalid `--set` value or an unknown field stops a script with a one-line
 error.
 
 ## Data preparation (see `data/README.md`)
@@ -64,7 +63,7 @@ error.
 | `run_retrieval_eval.py` | Table 2 and Fig. 5 (Recall@B / NDCG@B for ScholarPath, BM25, SPECTER, Dense + reranker, RAPTOR, LightRAG; B ∈ {2K, 4K, 6K, 8K, 16K}) |
 | `run_qa_eval.py` | Table 1 (benchmark statistics), Tables 3–4 and Fig. 6 (budgeted end-to-end QA: Answer LLM w/o retrieval, Keyword search, Dense retrieval, LightRAG, ScholarPath; evaluation of saved agent answers with `--answers-dir`) |
 | `run_official_eval.py` | the ResearchQA / ScholarQABench columns of Table 3 with the official evaluation scripts (App. C.3), from the saved answers of `run_qa_eval.py` / `run_agents.py` |
-| `run_agents.py` | unbudgeted agents (PaperQA2, OpenScholar, AgenticScholar, Codex; `simulated` for offline smoke runs) |
+| `run_agents.py` | unbudgeted agents (PaperQA2, OpenScholar, AgenticScholar, Codex; `simulated` for offline runs) |
 | `run_efficiency.py` | Table 5 (calls, tokens, cost, latency per query) and the Sec. 5.3.3 operator statistics (`--operator-stats`) |
 | `run_retrieval_ablation.py` | Table 7 (w/o temporal link prediction, bound-guided search, role-aware granularity, shared-cost reuse update) |
 | `ask.py` | answer a question with an index and print the selected support paths |

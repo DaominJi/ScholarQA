@@ -2,7 +2,7 @@
 
 **This is NOT one of the paper's baselines.** It exists to exercise the
 unbudgeted-agent evaluation path (uniform task prompt, multi-call usage
-accounting, robust output parsing, Answer records) in smoke tests and
+accounting, robust output parsing, Answer records) in offline runs and
 offline dry runs, where PaperQA2 / OpenScholar / AgenticScholar / Codex are
 not available. Its prompts are answered deterministically by
 :class:`~scholarpath.llm.MockLLM`, but it also runs against a real backend.

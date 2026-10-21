@@ -728,7 +728,7 @@ def add_experiment_args(
                             "baseline.seed for the selection baselines); FULL always uses baseline.seed")
     g.add_argument("--min-router-steps", type=int, default=None,
                    help="lower bound on the AdamW steps of the baseline routers "
-                        "(SelectionBuilder default 500; lower it only for smoke runs)")
+                        "(SelectionBuilder default 500; lower it only for quick offline runs)")
     if plots:
         g.add_argument("--no-plots", action="store_true",
                        help="skip the matplotlib figures (their CSV data is always written)")

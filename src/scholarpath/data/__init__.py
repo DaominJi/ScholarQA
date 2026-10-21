@@ -1,7 +1,7 @@
 """Corpus containers, dataset loaders, and benchmark preprocessing.
 
 * :mod:`.corpus`         -- :class:`Corpus`, JSONL I/O, query files
-* :mod:`.synthetic`      -- synthetic benchmark for offline smoke runs
+* :mod:`.synthetic`      -- synthetic benchmark for offline runs
 * :mod:`.arxiv`          -- arXiv sets and the arXiv-Subfields corpus (Sec. 5.2, App. C.2)
 * :mod:`.fulltext`       -- full text -> section chunks (Sec. 2.1)
 * :mod:`.alignment`      -- aligning benchmark citations to corpus papers (App. C.2 "Coverage")

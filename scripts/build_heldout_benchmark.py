@@ -37,7 +37,7 @@ corpus keeps related evidence; ``final_*`` columns resolve disagreements),
 trimmed to the per-setting quotas in seeded selection order, and writes them
 to ``queries.jsonl`` with ``annotation_report.json`` (counts, agreement).
 ``--auto-accept`` fills the sheet from the automatic leakage screen instead
-(smoke tests only: the paper's protocol uses two human annotators).
+(offline runs only: the paper's protocol uses two human annotators).
 
 Paper setting (``--min-source-date``: the knowledge cutoff of the answer LLM,
 DeepSeek-V4.0-Flash in the paper; App. C.1 requires every source paper to
@@ -224,7 +224,7 @@ def cmd_build(args: argparse.Namespace, rt: Runtime) -> int:
 
 
 def auto_fill_sheet(sheet: Path, out: Path) -> Path:
-    """Fill both annotators' columns from the automatic leakage screen (smoke tests only)."""
+    """Fill both annotators' columns from the automatic leakage screen (offline runs only)."""
     with open(sheet, encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
         fields = list(reader.fieldnames or [])
@@ -328,7 +328,7 @@ def main(argv=None) -> int:
     a.add_argument("--sheet", type=Path, default=None, help="filled sheet (default: <out>/annotation_sheet.csv)")
     a.add_argument("--no-quota", action="store_true", help="keep every validated query (no 24 / 23 trimming)")
     a.add_argument("--auto-accept", action="store_true",
-                   help="fill the sheet from the leakage screen (smoke tests; not the paper's protocol)")
+                   help="fill the sheet from the leakage screen (offline runs; not the paper's protocol)")
     args = ap.parse_args(argv)
     if args.command == "build" and (args.problem_taxonomy is None) != (args.method_taxonomy is None):
         ap.error("--problem-taxonomy and --method-taxonomy go together")

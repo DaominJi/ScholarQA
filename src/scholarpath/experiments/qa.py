@@ -369,12 +369,12 @@ BENCHMARKS: Dict[str, BenchmarkSpec] = {
     "chime": BenchmarkSpec("chime", "CHIME", "chime/queries.jsonl", "chime", "chime", PROTOCOL_ORGANIZATION),
     "heldout": BenchmarkSpec("heldout", "Held-Out Hypothesis", "heldout/queries.jsonl", "heldout", "heldout",
                              PROTOCOL_HYPOTHESIS),
-    # Evidence queries of the synthetic smoke-test layout (scripts/make_synthetic_data.py).
+    # Evidence queries of the synthetic layout (scripts/make_synthetic_data.py).
     "synthetic": BenchmarkSpec("synthetic", "Synthetic evidence", "evidence/queries.jsonl", "arxiv_subfields",
                                "synthetic", PROTOCOL_RESEARCHQA),
 }
 
-#: Evidence benchmarks of Tables 2-3 (``synthetic`` only in the smoke-test layout).
+#: Evidence benchmarks of Tables 2-3 (``synthetic`` only in the synthetic layout).
 EVIDENCE_BENCHMARKS = ("researchqa", "scholarqa_cs", "scholarqa_multi", "taxobench", "chime", "synthetic")
 HYPOTHESIS_BENCHMARKS = ("heldout",)
 _BENCHMARK_ALIASES = {
@@ -466,7 +466,7 @@ class DataLayout:
         return spec is not None and self.path(spec.papers).exists()
 
     def is_synthetic_layout(self) -> bool:
-        """The smoke-test layout of ``scripts/make_synthetic_data.py``.
+        """The synthetic layout of ``scripts/make_synthetic_data.py``.
 
         It ships the complete corpus as ``arxiv_subfields_full`` and an
         ``arxiv_subfields`` corpus from which its held-out papers are already

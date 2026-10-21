@@ -60,7 +60,7 @@ class LLMConfig:
         (DeepSeek, OpenRouter, vLLM, ...). Credentials come from the
         environment variable named by ``api_key_env``.
       * ``"mock"``   -- deterministic offline heuristics (no network); used by
-        the smoke tests and for dry runs of every script.
+        offline runs and dry runs of every script.
     """
 
     provider: str = "mock"
@@ -95,7 +95,7 @@ class EmbeddingConfig:
         sentence-transformers if ``adapters`` is unavailable);
       * ``"sentence-transformers"`` -- any sentence-transformers model;
       * ``"hashing"`` -- deterministic hashing embedder (no model download),
-        used for smoke tests.
+        used for offline runs.
     """
 
     backend: str = "hashing"

@@ -22,7 +22,7 @@ Held-out corpus (App. C.1: the held-out papers are "removed before any index
 is built"): its taxonomies must be built over the reduced corpus. Prebuilt
 taxonomies that reference papers outside it (e.g. the reference taxonomies
 of build_heldout_benchmark.py, built over the complete corpus) are refused
-unless ``--allow-reference-taxonomy`` (smoke tests): then the concepts of
+unless ``--allow-reference-taxonomy`` (offline runs): then the concepts of
 the removed papers are dropped, but the names and definitions of the
 remaining concepts may still reflect the held-out papers.
 
@@ -87,7 +87,7 @@ def main(argv=None) -> int:
     t.add_argument("--method-taxonomy", type=Path, default=None, help="prebuilt method taxonomy (Taxonomy JSON)")
     t.add_argument("--allow-reference-taxonomy", action="store_true",
                    help="held-out corpus only: accept prebuilt taxonomies that reference removed papers "
-                        "(restricted to the corpus; smoke tests)")
+                        "(restricted to the corpus; offline runs)")
     o = ap.add_argument_group("output")
     o.add_argument("--index-dir", type=Path, default=DEFAULT_INDEX_ROOT, help="index root (<index-dir>/<name>/)")
     o.add_argument("--force", action="store_true", help="rebuild an existing index")

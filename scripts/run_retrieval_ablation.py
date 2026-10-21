@@ -115,7 +115,7 @@ def main(argv=None) -> int:
     ap.add_argument("--budget", type=int, default=PAPER_BUDGET, help="context budget B (default 8,192)")
     ap.add_argument("--allow-untrained-prior", action="store_true",
                     help="run even if the index has no trained link predictor (then the full model and "
-                         "'w/o temporal link prediction' coincide; smoke tests only)")
+                         "'w/o temporal link prediction' coincide; offline runs only)")
     args = ap.parse_args(argv)
 
     rt = Runtime.from_args(args)

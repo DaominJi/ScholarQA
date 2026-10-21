@@ -5,7 +5,7 @@ The synthetic data (``scholarpath.data.synthetic``) is artificial: it only
 exists so that the whole pipeline -- taxonomy construction, index building,
 link-prediction training, held-out benchmark construction, retrieval and QA
 evaluation -- can be exercised offline with the mock LLM and the hashing
-embedder (see ``scripts/smoke_test.sh``). It does not reproduce any number of
+embedder. It does not reproduce any number of
 the paper.
 
 Layout written under ``--out`` (default ``data/synthetic``), mirroring

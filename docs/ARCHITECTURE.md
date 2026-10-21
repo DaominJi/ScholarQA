@@ -218,7 +218,7 @@ download_dataset(name, root, ...)                                               
 # scholarpath.data.heldout (App. C.1)
 select_targets, reduce_corpus, generate_queries, export_annotation_sheet, apply_annotations,
 build_heldout_benchmark(..., oversample=), save_heldout_benchmark
-# scholarpath.data.synthetic (offline smoke runs)
+# scholarpath.data.synthetic (offline runs)
 make_synthetic_benchmark(...)
 ```
 

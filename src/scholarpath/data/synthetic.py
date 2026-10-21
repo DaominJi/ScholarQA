@@ -1,4 +1,4 @@
-"""Deterministic synthetic scholarly repository for offline smoke runs.
+"""Deterministic synthetic scholarly repository for offline runs.
 
 Generates papers over a two-level problem hierarchy (domain -> sub-problem)
 and a two-level method hierarchy (family -> method). Each paper studies one

@@ -43,7 +43,6 @@ API keys or downloads.
 
 - [Repository structure](#repository-structure)
 - [Installation](#installation)
-- [Quick start (offline)](#quick-start-offline)
 - [Paper setting: LLM backbone and embeddings](#paper-setting-llm-backbone-and-embeddings)
 - [Data](#data)
 - [Reproducing the experiments](#reproducing-the-experiments)
@@ -102,28 +101,6 @@ pip install -e ".[agents]"            # paper-qa (PaperQA2; Python >= 3.11)
 
 Python ≥ 3.9 is required. The Codex CLI and an OpenScholar checkout are
 external tools; see [Unbudgeted agents](#unbudgeted-agents).
-
-## Quick start (offline)
-
-```bash
-bash scripts/smoke_test.sh        # ~3 minutes on a laptop; outputs under results/smoke/
-```
-
-The smoke test runs the pipeline on a small synthetic repository with the
-mock LLM and the hashing embedder:
-1. Synthetic data.
-2. Dual taxonomies with Algorithm 1.
-3. Construction experiments, ablation, scalability and dynamic update.
-4. Index building, link-predictor training, and the held-out benchmark
-   construction (`build_heldout_benchmark.py build` / `apply --auto-accept`).
-5. Retrieval accuracy, end-to-end QA, the agent path (offline simulated
-   agent), efficiency and the retrieval ablation.
-6. One interactive question.
-
-It writes Tables 1–9 and the data of Figs 2–6 in the paper's format. It does
-not exercise the downloads, the real LLM / SPECTER2 backends, the external
-agents or the official evaluation scripts. **The mock backends only exercise
-the code paths: their numbers are not the paper's results.**
 
 ## Paper setting: LLM backbone and embeddings
 
@@ -292,7 +269,7 @@ records with cited paper IDs and an established / hypothesis status.
 - An agent whose checkout, implementation or tool is missing is reported as
   unavailable and skipped. Check the "Unavailable agents" line and
   `summary.json` before building Tables 3–5.
-- **Offline smoke tests:** `simulated` is a deterministic multi-step agent.
+- **Offline runs:** `simulated` is a deterministic multi-step agent.
   It is not a paper baseline.
 
 ## Programmatic use
